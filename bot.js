@@ -118,7 +118,7 @@ async function startBot() {
             userMessages[sender]++;
         }
 
-        if (!userSessions[sender]) userSessions[sender] [];
+        if (!userSessions[sender]) userSessions[sender] = [];
 
         userSessions[sender].push({ role: 'user', content: body });
 
