@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || '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' });
 
-const ADMIN_NUMBER = '972593850520@c.us';
+const ADMIN_NUMBER = '264063917523099@lid';
 const DAILY_LIMIT = 50;
 
 let vipNumbers = [];
