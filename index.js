@@ -2,14 +2,19 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const Groq = require('groq-sdk');
 const express = require('express');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || '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' });
 
-let qrImageUrl = null;
-let botReady = false;
+// ← حط رقمك هون
+const ADMIN_NUMBER = '972593850520@c.us';
+const DAILY_LIMIT = 50;
+
+let vipNumbers = [];
+let userMessages = {};
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -28,9 +33,12 @@ const client = new Client({
     }
 });
 
+let qrImageUrl = null;
+let botReady = false;
+
 client.on('qr', async (qr) => {
     qrImageUrl = await qrcode.toDataURL(qr);
-    console.log('QR Code جاهز — افتح الرابط لمسحه');
+    console.log('QR Code جاهز');
 });
 
 client.on('ready', () => {
@@ -39,13 +47,79 @@ client.on('ready', () => {
     console.log('البوت جاهز!');
 });
 
+// إعادة تعيين الرسائل كل 24 ساعة
+setInterval(() => {
+    userMessages = {};
+    console.log('تم إعادة تعيين الرسائل اليومية');
+}, 24 * 60 * 60 * 1000);
+
 client.on('message', async (msg) => {
+    const sender = msg.from;
+    const isAdmin = sender === ADMIN_NUMBER;
+    const isVip = vipNumbers.includes(sender);
+    const body = msg.body.trim();
+
+    // أوامر الأدمن
+    if (isAdmin) {
+        if (body.startsWith('!vip ')) {
+            const num = body.split(' ')[1] + '@c.us';
+            if (!vipNumbers.includes(num)) {
+                vipNumbers.push(num);
+                msg.reply(`✅ تم إضافة ${body.split(' ')[1]} كـ VIP`);
+            } else {
+                msg.reply('⚠️ الرقم موجود أصلاً');
+            }
+            return;
+        }
+
+        if (body.startsWith('!دل ')) {
+            const num = body.split(' ')[1] + '@c.us';
+            vipNumbers = vipNumbers.filter(n => n !== num);
+            msg.reply(`✅ تم حذف ${body.split(' ')[1]} من VIP`);
+            return;
+        }
+
+        if (body === '!قائمة') {
+            if (vipNumbers.length === 0) {
+                msg.reply('📋 لا يوجد أرقام VIP');
+            } else {
+                const list = vipNumbers.map(n => n.replace('@c.us', '')).join('\n');
+                msg.reply(`📋 أرقام VIP:\n${list}`);
+            }
+            return;
+        }
+
+        if (body === '!إحصائيات') {
+            const stats = Object.entries(userMessages)
+                .map(([num, count]) => `${num.replace('@c.us', '')}: ${count} رسالة`)
+                .join('\n');
+            msg.reply(stats ? `📊 إحصائيات اليوم:\n${stats}` : '📊 لا يوجد إحصائيات');
+            return;
+        }
+
+        if (body === '!مساعدة') {
+            msg.reply(`🎛️ لوحة التحكم:\n!vip [رقم] — إضافة VIP\n!دل [رقم] — حذف VIP\n!قائمة — عرض VIP\n!إحصائيات — إحصائيات اليوم`);
+            return;
+        }
+    }
+
+    // التحقق من الحد اليومي للأرقام العادية
+    if (!isAdmin && !isVip) {
+        if (!userMessages[sender]) userMessages[sender] = 0;
+        if (userMessages[sender] >= DAILY_LIMIT) {
+            msg.reply(`⚠️ وصلت للحد اليومي (${DAILY_LIMIT} رسالة). عد غداً!`);
+            return;
+        }
+        userMessages[sender]++;
+    }
+
+    // الرد بالذكاء الاصطناعي
     try {
         const response = await groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
             messages: [
                 { role: 'system', content: 'أنت مساعد ذكي، رد دائماً بالعربية' },
-                { role: 'user', content: msg.body }
+                { role: 'user', content: body }
             ]
         });
         msg.reply(response.choices[0].message.content);
