@@ -1,15 +1,31 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const Groq = require('groq-sdk');
-const qrcode = require('qrcode-terminal');
+const express = require('express');
+const qrcode = require('qrcode');
+
+const app = express();
+const PORT = 3000;
 
 const groq = new Groq({ apiKey: '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' });
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
 let vipNumbers = [];
 let userMessages = {};
+let lastQR = null;
 
 setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
+
+app.get('/', async (req, res) => {
+    if (lastQR) {
+        const img = await qrcode.toDataURL(lastQR);
+        res.send('<html><body style="text-align:center"><h2>امسح الكود</h2><img src="' + img + '" style="width:300px"/><script>setTimeout(()=>location.reload(),5000)</script></body></html>');
+    } else {
+        res.send('<h2 style="text-align:center;margin-top:100px">البوت جاهز!</h2>');
+    }
+});
+
+app.listen(PORT, () => console.log('افتح المتصفح على http://localhost:3000'));
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -19,13 +35,14 @@ async function startBot() {
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
         if (qr) {
-            qrcode.generate(qr, { small: true });
-            console.log('امسح الكود بواتساب');
+            lastQR = qr;
+            console.log('افتح المتصفح على http://localhost:3000');
         }
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) startBot();
         } else if (connection === 'open') {
+            lastQR = null;
             console.log('البوت جاهز!');
         }
     });
