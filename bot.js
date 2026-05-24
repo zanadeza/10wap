@@ -37,10 +37,12 @@ async function startBot() {
         }
     });
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        console.log('نوع الحدث:', type);
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
-        const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '');
+        console.log('رسالة جديدة:', JSON.stringify(msg.message));
+        const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '');
         const body = msg.message.conversation || (msg.message.extendedTextMessage || {}).text || '';
         const isAdmin = sender === ADMIN_NUMBER;
         const isVip = vipNumbers.includes(sender);
@@ -70,6 +72,8 @@ async function startBot() {
             if (userMessages[sender] >= DAILY_LIMIT) { reply('وصلت للحد اليومي. عد غدا!'); return; }
             userMessages[sender]++;
         }
+
+        if (!body) return;
 
         try {
             await sock.sendMessage(msg.key.remoteJid, { react: { text: '⏳', key: msg.key } });
