@@ -77,4 +77,8 @@ app.listen(PORT, () => {
     console.log(`السيرفر شغال على بورت ${PORT}`);
 });
 
+setInterval(() => {
+    console.log('البوت شغال...');
+}, 4 * 60 * 1000);
+
 client.initialize();
