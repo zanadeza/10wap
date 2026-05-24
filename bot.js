@@ -46,6 +46,7 @@ async function startBot() {
         const isVip = vipNumbers.includes(sender);
         console.log('رسالة من:', sender, 'النص:', body);
         const reply = (text) => sock.sendMessage(msg.key.remoteJid, { text });
+
         if (isAdmin) {
             if (body.startsWith('!vip ')) {
                 const num = body.split(' ')[1];
@@ -63,12 +64,16 @@ async function startBot() {
             if (body === '!احصائيات') { reply(Object.entries(userMessages).map(([n,c]) => n+': '+c+' رسالة').join('\n') || 'لا يوجد'); return; }
             if (body === '!مساعدة') { reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات'); return; }
         }
+
         if (!isAdmin && !isVip) {
             if (!userMessages[sender]) userMessages[sender] = 0;
             if (userMessages[sender] >= DAILY_LIMIT) { reply('وصلت للحد اليومي. عد غدا!'); return; }
             userMessages[sender]++;
         }
+
         try {
+            await sock.sendMessage(msg.key.remoteJid, { react: { text: '⏳', key: msg.key } });
+            await reply('جاري التفكير... 🤔');
             const response = await groq.chat.completions.create({
                 model: 'llama-3.3-70b-versatile',
                 messages: [
@@ -76,10 +81,12 @@ async function startBot() {
                     { role: 'user', content: body }
                 ]
             });
-            reply(response.choices[0].message.content);
+            await reply(response.choices[0].message.content);
+            await sock.sendMessage(msg.key.remoteJid, { react: { text: '✅', key: msg.key } });
         } catch (error) {
             console.log(error);
-            reply('حدث خطا');
+            await sock.sendMessage(msg.key.remoteJid, { react: { text: '❌', key: msg.key } });
+            reply('حدث خطا، حاول مرة ثانية');
         }
     });
 }
