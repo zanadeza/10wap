@@ -8,12 +8,33 @@ const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
 let vipNumbers = [];
 let userMessages = {};
+let userSessions = {};
 let sock = null;
 
 setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
+
+const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "دكتور بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط، ولا تستخدم أي لغة أخرى أبداً.
+
+شخصيتك:
+- تتكلم مثل صديق حميم وتفهم ما يريده المستخدم
+- تستخدم العامية الفلسطينية بشكل طبيعي
+- تتفاعل مع المستخدم كأنك إنسان وليس روبوت
+- تفهم السياق وتتذكر ما قيل في المحادثة
+
+في المجال الطبي والتمريضي والصحي:
+- تعطي معلومات دقيقة ومفصلة جداً
+- تشرح الأعراض والأسباب والعلاج بالتفصيل
+- تذكر الجرعات والأدوية بدقة عند الحاجة
+- تنصح بمراجعة الطبيب عند الضرورة
+- تستخدم مصطلحات طبية مع شرحها بالعامية
+
+في باقي المواضيع:
+- تجاوب بشكل مفصل ودقيق
+- تعطي أمثلة عملية
+- تسأل إذا احتجت توضيح`;
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -31,10 +52,7 @@ async function startBot() {
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = code !== DisconnectReason.loggedOut;
-            console.log('انقطع الاتصال، كود:', code, 'إعادة:', shouldReconnect);
-            if (shouldReconnect) {
-                setTimeout(() => startBot(), 3000);
-            }
+            if (shouldReconnect) setTimeout(() => startBot(), 3000);
         } else if (connection === 'open') {
             console.log('البوت جاهز!');
         }
@@ -44,9 +62,11 @@ async function startBot() {
         if (type !== 'notify') return;
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
+
         const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '');
         const body = msg.message.conversation || (msg.message.extendedTextMessage || {}).text || '';
         if (!body) return;
+
         const isAdmin = sender === ADMIN_NUMBER;
         const isVip = vipNumbers.includes(sender);
         console.log('رسالة من:', sender, 'النص:', body);
@@ -80,31 +100,50 @@ async function startBot() {
             }
             if (body === '!قائمة') { await reply(vipNumbers.length === 0 ? 'لا يوجد VIP' : vipNumbers.join('\n')); return; }
             if (body === '!احصائيات') { await reply(Object.entries(userMessages).map(([n,c]) => n+': '+c+' رسالة').join('\n') || 'لا يوجد'); return; }
-            if (body === '!مساعدة') { await reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات'); return; }
+            if (body === '!مساعدة') { await reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات\n!مسح [رقم] - مسح جلسة'); return; }
+            if (body.startsWith('!مسح ')) {
+                const num = body.split(' ')[1];
+                delete userSessions[num];
+                await reply('تم مسح جلسة ' + num);
+                return;
+            }
         }
 
         if (!isAdmin && !isVip) {
             if (!userMessages[sender]) userMessages[sender] = 0;
-            if (userMessages[sender] >= DAILY_LIMIT) { await reply('وصلت للحد اليومي. عد غدا!'); return; }
+            if (userMessages[sender] >= DAILY_LIMIT) {
+                await reply('وصلت للحد اليومي يا صديقي. ارجع بكرة!');
+                return;
+            }
             userMessages[sender]++;
         }
 
+        if (!userSessions[sender]) userSessions[sender] [];
+
+        userSessions[sender].push({ role: 'user', content: body });
+
+        if (userSessions[sender].length > 20) {
+            userSessions[sender] = userSessions[sender].slice(-20);
+        }
+
         try {
-            await react('⏳');
-            await reply('جاري التفكير... 🤔');
+            await react('👍');
             const response = await groq.chat.completions.create({
                 model: 'llama-3.1-8b-instant',
                 messages: [
-                    { role: 'system', content: 'انت مساعد ذكي رد بالعربية' },
-                    { role: 'user', content: body }
-                ]
+                    { role: 'system', content: SYSTEM_PROMPT },
+                    ...userSessions[sender]
+                ],
+                max_tokens: 1000
             });
-            await reply(response.choices[0].message.content);
+            const reply_text = response.choices[0].message.content;
+            userSessions[sender].push({ role: 'assistant', content: reply_text });
+            await reply(reply_text);
             await react('✅');
         } catch (error) {
             console.log('خطا:', error.message);
             await react('❌');
-            await reply('حدث خطا، حاول مرة ثانية');
+            await reply('صار خطأ، جرب مرة ثانية!');
         }
     });
 }
