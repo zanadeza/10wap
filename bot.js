@@ -1,6 +1,7 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const Groq = require('groq-sdk');
+const qrcode = require('qrcode-terminal');
 
 const groq = new Groq({ apiKey: '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' });
 const ADMIN_NUMBER = '972593850520';
@@ -12,9 +13,15 @@ setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const sock = makeWASocket({ auth: state, printQRInTerminal: true });
+    const sock = makeWASocket({ auth: state });
+
     sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+        if (qr) {
+            qrcode.generate(qr, { small: true });
+            console.log('امسح الكود بواتساب');
+        }
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) startBot();
@@ -22,6 +29,7 @@ async function startBot() {
             console.log('البوت جاهز!');
         }
     });
+
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
