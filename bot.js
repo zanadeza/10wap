@@ -2,7 +2,7 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
 
-const TOGETHER_API_KEY = 'tgp_v1_XkEPaONsD6nAUyqvGqQsq0-W3eH8uueeF7bWJOF8mUw';
+const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
@@ -24,14 +24,14 @@ const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث 
 - إجابات واضحة وعملية`;
 
 async function askAI(messages) {
-    const response = await fetch('https://api.together.xyz/v1/chat/completions', {
+    const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
         method: 'POST',
         headers: {
-            'Authorization': `Bearer ${TOGETHER_API_KEY}`,
+            'Authorization': `Bearer ${MISTRAL_API_KEY}`,
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free',
+            model: 'mistral-small-latest',
             messages,
             max_tokens: 1000
         })
