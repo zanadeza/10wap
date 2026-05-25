@@ -1,12 +1,9 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const OpenAI = require('openai');
 const readline = require('readline');
 
-const openai = new OpenAI({
-    baseURL: 'https://openrouter.ai/api/v1',
-    apiKey: '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'
-});
+const CF_ACCOUNT_ID = '326b0bcab726bdc1154811560cde34c6';
+const CF_API_TOKEN = 'cfut_eGsKKCkraHzIDKllEtngAbK1XKDBhfNSjYsGfcIv23e554d4';
 
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
@@ -20,24 +17,28 @@ setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط، ولا تستخدم أي لغة أخرى أبداً.
+const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط.
+- تحكي مثل صديق قريب: شو، كيفك، والله، يعني، بدي، هيك
+- تتفاعل كأنك إنسان
+- في الطب: معلومات دقيقة ومفصلة
+- إجابات واضحة وعملية`;
 
-شخصيتك:
-- تحكي مثل صديق قريب بالعامية الفلسطينية: شو، كيفك، والله، يعني، بدي، هيك، ليش، وين
-- تتفاعل كأنك إنسان مش روبوت
-- تتذكر المحادثة وتربط الأسئلة ببعض
-- تسأل لو ما فهمت
-
-في المجال الطبي والتمريضي والصحي:
-- معلومات دقيقة ومفصلة جداً
-- تشرح الأعراض والأسباب والعلاج خطوة بخطوة
-- تذكر الجرعات والأدوية بدقة
-- تنصح بمراجعة الطبيب عند الضرورة
-
-في باقي المواضيع:
-- إجابات مفصلة ودقيقة
-- أمثلة عملية
-- ردود طبيعية كأنك إنسان`;
+async function askAI(messages) {
+    const response = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
+        {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${CF_API_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ messages })
+        }
+    );
+    const data = await response.json();
+    if (!data.success) throw new Error(JSON.stringify(data.errors));
+    return data.result.response;
+}
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -127,15 +128,10 @@ async function startBot() {
 
         try {
             await react('👍');
-            const response = await openai.chat.completions.create({
-                model: 'meta-llama/llama-3.3-70b-instruct:free',
-                messages: [
-                    { role: 'system', content: SYSTEM_PROMPT },
-                    ...userChats[sender]
-                ],
-                max_tokens: 1000
-            });
-            const responseText = response.choices[0].message.content;
+            const responseText = await askAI([
+                { role: 'system', content: SYSTEM_PROMPT },
+                ...userChats[sender]
+            ]);
             userChats[sender].push({ role: 'assistant', content: responseText });
             await reply(responseText);
             await react('✅');
