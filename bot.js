@@ -19,9 +19,7 @@ let userMessages = {};
 let userChats = {};
 let sock = null;
 
-setInterval(() => {
-    userMessages = {};
-}, 24 * 60 * 60 * 1000);
+setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
@@ -126,14 +124,15 @@ async function startBot() {
 
         const message = msg.message || {};
 
-        const msgType =
-            Object.keys(message || {}).find(k => message[k]) || null;
+        // 🔥 FIX الأساسي (حل مشكلة reading '0')
+        const msgType = Object.entries(message || {}).find(([k, v]) => v != null)?.[0];
 
         if (!msgType) return;
 
         if (
             msgType === 'protocolMessage' ||
-            msgType === 'senderKeyDistributionMessage'
+            msgType === 'senderKeyDistributionMessage' ||
+            msgType === 'messageContextInfo'
         ) return;
 
         const jid = msg.key?.remoteJid;
@@ -144,16 +143,16 @@ async function startBot() {
             .replace('@lid', '')
             .replace('@g.us', '');
 
-        // 🔥 FIX الحقيقي للمشكلة
-        const bodyRaw =
-            message.conversation ||
-            message.extendedTextMessage?.text ||
-            message.imageMessage?.caption ||
-            message.documentMessage?.caption ||
-            message.videoMessage?.caption;
+        // 🔥 FIX النهائي للـ body
+        const body =
+            typeof message?.conversation === 'string' ? message.conversation :
+            typeof message?.extendedTextMessage?.text === 'string' ? message.extendedTextMessage.text :
+            typeof message?.imageMessage?.caption === 'string' ? message.imageMessage.caption :
+            typeof message?.documentMessage?.caption === 'string' ? message.documentMessage.caption :
+            typeof message?.videoMessage?.caption === 'string' ? message.videoMessage.caption :
+            '';
 
-        const body = typeof bodyRaw === 'string' ? bodyRaw : '';
-        const safeBody = body;
+        const safeBody = body || '';
 
         const isAdmin = sender === ADMIN_NUMBER;
         const isVip = vipNumbers.includes(sender);
@@ -180,45 +179,40 @@ async function startBot() {
         if (isAdmin) {
             if (safeBody.startsWith('!vip ')) {
                 const num = safeBody.split(' ')[1];
-                if (!vipNumbers.includes(num)) {
-                    vipNumbers.push(num);
-                    await reply('تم إضافة ' + num + ' كـ VIP');
-                } else {
-                    await reply('الرقم موجود مسبقاً');
-                }
+                if (!vipNumbers.includes(num)) vipNumbers.push(num);
+                await reply('تم إضافة VIP');
                 return;
             }
 
             if (safeBody.startsWith('!دل ')) {
-                const num = safeBody.split(' ')[1];
-                vipNumbers = vipNumbers.filter(n => n !== num);
-                await reply('تم حذف ' + num);
+                vipNumbers = vipNumbers.filter(n => n !== safeBody.split(' ')[1]);
+                await reply('تم الحذف');
                 return;
             }
 
             if (safeBody === '!قائمة') {
-                await reply(vipNumbers.length === 0 ? 'لا يوجد أرقام VIP' : vipNumbers.join('\n'));
+                await reply(vipNumbers.length ? vipNumbers.join('\n') : 'لا يوجد VIP');
                 return;
             }
 
             if (safeBody === '!احصائيات') {
                 await reply(
                     Object.entries(userMessages)
-                        .map(([n, c]) => n + ': ' + c + ' رسالة')
+                        .map(([n, c]) => `${n}: ${c} رسالة`)
                         .join('\n') || 'لا يوجد إحصائيات'
                 );
                 return;
             }
 
             if (safeBody === '!مساعدة') {
-                await reply('أوامر لوحة التحكم:\n!vip [رقم] - إضافة VIP\n!دل [رقم] - حذف VIP\n!قائمة - عرض VIP\n!احصائيات - إحصائيات اليوم\n!مسح [رقم] - مسح جلسة');
+                await reply('أوامر لوحة التحكم جاهزة');
                 return;
             }
 
             if (safeBody.startsWith('!مسح ')) {
                 const num = safeBody.split(' ')[1];
                 delete userChats[num];
-                await reply('تم مسح جلسة ' + num);
+                await reply('تم المسح');
                 return;
             }
         }
@@ -227,7 +221,7 @@ async function startBot() {
         if (!isAdmin && !isVip) {
             if (!userMessages[sender]) userMessages[sender] = 0;
             if (userMessages[sender] >= DAILY_LIMIT) {
-                await reply('لقد وصلت إلى الحد اليومي المسموح به. يرجى المحاولة غداً.');
+                await reply('انتهى الحد اليومي');
                 return;
             }
             userMessages[sender]++;
@@ -240,9 +234,8 @@ async function startBot() {
             if (msgType === 'imageMessage') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
                 const base64 = buffer.toString('base64');
-
-                const responseText = await askAIWithImage(base64, safeBody);
-                await reply(responseText);
+                const res = await askAIWithImage(base64, safeBody);
+                await reply(res);
                 await react('✅');
                 return;
             }
@@ -252,26 +245,23 @@ async function startBot() {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
                 const text = buffer.toString('utf-8');
 
-                const q = safeBody || 'اشرح هذا الملف بالتفصيل';
+                const q = safeBody || 'اشرح الملف';
 
                 if (!userChats[sender]) userChats[sender] = [];
 
                 userChats[sender].push({
                     role: 'user',
-                    content: `${q}\n\nمحتوى الملف:\n${text.slice(0, 5000)}`
+                    content: `${q}\n\n${text.slice(0, 5000)}`
                 });
 
-                const responseText = await askAI([
+                const res = await askAI([
                     { role: 'system', content: SYSTEM_PROMPT },
                     ...userChats[sender]
                 ]);
 
-                userChats[sender].push({
-                    role: 'assistant',
-                    content: responseText
-                });
+                userChats[sender].push({ role: 'assistant', content: res });
 
-                await reply(responseText);
+                await reply(res);
                 await react('✅');
                 return;
             }
@@ -281,32 +271,25 @@ async function startBot() {
 
             if (!userChats[sender]) userChats[sender] = [];
 
-            userChats[sender].push({
-                role: 'user',
-                content: safeBody
-            });
+            userChats[sender].push({ role: 'user', content: safeBody });
 
-            if (userChats[sender].length > 20) {
+            if (userChats[sender].length > 20)
                 userChats[sender] = userChats[sender].slice(-20);
-            }
 
-            const responseText = await askAI([
+            const res = await askAI([
                 { role: 'system', content: SYSTEM_PROMPT },
                 ...userChats[sender]
             ]);
 
-            userChats[sender].push({
-                role: 'assistant',
-                content: responseText
-            });
+            userChats[sender].push({ role: 'assistant', content: res });
 
-            await reply(responseText);
+            await reply(res);
             await react('✅');
 
         } catch (error) {
             console.log('خطا:', error.message);
-            await react('❌');
             await reply('حدث خطأ، يرجى المحاولة مرة أخرى.');
+            await react('❌');
         }
     });
 }
