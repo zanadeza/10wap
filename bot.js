@@ -1,14 +1,18 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const Groq = require('groq-sdk');
+const OpenAI = require('openai');
 const readline = require('readline');
 
-const groq = new Groq({ apiKey: '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' });
+const openai = new OpenAI({
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKey: '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'
+});
+
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
 let vipNumbers = [];
 let userMessages = {};
-let userSessions = {};
+let userChats = {};
 let sock = null;
 
 setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
@@ -16,25 +20,24 @@ setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "دكتور بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط، ولا تستخدم أي لغة أخرى أبداً.
+const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط، ولا تستخدم أي لغة أخرى أبداً.
 
 شخصيتك:
-- تتكلم مثل صديق حميم وتفهم ما يريده المستخدم
-- تستخدم العامية الفلسطينية بشكل طبيعي
-- تتفاعل مع المستخدم كأنك إنسان وليس روبوت
-- تفهم السياق وتتذكر ما قيل في المحادثة
+- تحكي مثل صديق قريب بالعامية الفلسطينية: شو، كيفك، والله، يعني، بدي، هيك، ليش، وين
+- تتفاعل كأنك إنسان مش روبوت
+- تتذكر المحادثة وتربط الأسئلة ببعض
+- تسأل لو ما فهمت
 
 في المجال الطبي والتمريضي والصحي:
-- تعطي معلومات دقيقة ومفصلة جداً
-- تشرح الأعراض والأسباب والعلاج بالتفصيل
-- تذكر الجرعات والأدوية بدقة عند الحاجة
+- معلومات دقيقة ومفصلة جداً
+- تشرح الأعراض والأسباب والعلاج خطوة بخطوة
+- تذكر الجرعات والأدوية بدقة
 - تنصح بمراجعة الطبيب عند الضرورة
-- تستخدم مصطلحات طبية مع شرحها بالعامية
 
 في باقي المواضيع:
-- تجاوب بشكل مفصل ودقيق
-- تعطي أمثلة عملية
-- تسأل إذا احتجت توضيح`;
+- إجابات مفصلة ودقيقة
+- أمثلة عملية
+- ردود طبيعية كأنك إنسان`;
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -100,10 +103,10 @@ async function startBot() {
             }
             if (body === '!قائمة') { await reply(vipNumbers.length === 0 ? 'لا يوجد VIP' : vipNumbers.join('\n')); return; }
             if (body === '!احصائيات') { await reply(Object.entries(userMessages).map(([n,c]) => n+': '+c+' رسالة').join('\n') || 'لا يوجد'); return; }
-            if (body === '!مساعدة') { await reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات\n!مسح [رقم] - مسح جلسة'); return; }
+            if (body === '!مساعدة') { await reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات\n!مسح [رقم]'); return; }
             if (body.startsWith('!مسح ')) {
                 const num = body.split(' ')[1];
-                delete userSessions[num];
+                delete userChats[num];
                 await reply('تم مسح جلسة ' + num);
                 return;
             }
@@ -112,33 +115,29 @@ async function startBot() {
         if (!isAdmin && !isVip) {
             if (!userMessages[sender]) userMessages[sender] = 0;
             if (userMessages[sender] >= DAILY_LIMIT) {
-                await reply('وصلت للحد اليومي يا صديقي. ارجع بكرة!');
+                await reply('وصلت للحد اليومي يا صديقي، ارجع بكرة!');
                 return;
             }
             userMessages[sender]++;
         }
 
-        if (!userSessions[sender]) userSessions[sender] = [];
-
-        userSessions[sender].push({ role: 'user', content: body });
-
-        if (userSessions[sender].length > 20) {
-            userSessions[sender] = userSessions[sender].slice(-20);
-        }
+        if (!userChats[sender]) userChats[sender] = [];
+        userChats[sender].push({ role: 'user', content: body });
+        if (userChats[sender].length > 20) userChats[sender] = userChats[sender].slice(-20);
 
         try {
             await react('👍');
-            const response = await groq.chat.completions.create({
-                model: 'llama-3.1-8b-instant',
+            const response = await openai.chat.completions.create({
+                model: 'meta-llama/llama-3.3-70b-instruct:free',
                 messages: [
                     { role: 'system', content: SYSTEM_PROMPT },
-                    ...userSessions[sender]
+                    ...userChats[sender]
                 ],
                 max_tokens: 1000
             });
-            const reply_text = response.choices[0].message.content;
-            userSessions[sender].push({ role: 'assistant', content: reply_text });
-            await reply(reply_text);
+            const responseText = response.choices[0].message.content;
+            userChats[sender].push({ role: 'assistant', content: responseText });
+            await reply(responseText);
             await react('✅');
         } catch (error) {
             console.log('خطا:', error.message);
