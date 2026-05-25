@@ -3,7 +3,7 @@ const { Boom } = require('@hapi/boom');
 const readline = require('readline');
 
 const CF_ACCOUNT_ID = '326b0bcab726bdc1154811560cde34c6';
-const CF_API_TOKEN = 'cfut_eGsKKCkraHzIDKllEtngAbK1XKDBhfNSjYsGfcIv23e554d4';
+const CF_API_TOKEN = 'cfut_V4s83z76wK6Ew6yWXB9hWsp46Th7BbYlKfReJrHHff6371f8';
 
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
