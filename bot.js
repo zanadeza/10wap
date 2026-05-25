@@ -5,7 +5,7 @@ const readline = require('readline');
 
 const openai = new OpenAI({
     baseURL: 'https://openrouter.ai/api/v1',
-    apiKey: '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'
+    apiKey: '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'
 });
 
 const ADMIN_NUMBER = '972593850520';
