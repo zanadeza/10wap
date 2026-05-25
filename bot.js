@@ -2,8 +2,7 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
 
-const CF_ACCOUNT_ID = '326b0bcab726bdc1154811560cde34c6';
-const CF_API_TOKEN = 'cfut_V4s83z76wK6Ew6yWXB9hWsp46Th7BbYlKfReJrHHff6371f8';
+const TOGETHER_API_KEY = 'tgp_v1_XkEPaONsD6nAUyqvGqQsq0-W3eH8uueeF7bWJOF8mUw';
 
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
@@ -19,25 +18,27 @@ const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
 const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط.
 - تحكي مثل صديق قريب: شو، كيفك، والله، يعني، بدي، هيك
-- تتفاعل كأنك إنسان
-- في الطب: معلومات دقيقة ومفصلة
+- تتفاعل كأنك إنسان مش روبوت
+- تتذكر المحادثة وتربط الأسئلة ببعض
+- في الطب والتمريض: معلومات دقيقة ومفصلة جداً خطوة بخطوة
 - إجابات واضحة وعملية`;
 
 async function askAI(messages) {
-    const response = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
-        {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${CF_API_TOKEN}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ messages })
-        }
-    );
+    const response = await fetch('https://api.together.xyz/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${TOGETHER_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free',
+            messages,
+            max_tokens: 1000
+        })
+    });
     const data = await response.json();
-    if (!data.success) throw new Error(JSON.stringify(data.errors));
-    return data.result.response;
+    if (data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
 }
 
 async function startBot() {
