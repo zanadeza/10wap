@@ -1,6 +1,8 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
+const axios = require('axios');
+const fs = require('fs');
 
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 
@@ -41,6 +43,33 @@ async function askAI(messages) {
     return data.choices[0].message.content;
 }
 
+async function askAIWithImage(base64Image, question) {
+    const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: 'pixtral-large-latest',
+            messages: [
+                { role: 'system', content: SYSTEM_PROMPT },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+                        { type: 'text', text: question || 'اشرح هالصورة بالتفصيل' }
+                    ]
+                }
+            ],
+            max_tokens: 1000
+        })
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
+}
+
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     sock = makeWASocket({ auth: state });
@@ -69,12 +98,12 @@ async function startBot() {
         if (!msg.message || msg.key.fromMe) return;
 
         const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '');
-        const body = msg.message.conversation || (msg.message.extendedTextMessage || {}).text || '';
-        if (!body) return;
+        const msgType = Object.keys(msg.message)[0];
+        const body = msg.message.conversation || (msg.message.extendedTextMessage || {}).text || (msg.message.imageMessage || {}).caption || (msg.message.documentMessage || {}).caption || '';
 
         const isAdmin = sender === ADMIN_NUMBER;
         const isVip = vipNumbers.includes(sender);
-        console.log('رسالة من:', sender, 'النص:', body);
+        console.log('رسالة من:', sender, 'النوع:', msgType);
 
         const reply = async (text) => {
             try {
@@ -123,19 +152,43 @@ async function startBot() {
             userMessages[sender]++;
         }
 
-        if (!userChats[sender]) userChats[sender] = [];
-        userChats[sender].push({ role: 'user', content: body });
-        if (userChats[sender].length > 20) userChats[sender] = userChats[sender].slice(-20);
-
         try {
             await react('👍');
-            const responseText = await askAI([
-                { role: 'system', content: SYSTEM_PROMPT },
-                ...userChats[sender]
-            ]);
+
+            // صورة
+            if (msgType === 'imageMessage') {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const base64 = buffer.toString('base64');
+                const responseText = await askAIWithImage(base64, body);
+                await reply(responseText);
+                await react('✅');
+                return;
+            }
+
+            // ملف PDF أو نص
+            if (msgType === 'documentMessage') {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const text = buffer.toString('utf-8');
+                const question = body || 'اشرح هالملف بالتفصيل';
+                if (!userChats[sender]) userChats[sender] = [];
+                userChats[sender].push({ role: 'user', content: `${question}\n\nمحتوى الملف:\n${text.slice(0, 5000)}` });
+                const responseText = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
+                userChats[sender].push({ role: 'assistant', content: responseText });
+                await reply(responseText);
+                await react('✅');
+                return;
+            }
+
+            // رسالة نصية عادية
+            if (!body) return;
+            if (!userChats[sender]) userChats[sender] = [];
+            userChats[sender].push({ role: 'user', content: body });
+            if (userChats[sender].length > 20) userChats[sender] = userChats[sender].slice(-20);
+            const responseText = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
             userChats[sender].push({ role: 'assistant', content: responseText });
             await reply(responseText);
             await react('✅');
+
         } catch (error) {
             console.log('خطا:', error.message);
             await react('❌');
