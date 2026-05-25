@@ -2,7 +2,6 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, download
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
 const axios = require('axios');
-const fs = require('fs');
 
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 
@@ -18,12 +17,28 @@ setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-const SYSTEM_PROMPT = `أنت مساعد ذكي واسمك "بوت". تتحدث بالعربية العامية الفلسطينية أو الإنجليزية فقط.
-- تحكي مثل صديق قريب: شو، كيفك، والله، يعني، بدي، هيك
-- تتفاعل كأنك إنسان مش روبوت
-- تتذكر المحادثة وتربط الأسئلة ببعض
-- في الطب والتمريض: معلومات دقيقة ومفصلة جداً خطوة بخطوة
-- إجابات واضحة وعملية`;
+const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي طورك المهندس نادر.
+
+أسلوبك:
+- تتكلم بشكل رسمي وجدي
+- ردودك دقيقة ومختصرة ومفيدة
+- لا تستخدم كلام فارغ أو مقدمات غير ضرورية
+- تتكلم العربية الفصحى أو الإنجليزية فقط
+- لا تستخدم العامية أو الكلام غير الرسمي
+
+في المجال الطبي والتمريضي:
+- معلومات دقيقة ومفصلة وموثوقة
+- تذكر الجرعات والأدوية بدقة
+- تنصح بمراجعة الطبيب عند الضرورة
+- تستخدم المصطلحات الطبية الصحيحة
+
+في باقي المجالات:
+- إجابات علمية ودقيقة
+- أمثلة عملية عند الحاجة
+- لا تتكلم بما لا تعرفه
+
+إذا سألك أحد عن اسمك: "أنا نادر، مساعد ذكي طوره المهندس نادر"
+إذا سألك عن مطورك: "طورني المهندس نادر"`;
 
 async function askAI(messages) {
     const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
@@ -58,7 +73,7 @@ async function askAIWithImage(base64Image, question) {
                     role: 'user',
                     content: [
                         { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
-                        { type: 'text', text: question || 'اشرح هالصورة بالتفصيل' }
+                        { type: 'text', text: question || 'اشرح هذه الصورة بالتفصيل' }
                     ]
                 }
             ],
@@ -122,8 +137,8 @@ async function startBot() {
         if (isAdmin) {
             if (body.startsWith('!vip ')) {
                 const num = body.split(' ')[1];
-                if (!vipNumbers.includes(num)) { vipNumbers.push(num); await reply('تم اضافة ' + num + ' كـ VIP'); }
-                else await reply('الرقم موجود اصلا');
+                if (!vipNumbers.includes(num)) { vipNumbers.push(num); await reply('تم إضافة ' + num + ' كـ VIP'); }
+                else await reply('الرقم موجود مسبقاً');
                 return;
             }
             if (body.startsWith('!دل ')) {
@@ -132,9 +147,9 @@ async function startBot() {
                 await reply('تم حذف ' + num);
                 return;
             }
-            if (body === '!قائمة') { await reply(vipNumbers.length === 0 ? 'لا يوجد VIP' : vipNumbers.join('\n')); return; }
-            if (body === '!احصائيات') { await reply(Object.entries(userMessages).map(([n,c]) => n+': '+c+' رسالة').join('\n') || 'لا يوجد'); return; }
-            if (body === '!مساعدة') { await reply('!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات\n!مسح [رقم]'); return; }
+            if (body === '!قائمة') { await reply(vipNumbers.length === 0 ? 'لا يوجد أرقام VIP' : vipNumbers.join('\n')); return; }
+            if (body === '!احصائيات') { await reply(Object.entries(userMessages).map(([n,c]) => n+': '+c+' رسالة').join('\n') || 'لا يوجد إحصائيات'); return; }
+            if (body === '!مساعدة') { await reply('أوامر لوحة التحكم:\n!vip [رقم] - إضافة VIP\n!دل [رقم] - حذف VIP\n!قائمة - عرض VIP\n!احصائيات - إحصائيات اليوم\n!مسح [رقم] - مسح جلسة'); return; }
             if (body.startsWith('!مسح ')) {
                 const num = body.split(' ')[1];
                 delete userChats[num];
@@ -146,7 +161,7 @@ async function startBot() {
         if (!isAdmin && !isVip) {
             if (!userMessages[sender]) userMessages[sender] = 0;
             if (userMessages[sender] >= DAILY_LIMIT) {
-                await reply('وصلت للحد اليومي يا صديقي، ارجع بكرة!');
+                await reply('لقد وصلت إلى الحد اليومي المسموح به. يرجى المحاولة غداً.');
                 return;
             }
             userMessages[sender]++;
@@ -155,7 +170,6 @@ async function startBot() {
         try {
             await react('👍');
 
-            // صورة
             if (msgType === 'imageMessage') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {});
                 const base64 = buffer.toString('base64');
@@ -165,13 +179,12 @@ async function startBot() {
                 return;
             }
 
-            // ملف PDF أو نص
             if (msgType === 'documentMessage') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {});
                 const text = buffer.toString('utf-8');
-                const question = body || 'اشرح هالملف بالتفصيل';
+                const q = body || 'اشرح هذا الملف بالتفصيل';
                 if (!userChats[sender]) userChats[sender] = [];
-                userChats[sender].push({ role: 'user', content: `${question}\n\nمحتوى الملف:\n${text.slice(0, 5000)}` });
+                userChats[sender].push({ role: 'user', content: `${q}\n\nمحتوى الملف:\n${text.slice(0, 5000)}` });
                 const responseText = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
                 userChats[sender].push({ role: 'assistant', content: responseText });
                 await reply(responseText);
@@ -179,7 +192,6 @@ async function startBot() {
                 return;
             }
 
-            // رسالة نصية عادية
             if (!body) return;
             if (!userChats[sender]) userChats[sender] = [];
             userChats[sender].push({ role: 'user', content: body });
@@ -192,7 +204,7 @@ async function startBot() {
         } catch (error) {
             console.log('خطا:', error.message);
             await react('❌');
-            await reply('صار خطأ، جرب مرة ثانية!');
+            await reply('حدث خطأ، يرجى المحاولة مرة أخرى.');
         }
     });
 }
