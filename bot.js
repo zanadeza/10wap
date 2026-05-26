@@ -7,8 +7,10 @@ const {
 
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
+const { MongoClient } = require('mongodb');
 
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
+const MONGO_URI = 'mongodb+srv://nademarwuf_db_user:jzJW3zPqCDFzio4f@cluster0.q5gu6pe.mongodb.net/?appName=Cluster0';
 
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
@@ -17,10 +19,9 @@ let vipNumbers = [];
 let userMessages = {};
 let userChats = {};
 let sock = null;
+let db = null;
 
-setInterval(() => {
-    userMessages = {};
-}, 24 * 60 * 60 * 1000);
+setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
@@ -56,11 +57,7 @@ async function askAI(messages) {
                 'Authorization': `Bearer ${MISTRAL_API_KEY}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                model: 'mistral-small-latest',
-                messages,
-                max_tokens: 1000
-            })
+            body: JSON.stringify({ model: 'mistral-small-latest', messages, max_tokens: 1000 })
         });
         const data = await response.json();
         if (!data?.choices?.[0]) throw new Error('AI error');
@@ -99,7 +96,30 @@ async function askAIWithImage(base64Image, question) {
         return data.choices[0].message.content;
     } catch (e) {
         console.log("AI IMAGE ERROR:", e.message);
-        return "حدث خطأ في تحليل الصورة، يرجى المحاولة مرة أخرى.";
+        return "حدث خطأ في تحليل الصورة.";
+    }
+}
+
+// حفظ الجلسة على MongoDB
+async function saveSession(data) {
+    try {
+        await db.collection('sessions').updateOne(
+            { _id: 'whatsapp_session' },
+            { $set: { data, updatedAt: new Date() } },
+            { upsert: true }
+        );
+    } catch (e) {
+        console.log('خطأ في حفظ الجلسة:', e.message);
+    }
+}
+
+async function loadSession() {
+    try {
+        const doc = await db.collection('sessions').findOne({ _id: 'whatsapp_session' });
+        return doc?.data || null;
+    } catch (e) {
+        console.log('خطأ في تحميل الجلسة:', e.message);
+        return null;
     }
 }
 
@@ -113,7 +133,10 @@ async function startBot() {
         console.log('كود الربط: ' + code);
     }
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async (creds) => {
+        await saveCreds();
+        await saveSession(creds);
+    });
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
         if (connection === 'close') {
@@ -128,15 +151,12 @@ async function startBot() {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
             if (type !== 'notify') return;
-
             const msg = messages?.[0];
             if (!msg?.message || msg?.key?.fromMe) return;
 
             const message = msg.message || {};
-
             const msgType = (() => {
                 const keys = Object.keys(message || {});
-                if (!Array.isArray(keys) || keys.length === 0) return null;
                 for (let k of keys) {
                     if (message[k] !== undefined && message[k] !== null) return k;
                 }
@@ -144,51 +164,34 @@ async function startBot() {
             })();
 
             if (!msgType) return;
-
-            if (
-                msgType === 'protocolMessage' ||
-                msgType === 'senderKeyDistributionMessage' ||
-                msgType === 'messageContextInfo'
-            ) return;
+            if (['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo'].includes(msgType)) return;
 
             const jid = msg.key?.remoteJid;
             if (!jid) return;
 
-            const sender = jid
-                .replace('@s.whatsapp.net', '')
-                .replace('@lid', '')
-                .replace('@g.us', '');
+            const sender = jid.replace('@s.whatsapp.net', '').replace('@lid', '').replace('@g.us', '');
 
             const body =
                 (typeof message?.conversation === 'string' && message.conversation) ||
                 (typeof message?.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text) ||
                 (typeof message?.imageMessage?.caption === 'string' && message.imageMessage.caption) ||
                 (typeof message?.documentMessage?.caption === 'string' && message.documentMessage.caption) ||
-                (typeof message?.videoMessage?.caption === 'string' && message.videoMessage.caption) ||
                 '';
 
             const safeBody = body || '';
-
             const isAdmin = sender === ADMIN_NUMBER;
             const isVip = vipNumbers.includes(sender);
 
             console.log('رسالة من:', sender, 'النوع:', msgType);
 
             const reply = async (text) => {
-                try {
-                    await sock.sendMessage(jid, { text });
-                } catch (e) {
-                    console.log('خطا في الرد:', e.message);
-                }
+                try { await sock.sendMessage(jid, { text }); } catch (e) { console.log('خطا في الرد:', e.message); }
             };
 
             const react = async (emoji) => {
-                try {
-                    await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
-                } catch {}
+                try { await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }); } catch {}
             };
 
-            // ===== ADMIN =====
             if (isAdmin) {
                 if (safeBody.startsWith('!vip ')) {
                     const num = safeBody.split(' ')[1];
@@ -202,18 +205,9 @@ async function startBot() {
                     await reply('تم حذف ' + num + ' من VIP');
                     return;
                 }
-                if (safeBody === '!قائمة') {
-                    await reply(vipNumbers.length ? vipNumbers.join('\n') : 'لا يوجد أرقام VIP');
-                    return;
-                }
-                if (safeBody === '!احصائيات') {
-                    await reply(Object.entries(userMessages).map(([n, c]) => `${n}: ${c} رسالة`).join('\n') || 'لا يوجد إحصائيات');
-                    return;
-                }
-                if (safeBody === '!مساعدة') {
-                    await reply('أوامر لوحة التحكم:\n!vip [رقم] - إضافة VIP\n!دل [رقم] - حذف VIP\n!قائمة - عرض VIP\n!احصائيات - إحصائيات اليوم\n!مسح [رقم] - مسح جلسة');
-                    return;
-                }
+                if (safeBody === '!قائمة') { await reply(vipNumbers.length ? vipNumbers.join('\n') : 'لا يوجد أرقام VIP'); return; }
+                if (safeBody === '!احصائيات') { await reply(Object.entries(userMessages).map(([n, c]) => `${n}: ${c} رسالة`).join('\n') || 'لا يوجد إحصائيات'); return; }
+                if (safeBody === '!مساعدة') { await reply('أوامر لوحة التحكم:\n!vip [رقم]\n!دل [رقم]\n!قائمة\n!احصائيات\n!مسح [رقم]'); return; }
                 if (safeBody.startsWith('!مسح ')) {
                     const num = safeBody.split(' ')[1];
                     delete userChats[num];
@@ -222,7 +216,6 @@ async function startBot() {
                 }
             }
 
-            // ===== LIMIT =====
             if (!isAdmin && !isVip) {
                 if (!userMessages[sender]) userMessages[sender] = 0;
                 if (userMessages[sender] >= DAILY_LIMIT) {
@@ -234,14 +227,12 @@ async function startBot() {
 
             await react('👍');
 
-            // ===== AUDIO =====
             if (msgType === 'audioMessage') {
                 await reply('عذراً، لا يمكنني معالجة الرسائل الصوتية حالياً. يرجى إرسال رسالة نصية.');
                 await react('❌');
                 return;
             }
 
-            // ===== IMAGE =====
             if (msgType === 'imageMessage') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
                 const base64 = buffer.toString('base64');
@@ -251,7 +242,6 @@ async function startBot() {
                 return;
             }
 
-            // ===== DOCUMENT =====
             if (msgType === 'documentMessage') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
                 const text = buffer.toString('utf-8');
@@ -265,7 +255,6 @@ async function startBot() {
                 return;
             }
 
-            // ===== TEXT =====
             if (!safeBody) return;
             if (!userChats[sender]) userChats[sender] = [];
             userChats[sender].push({ role: 'user', content: safeBody });
@@ -282,4 +271,18 @@ async function startBot() {
     });
 }
 
-startBot();
+// تشغيل البوت مع MongoDB
+async function main() {
+    try {
+        const client = new MongoClient(MONGO_URI);
+        await client.connect();
+        db = client.db('whatsapp_bot');
+        console.log('تم الاتصال بـ MongoDB');
+        await startBot();
+    } catch (e) {
+        console.log('خطأ في الاتصال بـ MongoDB:', e.message);
+        await startBot();
+    }
+}
+
+main();
