@@ -7,7 +7,6 @@ const {
 
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
-const axios = require('axios');
 
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 
@@ -63,14 +62,12 @@ async function askAI(messages) {
                 max_tokens: 1000
             })
         });
-
         const data = await response.json();
         if (!data?.choices?.[0]) throw new Error('AI error');
         return data.choices[0].message.content;
-
     } catch (e) {
         console.log("AI ERROR:", e.message);
-        return "حدث خطأ في الذكاء الاصطناعي";
+        return "حدث خطأ في الذكاء الاصطناعي، يرجى المحاولة مرة أخرى.";
     }
 }
 
@@ -89,28 +86,20 @@ async function askAIWithImage(base64Image, question) {
                     {
                         role: 'user',
                         content: [
-                            {
-                                type: 'image_url',
-                                image_url: { url: `data:image/jpeg;base64,${base64Image}` }
-                            },
-                            {
-                                type: 'text',
-                                text: question || 'اشرح هذه الصورة بالتفصيل'
-                            }
+                            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+                            { type: 'text', text: question || 'اشرح هذه الصورة بالتفصيل' }
                         ]
                     }
                 ],
                 max_tokens: 1000
             })
         });
-
         const data = await response.json();
         if (!data?.choices?.[0]) throw new Error('AI image error');
         return data.choices[0].message.content;
-
     } catch (e) {
         console.log("AI IMAGE ERROR:", e.message);
-        return "حدث خطأ في تحليل الصورة";
+        return "حدث خطأ في تحليل الصورة، يرجى المحاولة مرة أخرى.";
     }
 }
 
@@ -145,15 +134,11 @@ async function startBot() {
 
             const message = msg.message || {};
 
-            // 🔥 FIX 1: استخراج msgType بدون Object.entries crash
             const msgType = (() => {
                 const keys = Object.keys(message || {});
                 if (!Array.isArray(keys) || keys.length === 0) return null;
-
                 for (let k of keys) {
-                    if (message[k] !== undefined && message[k] !== null) {
-                        return k;
-                    }
+                    if (message[k] !== undefined && message[k] !== null) return k;
                 }
                 return null;
             })();
@@ -174,7 +159,6 @@ async function startBot() {
                 .replace('@lid', '')
                 .replace('@g.us', '');
 
-            // 🔥 FIX 2: body safe 100%
             const body =
                 (typeof message?.conversation === 'string' && message.conversation) ||
                 (typeof message?.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text) ||
@@ -200,9 +184,7 @@ async function startBot() {
 
             const react = async (emoji) => {
                 try {
-                    await sock.sendMessage(jid, {
-                        react: { text: emoji, key: msg.key }
-                    });
+                    await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
                 } catch {}
             };
 
@@ -211,40 +193,31 @@ async function startBot() {
                 if (safeBody.startsWith('!vip ')) {
                     const num = safeBody.split(' ')[1];
                     if (!vipNumbers.includes(num)) vipNumbers.push(num);
-                    await reply('تم إضافة VIP');
+                    await reply('تم إضافة ' + num + ' كـ VIP');
                     return;
                 }
-
                 if (safeBody.startsWith('!دل ')) {
                     const num = safeBody.split(' ')[1];
                     vipNumbers = vipNumbers.filter(n => n !== num);
-                    await reply('تم الحذف');
+                    await reply('تم حذف ' + num + ' من VIP');
                     return;
                 }
-
                 if (safeBody === '!قائمة') {
-                    await reply(vipNumbers.length ? vipNumbers.join('\n') : 'لا يوجد VIP');
+                    await reply(vipNumbers.length ? vipNumbers.join('\n') : 'لا يوجد أرقام VIP');
                     return;
                 }
-
                 if (safeBody === '!احصائيات') {
-                    await reply(
-                        Object.entries(userMessages)
-                            .map(([n, c]) => `${n}: ${c} رسالة`)
-                            .join('\n') || 'لا يوجد إحصائيات'
-                    );
+                    await reply(Object.entries(userMessages).map(([n, c]) => `${n}: ${c} رسالة`).join('\n') || 'لا يوجد إحصائيات');
                     return;
                 }
-
                 if (safeBody === '!مساعدة') {
-                    await reply('أوامر لوحة التحكم تعمل بشكل طبيعي');
+                    await reply('أوامر لوحة التحكم:\n!vip [رقم] - إضافة VIP\n!دل [رقم] - حذف VIP\n!قائمة - عرض VIP\n!احصائيات - إحصائيات اليوم\n!مسح [رقم] - مسح جلسة');
                     return;
                 }
-
                 if (safeBody.startsWith('!مسح ')) {
                     const num = safeBody.split(' ')[1];
                     delete userChats[num];
-                    await reply('تم المسح');
+                    await reply('تم مسح جلسة ' + num);
                     return;
                 }
             }
@@ -253,7 +226,7 @@ async function startBot() {
             if (!isAdmin && !isVip) {
                 if (!userMessages[sender]) userMessages[sender] = 0;
                 if (userMessages[sender] >= DAILY_LIMIT) {
-                    await reply('انتهى الحد اليومي');
+                    await reply('لقد وصلت إلى الحد اليومي المسموح به. يرجى المحاولة غداً.');
                     return;
                 }
                 userMessages[sender]++;
@@ -261,11 +234,17 @@ async function startBot() {
 
             await react('👍');
 
+            // ===== AUDIO =====
+            if (msgType === 'audioMessage') {
+                await reply('عذراً، لا يمكنني معالجة الرسائل الصوتية حالياً. يرجى إرسال رسالة نصية.');
+                await react('❌');
+                return;
+            }
+
             // ===== IMAGE =====
             if (msgType === 'imageMessage') {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
                 const base64 = buffer.toString('base64');
-
                 const res = await askAIWithImage(base64, safeBody);
                 await reply(res);
                 await react('✅');
@@ -274,25 +253,13 @@ async function startBot() {
 
             // ===== DOCUMENT =====
             if (msgType === 'documentMessage') {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: sock.logger });
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
                 const text = buffer.toString('utf-8');
-
-                const q = safeBody || 'اشرح الملف';
-
+                const q = safeBody || 'اشرح هذا الملف بالتفصيل';
                 if (!userChats[sender]) userChats[sender] = [];
-
-                userChats[sender].push({
-                    role: 'user',
-                    content: `${q}\n\n${text.slice(0, 5000)}`
-                });
-
-                const res = await askAI([
-                    { role: 'system', content: SYSTEM_PROMPT },
-                    ...userChats[sender]
-                ]);
-
+                userChats[sender].push({ role: 'user', content: `${q}\n\n${text.slice(0, 5000)}` });
+                const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
                 userChats[sender].push({ role: 'assistant', content: res });
-
                 await reply(res);
                 await react('✅');
                 return;
@@ -300,33 +267,16 @@ async function startBot() {
 
             // ===== TEXT =====
             if (!safeBody) return;
-
             if (!userChats[sender]) userChats[sender] = [];
-
-            userChats[sender].push({
-                role: 'user',
-                content: safeBody
-            });
-
-            if (userChats[sender].length > 20)
-                userChats[sender] = userChats[sender].slice(-20);
-
-            const res = await askAI([
-                { role: 'system', content: SYSTEM_PROMPT },
-                ...userChats[sender]
-            ]);
-
-            userChats[sender].push({
-                role: 'assistant',
-                content: res
-            });
-
+            userChats[sender].push({ role: 'user', content: safeBody });
+            if (userChats[sender].length > 20) userChats[sender] = userChats[sender].slice(-20);
+            const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
+            userChats[sender].push({ role: 'assistant', content: res });
             await reply(res);
             await react('✅');
 
         } catch (error) {
             console.log('خطا:', error.message);
-            await reply('حدث خطأ، يرجى المحاولة مرة أخرى.');
             await react('❌');
         }
     });
