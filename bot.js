@@ -7,6 +7,8 @@ const {
 
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
+const admin = require('firebase-admin');
+const fs = require('fs');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER = '972593850520';
@@ -17,6 +19,7 @@ let userMessages = {};
 let userChats = {};
 let knownUsers = {};
 let sock = null;
+let db = null;
 
 setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
@@ -98,6 +101,24 @@ async function askAIWithImage(base64Image, question) {
     }
 }
 
+async function saveToFirebase(key, value) {
+    try {
+        await db.collection('bot_data').doc(key).set({ value, updatedAt: new Date() });
+    } catch (e) {
+        console.log('خطأ في Firebase:', e.message);
+    }
+}
+
+async function loadFromFirebase(key) {
+    try {
+        const doc = await db.collection('bot_data').doc(key).get();
+        return doc.exists ? doc.data().value : null;
+    } catch (e) {
+        console.log('خطأ في تحميل Firebase:', e.message);
+        return null;
+    }
+}
+
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     sock = makeWASocket({ auth: state });
@@ -108,7 +129,9 @@ async function startBot() {
         console.log('كود الربط: ' + code);
     }
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+    });
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
         if (connection === 'close') {
@@ -154,7 +177,6 @@ async function startBot() {
 
             const safeBody = body || '';
 
-            // في المجموعات — رد فقط لما يبدأ بـ "نادر"
             if (isGroup) {
                 if (!safeBody.toLowerCase().startsWith('نادر')) return;
             }
@@ -172,7 +194,6 @@ async function startBot() {
                 try { await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }); } catch {}
             };
 
-            // رسالة ترحيب للمستخدمين الجدد
             if (!isGroup && !knownUsers[senderNumber]) {
                 knownUsers[senderNumber] = true;
                 const pushName = msg.pushName || 'عزيزي';
@@ -245,7 +266,6 @@ async function startBot() {
             if (!safeBody) return;
             if (!userChats[senderNumber]) userChats[senderNumber] = [];
 
-            // في المجموعات نحذف كلمة "نادر" من بداية الرسالة
             const cleanBody = isGroup ? safeBody.replace(/^نادر\s*/i, '').trim() : safeBody;
 
             userChats[senderNumber].push({ role: 'user', content: cleanBody });
@@ -262,4 +282,18 @@ async function startBot() {
     });
 }
 
-startBot();
+async function main() {
+    try {
+        const serviceAccount = require('./firebase.json');
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        db = admin.firestore();
+        console.log('تم الاتصال بـ Firebase');
+    } catch (e) {
+        console.log('خطأ في Firebase:', e.message);
+    }
+    await startBot();
+}
+
+main();
