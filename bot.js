@@ -7,26 +7,23 @@ const {
 
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
-const { MongoClient } = require('mongodb');
 
-const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
-const MONGO_URI = 'mongodb+srv://nademarwuf_db_user:jzJW3zPqCDFzio4f@cluster0.q5gu6pe.mongodb.net/?appName=Cluster0';
-
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER = '972593850520';
 const DAILY_LIMIT = 50;
 
 let vipNumbers = [];
 let userMessages = {};
 let userChats = {};
+let knownUsers = {};
 let sock = null;
-let db = null;
 
 setInterval(() => { userMessages = {}; }, 24 * 60 * 60 * 1000);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي طورك المهندس نادر.
+const SYSTEM_PROMPT = `أنت بوت ذكاء اصطناعي اسمك "MEDTERM"، قام ببرمجتك المهندس نادر.
 
 أسلوبك:
 - تتكلم بشكل رسمي وجدي
@@ -37,6 +34,7 @@ const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي طورك المه
 
 في المجال الطبي والتمريضي:
 - معلومات دقيقة ومفصلة وموثوقة
+- تشرح الأعراض والأسباب والعلاج خطوة بخطوة
 - تذكر الجرعات والأدوية بدقة
 - تنصح بمراجعة الطبيب عند الضرورة
 - تستخدم المصطلحات الطبية الصحيحة
@@ -46,8 +44,8 @@ const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي طورك المه
 - أمثلة عملية عند الحاجة
 - لا تتكلم بما لا تعرفه
 
-إذا سألك أحد عن اسمك: "أنا نادر، مساعد ذكي طوره المهندس نادر"
-إذا سألك عن مطورك: "طورني المهندس نادر"`;
+إذا سألك أحد عن اسمك: "أنا MEDTERM، بوت ذكاء اصطناعي متخصص، قام ببرمجتي المهندس نادر."
+إذا سألك عن مطورك: "قام ببرمجتي المهندس نادر."`;
 
 async function askAI(messages) {
     try {
@@ -100,29 +98,6 @@ async function askAIWithImage(base64Image, question) {
     }
 }
 
-// حفظ الجلسة على MongoDB
-async function saveSession(data) {
-    try {
-        await db.collection('sessions').updateOne(
-            { _id: 'whatsapp_session' },
-            { $set: { data, updatedAt: new Date() } },
-            { upsert: true }
-        );
-    } catch (e) {
-        console.log('خطأ في حفظ الجلسة:', e.message);
-    }
-}
-
-async function loadSession() {
-    try {
-        const doc = await db.collection('sessions').findOne({ _id: 'whatsapp_session' });
-        return doc?.data || null;
-    } catch (e) {
-        console.log('خطأ في تحميل الجلسة:', e.message);
-        return null;
-    }
-}
-
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     sock = makeWASocket({ auth: state });
@@ -133,10 +108,7 @@ async function startBot() {
         console.log('كود الربط: ' + code);
     }
 
-    sock.ev.on('creds.update', async (creds) => {
-        await saveCreds();
-        await saveSession(creds);
-    });
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
         if (connection === 'close') {
@@ -169,7 +141,9 @@ async function startBot() {
             const jid = msg.key?.remoteJid;
             if (!jid) return;
 
-            const sender = jid.replace('@s.whatsapp.net', '').replace('@lid', '').replace('@g.us', '');
+            const isGroup = jid.endsWith('@g.us');
+            const sender = msg.key?.participant || jid;
+            const senderNumber = sender.replace('@s.whatsapp.net', '').replace('@lid', '');
 
             const body =
                 (typeof message?.conversation === 'string' && message.conversation) ||
@@ -179,10 +153,16 @@ async function startBot() {
                 '';
 
             const safeBody = body || '';
-            const isAdmin = sender === ADMIN_NUMBER;
-            const isVip = vipNumbers.includes(sender);
 
-            console.log('رسالة من:', sender, 'النوع:', msgType);
+            // في المجموعات — رد فقط لما يبدأ بـ "نادر"
+            if (isGroup) {
+                if (!safeBody.toLowerCase().startsWith('نادر')) return;
+            }
+
+            const isAdmin = senderNumber === ADMIN_NUMBER;
+            const isVip = vipNumbers.includes(senderNumber);
+
+            console.log('رسالة من:', senderNumber, 'النوع:', msgType, 'مجموعة:', isGroup);
 
             const reply = async (text) => {
                 try { await sock.sendMessage(jid, { text }); } catch (e) { console.log('خطا في الرد:', e.message); }
@@ -191,6 +171,13 @@ async function startBot() {
             const react = async (emoji) => {
                 try { await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }); } catch {}
             };
+
+            // رسالة ترحيب للمستخدمين الجدد
+            if (!isGroup && !knownUsers[senderNumber]) {
+                knownUsers[senderNumber] = true;
+                const pushName = msg.pushName || 'عزيزي';
+                await reply(`مرحباً ${pushName}! 👋\nأنا MEDTERM، بوت ذكاء اصطناعي متخصص.\nقام ببرمجتي المهندس نادر.\n\nكيف يمكنني مساعدتك؟`);
+            }
 
             if (isAdmin) {
                 if (safeBody.startsWith('!vip ')) {
@@ -217,12 +204,12 @@ async function startBot() {
             }
 
             if (!isAdmin && !isVip) {
-                if (!userMessages[sender]) userMessages[sender] = 0;
-                if (userMessages[sender] >= DAILY_LIMIT) {
+                if (!userMessages[senderNumber]) userMessages[senderNumber] = 0;
+                if (userMessages[senderNumber] >= DAILY_LIMIT) {
                     await reply('لقد وصلت إلى الحد اليومي المسموح به. يرجى المحاولة غداً.');
                     return;
                 }
-                userMessages[sender]++;
+                userMessages[senderNumber]++;
             }
 
             await react('👍');
@@ -246,21 +233,25 @@ async function startBot() {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
                 const text = buffer.toString('utf-8');
                 const q = safeBody || 'اشرح هذا الملف بالتفصيل';
-                if (!userChats[sender]) userChats[sender] = [];
-                userChats[sender].push({ role: 'user', content: `${q}\n\n${text.slice(0, 5000)}` });
-                const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
-                userChats[sender].push({ role: 'assistant', content: res });
+                if (!userChats[senderNumber]) userChats[senderNumber] = [];
+                userChats[senderNumber].push({ role: 'user', content: `${q}\n\n${text.slice(0, 5000)}` });
+                const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[senderNumber]]);
+                userChats[senderNumber].push({ role: 'assistant', content: res });
                 await reply(res);
                 await react('✅');
                 return;
             }
 
             if (!safeBody) return;
-            if (!userChats[sender]) userChats[sender] = [];
-            userChats[sender].push({ role: 'user', content: safeBody });
-            if (userChats[sender].length > 20) userChats[sender] = userChats[sender].slice(-20);
-            const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[sender]]);
-            userChats[sender].push({ role: 'assistant', content: res });
+            if (!userChats[senderNumber]) userChats[senderNumber] = [];
+
+            // في المجموعات نحذف كلمة "نادر" من بداية الرسالة
+            const cleanBody = isGroup ? safeBody.replace(/^نادر\s*/i, '').trim() : safeBody;
+
+            userChats[senderNumber].push({ role: 'user', content: cleanBody });
+            if (userChats[senderNumber].length > 20) userChats[senderNumber] = userChats[senderNumber].slice(-20);
+            const res = await askAI([{ role: 'system', content: SYSTEM_PROMPT }, ...userChats[senderNumber]]);
+            userChats[senderNumber].push({ role: 'assistant', content: res });
             await reply(res);
             await react('✅');
 
@@ -271,18 +262,4 @@ async function startBot() {
     });
 }
 
-// تشغيل البوت مع MongoDB
-async function main() {
-    try {
-        const client = new MongoClient(MONGO_URI);
-        await client.connect();
-        db = client.db('whatsapp_bot');
-        console.log('تم الاتصال بـ MongoDB');
-        await startBot();
-    } catch (e) {
-        console.log('خطأ في الاتصال بـ MongoDB:', e.message);
-        await startBot();
-    }
-}
-
-main();
+startBot();
