@@ -2,6 +2,6 @@ services:
   - type: web
     name: whatsapp-bot
     env: node
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: npm install --legacy-peer-deps
+    startCommand: node bot.js
     plan: free
