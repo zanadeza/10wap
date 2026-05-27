@@ -349,7 +349,6 @@ async function startBot() {
         }
     });
 }
-const fs = require('fs');
 
-fs.rmSync('auth_info', { recursive: true, force: true });
+
 startBot();
