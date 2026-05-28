@@ -32,7 +32,7 @@ function loadData() {
     } catch (e) {
         console.log('تحميل بيانات جديدة...');
     }
-    return { userNames: {}, welcomedUsers: {}, vipNumbers: [] };
+    return { userNames: {}, welcomedUsers: {}, vipNumbers: [], reports: [], stats: { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedical: 0 } };
 }
 
 function saveData() {
@@ -40,14 +40,18 @@ function saveData() {
         fs.writeFileSync(DATA_FILE, JSON.stringify({
             userNames,
             welcomedUsers,
-            vipNumbers
+            vipNumbers,
+            reports,
+            stats
         }, null, 2));
     } catch (e) {
         console.log('خطأ في حفظ البيانات:', e.message);
     }
 }
 
-let { userNames, welcomedUsers, vipNumbers } = loadData();
+let { userNames, welcomedUsers, vipNumbers, reports, stats } = loadData();
+if (!reports) reports = [];
+if (!stats) stats = { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedical: 0 };
 let userChats = {};
 let sock = null;
 
@@ -55,27 +59,50 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
 // ===== SYSTEM PROMPT =====
-const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي على واتساب.
+const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي ومتخصص على واتساب.
 
-أسلوبك:
-- تحكي بالعامية العربية بشكل طبيعي ومريح
-- تمزح وتضحك مع الناس بس بنفس الوقت بتعطي معلومات دقيقة وصح
-- ردودك مفيدة ومباشرة، ما تحشو الكلام
-- لو حدا حكيلك بالإنجليزي رد عليه بالإنجليزي
-- لو سألك عن اسمك قلو: "أنا نادر 😄" بس ما تضل تكرر معلومات عن نفسك كل مرة
-- كن ودود وطبيعي زي الصاحب
+🎯 شخصيتك الأساسية (90% صارم وجدي):
+- ردودك مهنية ودقيقة ومباشرة دون أي حشو أو كلام فاضي
+- تتكلم بعامية عربية واضحة لكن بأسلوب جدي محترم
+- تعطي المعلومة كاملة وصحيحة في أول مرة
+- لا تتهاون في الدقة أبداً، المعلومة الخاطئة أخطر من الصمت
+- لو ما بتعرف شي قول "ما عندي معلومة كافية عن هاد الموضوع" بدل ما تخمن
+- لو حدا حكيلك بالإنجليزي رد عليه بالإنجليزي بنفس الأسلوب الجدي
+- لو سألك عن اسمك قلو: "أنا نادر" بدون ما تزيد
+
+😄 جانب خفيف (10% فقط - مزاح خفيف بالوقت المناسب):
+- أحياناً ممكن تضيف تعليق خفيف أو مزحة صغيرة بس بعد ما تعطي الإجابة الجدية
+- المزاح يكون لطيف ومناسب، مش في المواقف الحساسة أو الطبية الخطيرة
+- لا تبالغ في المزاح، جملة واحدة كافية كل فترة
 
 في المجال الطبي والعلمي:
-- معلومات دقيقة وموثوقة
-- اذكر الجرعات والأدوية بدقة لما يلزم
-- نصح بمراجعة الطبيب للحالات المهمة
+- معلومات دقيقة 100% موثوقة
+- اذكر الجرعات والأدوية بدقة عند الحاجة
+- نبّه دائماً بمراجعة الطبيب للحالات الخطيرة أو المزمنة
+- في تحليل الصور الطبية: كن متخصصاً ودقيقاً، اذكر الملاحظات بوضوح واطلب دائماً مراجعة متخصص للتأكيد
 
 في باقي المجالات:
-- إجابات علمية ودقيقة
+- إجابات علمية ودقيقة ومنظمة
 - أمثلة عملية عند الحاجة
-- لو ما بتعرف شي قول ما بعرف بدل ما تكذب
+- لا تطول الرد بلا داعٍ
 
-تذكر: اسم المستخدم اللي عم تحكي معو موجود في سياق المحادثة، استخدمو أحياناً بشكل طبيعي.`;
+تذكر: اسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`;
+
+// ===== MEDICAL IMAGE SYSTEM PROMPT =====
+const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. مهمتك تحليل الصور الطبية (أشعة، تحاليل، صور مجهرية، تقارير طبية) بدقة عالية.
+
+عند تحليل الصورة الطبية:
+1. **تحديد نوع الصورة**: أشعة X، CT، MRI، تحليل دم، تقرير مخبري، وغيره
+2. **الملاحظات الرئيسية**: ما تلاحظه بوضوح في الصورة
+3. **التفسير الطبي**: ماذا تعني هذه الملاحظات
+4. **مؤشرات طبيعية/غير طبيعية**: هل القيم أو الصورة ضمن المعدل الطبيعي
+5. **التوصية**: ما الخطوة التالية المقترحة
+
+قواعد مهمة:
+- كن دقيقاً ومهنياً في وصفك
+- اذكر أي نتيجة غير طبيعية بوضوح
+- دائماً في النهاية: "⚠️ هاد التحليل للمعلومة فقط، لازم تراجع طبيب متخصص للتشخيص النهائي"
+- لا تتهرب من الإجابة لأسباب غير طبية`;
 
 // ===== AI FUNCTIONS =====
 async function askAI(messages) {
@@ -104,8 +131,18 @@ async function askAI(messages) {
     }
 }
 
+// ===== MEDICAL IMAGE DETECTION =====
+function isMedicalImage(text) {
+    const medicalKeywords = /أشعة|xray|x-ray|x ray|mri|رنين|ct scan|سكان|تحليل دم|فحص دم|صورة طبية|تقرير طبي|مختبر|مخبر|lab|blood test|صورة صدر|قلب|كلية|كبد|دماغ|brain|lung|kidney|liver|heart|ultrasound|سونار|إيكو|echo|تخطيط|ecg|ekg|نتائج|results|تقرير|report|فحص/i;
+    return medicalKeywords.test(text || '');
+}
+
 async function askAIWithImage(base64Image, userQuestion, userName) {
     try {
+        const isMedical = isMedicalImage(userQuestion);
+        const systemToUse = isMedical ? MEDICAL_IMAGE_PROMPT : SYSTEM_PROMPT;
+        const questionText = userQuestion || (isMedical ? 'حلل هذه الصورة الطبية بالتفصيل' : 'احكيلي شو في هالصورة بالتفصيل');
+
         const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -115,7 +152,7 @@ async function askAIWithImage(base64Image, userQuestion, userName) {
             body: JSON.stringify({
                 model: 'pixtral-large-latest',
                 messages: [
-                    { role: 'system', content: SYSTEM_PROMPT },
+                    { role: 'system', content: systemToUse },
                     {
                         role: 'user',
                         content: [
@@ -125,13 +162,13 @@ async function askAIWithImage(base64Image, userQuestion, userName) {
                             },
                             {
                                 type: 'text',
-                                text: userQuestion || 'احكيلي شو في هالصورة بالتفصيل'
+                                text: userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText
                             }
                         ]
                     }
                 ],
-                max_tokens: 1500,
-                temperature: 0.7
+                max_tokens: isMedical ? 2000 : 1500,
+                temperature: isMedical ? 0.3 : 0.7
             })
         });
 
@@ -188,18 +225,19 @@ function buildWelcomeMessage(name) {
 
     return `${greeting}
 
-أنا *نادر*، مساعدك الذكي على واتساب! 🤖✨
+أنا *نادر*، مساعدك الذكي على واتساب. 🤖
 
 قادر أساعدك في:
 • أي سؤال أو استفسار 💬
-• تحليل الصور 🖼️
+• تحليل الصور والصور الطبية 🏥
 • قراءة وشرح الملفات 📄
-• معلومات طبية وعلمية 🏥
+• معلومات طبية وعلمية دقيقة
 • والكثير غيرها...
 
-بس خليك عارف إني شغال من *7 الصبح لـ 7 المسا* كل يوم ⏰
+شغال من *7 الصبح لـ 7 المسا* ⏰
+لو صار أي مشكلة: اكتب *!بلاغ* ووصف المشكلة
 
-اسأل بدون تردد، أنا هون! 😄
+اسأل بدون تردد! 😄
 
 ---
 _إذا عجبك البوت، شاركه مع أصحابك عشان يستفيدوا هم كمان_ 🙌`;
@@ -356,10 +394,15 @@ async function startBot() {
                     const activeUsers = Object.keys(userChats).filter(k => !k.includes('_')).length;
                     const welcomedCount = Object.keys(welcomedUsers).length;
                     await reply(
-                        `📊 إحصائيات البوت:\n` +
-                        `• مستخدمين تم استقبالهم: ${welcomedCount}\n` +
-                        `• مستخدمين نشطين في الجلسة: ${activeUsers}\n` +
-                        `• أرقام VIP: ${vipNumbers.length}`
+                        `📊 *إحصائيات البوت:*\n\n` +
+                        `👥 مستخدمين مسجلين: ${welcomedCount}\n` +
+                        `🟢 مستخدمين نشطين الآن: ${activeUsers}\n` +
+                        `⭐ أرقام VIP: ${vipNumbers.length}\n\n` +
+                        `💬 رسائل نصية: ${stats.totalMessages}\n` +
+                        `🖼️ صور محللة: ${stats.totalImages}\n` +
+                        `🏥 صور طبية: ${stats.totalMedical}\n` +
+                        `📄 ملفات: ${stats.totalDocs}\n` +
+                        `🚨 بلاغات: ${reports.length}`
                     );
                     return;
                 }
@@ -386,14 +429,58 @@ async function startBot() {
                         `!حذف [رقم] - حذف VIP\n` +
                         `!قائمة - عرض VIP\n` +
                         `!احصائيات - إحصائيات البوت\n` +
+                        `!بلاغات - عرض البلاغات الأخيرة\n` +
                         `!مسح [رقم] - مسح محادثة\n` +
                         `!مسح_كل - مسح كل الجلسات`
                     );
                     return;
                 }
+
+                if (safeBody === '!بلاغات') {
+                    if (!reports.length) {
+                        await reply('📭 ما في بلاغات حالياً');
+                    } else {
+                        const last10 = reports.slice(-10).reverse();
+                        let msg = `📋 آخر ${last10.length} بلاغات:\n\n`;
+                        last10.forEach((r, i) => {
+                            msg += `${i+1}. 👤 ${r.name || r.sender}\n📞 ${r.sender}\n📝 ${r.text}\n🕐 ${r.time}\n\n`;
+                        });
+                        await reply(msg);
+                    }
+                    return;
+                }
             }
 
             await react('👍');
+
+            // ===== نظام الإبلاغ عن مشكلة =====
+            if (safeBody.startsWith('!بلاغ ') || safeBody.startsWith('!مشكلة ') || safeBody.toLowerCase().startsWith('!report ')) {
+                const reportText = safeBody.split(' ').slice(1).join(' ').trim();
+                if (!reportText) {
+                    await reply('❓ اكتب المشكلة بعد الأمر، مثال:\n!بلاغ البوت ما رد عليّ بشكل صحيح');
+                    return;
+                }
+                const report = {
+                    sender,
+                    name: userNames[sender] || 'غير معروف',
+                    text: reportText,
+                    time: new Date().toLocaleString('ar-SA', { timeZone: 'Asia/Jerusalem' })
+                };
+                reports.push(report);
+                if (reports.length > 500) reports = reports.slice(-500);
+                saveData();
+
+                // إشعار الأدمن
+                try {
+                    await sock.sendMessage(`${ADMIN_NUMBER}@s.whatsapp.net`, {
+                        text: `🚨 *بلاغ جديد*\n👤 ${report.name}\n📞 ${report.sender}\n📝 ${report.text}\n🕐 ${report.time}`
+                    });
+                } catch {}
+
+                await reply('✅ تم استلام بلاغك وسيتم مراجعته. شكراً على تواصلك!');
+                await react('✅');
+                return;
+            }
 
             // ===== استخراج اسم المستخدم =====
             let userName = userNames[sender];
@@ -450,6 +537,10 @@ async function startBot() {
                 try {
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: { level: 'silent', child: () => ({ level: 'silent' }) } });
                     const base64 = buffer.toString('base64');
+                    const isMed = isMedicalImage(safeBody);
+                    stats.totalImages++;
+                    if (isMed) stats.totalMedical++;
+                    saveData();
 
                     const res = await askAIWithImage(base64, safeBody, userName);
                     await reply(res);
@@ -487,6 +578,8 @@ async function startBot() {
             // ===== معالجة الملفات =====
             if (msgType === 'documentMessage') {
                 try {
+                    stats.totalDocs++;
+                    saveData();
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: { level: 'silent', child: () => ({ level: 'silent' }) } });
                     const mimeType = message.documentMessage?.mimetype || '';
                     let fileText = '';
@@ -559,6 +652,7 @@ async function startBot() {
                 role: 'user',
                 content: safeBody
             });
+            stats.totalMessages++;
 
             // الحفاظ على آخر 20 رسالة فقط
             if (userChats[sender].length > 25)
@@ -596,6 +690,10 @@ async function startBot() {
 
 // ===== START =====
 console.log('🚀 جاري تشغيل البوت...');
+
+// تشغيل لوحة التحكم
+require('./dashboard');
+
 startBot().catch(e => {
     console.error('خطأ في تشغيل البوت:', e);
     setTimeout(startBot, 5000);
