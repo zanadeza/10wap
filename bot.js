@@ -13,6 +13,7 @@ const fs = require('fs');
 // ===== CONFIG =====
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER = '972593850520';
+const BOT_NAME = 'MedTerm';
 
 // ===== PERSISTENCE =====
 const DATA_FILE = './bot_data.json';
@@ -22,10 +23,15 @@ function loadData() {
         if (fs.existsSync(DATA_FILE)) {
             return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
         }
-    } catch (e) {
-        console.log('تحميل بيانات جديدة...');
-    }
-    return { userNames: {}, welcomedUsers: {}, vipNumbers: [], reports: [], stats: { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedical: 0 } };
+    } catch (e) {}
+    return {
+        userNames: {},
+        welcomedUsers: {},
+        vipNumbers: [],
+        reports: [],
+        stats: { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedical: 0 },
+        userLanguages: {}
+    };
 }
 
 function saveData() {
@@ -35,65 +41,62 @@ function saveData() {
             welcomedUsers,
             vipNumbers,
             reports,
-            stats
+            stats,
+            userLanguages
         }, null, 2));
     } catch (e) {
         console.log('خطأ في حفظ البيانات:', e.message);
     }
 }
 
-let { userNames, welcomedUsers, vipNumbers, reports, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, reports, stats, userLanguages } = loadData();
 if (!reports) reports = [];
 if (!stats) stats = { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedical: 0 };
+if (!userLanguages) userLanguages = {};
+
 let userChats = {};
 let sock = null;
 
-
 // ===== SYSTEM PROMPT =====
-const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي ومتخصص على واتساب.
+const SYSTEM_PROMPT = `اسمك "${BOT_NAME}"، بوت ذكاء اصطناعي متخصص على واتساب.
 
-🎯 شخصيتك الأساسية (90% صارم وجدي):
-- ردودك مهنية ودقيقة ومباشرة دون أي حشو أو كلام فاضي
-- تتكلم بعامية عربية واضحة لكن بأسلوب جدي محترم
-- تعطي المعلومة كاملة وصحيحة في أول مرة
-- لا تتهاون في الدقة أبداً، المعلومة الخاطئة أخطر من الصمت
-- لو ما بتعرف شي قول "ما عندي معلومة كافية عن هاد الموضوع" بدل ما تخمن
-- لو حدا حكيلك بالإنجليزي رد عليه بالإنجليزي بنفس الأسلوب الجدي
-- لو سألك عن اسمك قلو: "أنا نادر" بدون ما تزيد
-
-😄 جانب خفيف (10% فقط - مزاح خفيف بالوقت المناسب):
-- أحياناً ممكن تضيف تعليق خفيف أو مزحة صغيرة بس بعد ما تعطي الإجابة الجدية
-- المزاح يكون لطيف ومناسب، مش في المواقف الحساسة أو الطبية الخطيرة
-- لا تبالغ في المزاح، جملة واحدة كافية كل فترة
+شخصيتك (95% جدية ومهنية):
+- ردودك دقيقة ومباشرة وبدون أي حشو أو كلام زائد
+- اللغة الأساسية عربية فصحى واضحة وسهلة الفهم
+- إذا طلب المستخدم لغة أخرى، تحدث معه بها
+- تعطي المعلومة الصحيحة الكاملة في أول مرة
+- لا تتهاون أبداً في الدقة، المعلومة الخاطئة أخطر من الصمت
+- إذا لم تعرف شيئاً قل "لا تتوفر لديّ معلومات كافية حول هذا الموضوع"
+- تدعم جميع أرقام دول العالم وتتعامل مع الجميع باحترام
+- لو سألك عن اسمك قل: "أنا ${BOT_NAME}، بوت ذكاء اصطناعي"
+- ردودك منطقية ومن مصادر موثوقة
+- لا تستخدم جداول في ردودك، استخدم النص العادي فقط
+- لا تستخدم كلمات أجنبية أو مصطلحات غير مفهومة، عربي وإنجليزي فقط عند الحاجة
+- اقرأ سياق المحادثة كاملاً قبل الرد واربط الرسائل ببعضها بذكاء
 
 في المجال الطبي والعلمي:
 - معلومات دقيقة 100% موثوقة
 - اذكر الجرعات والأدوية بدقة عند الحاجة
 - نبّه دائماً بمراجعة الطبيب للحالات الخطيرة أو المزمنة
-- في تحليل الصور الطبية: كن متخصصاً ودقيقاً، اذكر الملاحظات بوضوح واطلب دائماً مراجعة متخصص للتأكيد
-
-في باقي المجالات:
-- إجابات علمية ودقيقة ومنظمة
-- أمثلة عملية عند الحاجة
-- لا تطول الرد بلا داعٍ
+- في تحليل الصور الطبية: كن متخصصاً ودقيقاً واطلب مراجعة متخصص للتأكيد
 
 تذكر: اسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`;
 
-// ===== MEDICAL IMAGE SYSTEM PROMPT =====
-const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. مهمتك تحليل الصور الطبية (أشعة، تحاليل، صور مجهرية، تقارير طبية) بدقة عالية.
+// ===== MEDICAL IMAGE PROMPT =====
+const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. مهمتك تحليل الصور الطبية بدقة عالية.
 
 عند تحليل الصورة الطبية:
-1. **تحديد نوع الصورة**: أشعة X، CT، MRI، تحليل دم، تقرير مخبري، وغيره
-2. **الملاحظات الرئيسية**: ما تلاحظه بوضوح في الصورة
-3. **التفسير الطبي**: ماذا تعني هذه الملاحظات
-4. **مؤشرات طبيعية/غير طبيعية**: هل القيم أو الصورة ضمن المعدل الطبيعي
-5. **التوصية**: ما الخطوة التالية المقترحة
+1. تحديد نوع الصورة: أشعة X أو CT أو MRI أو تحليل دم أو تقرير مخبري
+2. الملاحظات الرئيسية: ما تلاحظه بوضوح في الصورة
+3. التفسير الطبي: ماذا تعني هذه الملاحظات
+4. المؤشرات الطبيعية أو غير الطبيعية: هل القيم ضمن المعدل الطبيعي
+5. التوصية: ما الخطوة التالية المقترحة
 
 قواعد مهمة:
 - كن دقيقاً ومهنياً في وصفك
 - اذكر أي نتيجة غير طبيعية بوضوح
-- دائماً في النهاية: "⚠️ هاد التحليل للمعلومة فقط، لازم تراجع طبيب متخصص للتشخيص النهائي"
-- لا تتهرب من الإجابة لأسباب غير طبية`;
+- لا تستخدم جداول، اكتب كل شيء كنص عادي
+- دائماً في النهاية: "تنبيه: هذا التحليل للمعلومة فقط، يجب مراجعة طبيب متخصص للتشخيص النهائي"`;
 
 // ===== AI FUNCTIONS =====
 async function askAI(messages) {
@@ -107,32 +110,32 @@ async function askAI(messages) {
             body: JSON.stringify({
                 model: 'mistral-small-latest',
                 messages,
-                max_tokens: 1000,
-                temperature: 0.8
+                max_tokens: 1200,
+                temperature: 0.5
             })
         });
 
         const data = await response.json();
-        if (!data?.choices?.[0]) throw new Error('No response from AI');
+        if (!data?.choices?.[0]) throw new Error('No response');
         return data.choices[0].message.content;
 
     } catch (e) {
         console.log("AI ERROR:", e.message);
-        return "عندي مشكلة تقنية هلق، جرب مرة ثانية 😅";
+        return "عذراً، حدث خطأ تقني. يرجى المحاولة مرة أخرى.";
     }
 }
 
 // ===== MEDICAL IMAGE DETECTION =====
 function isMedicalImage(text) {
-    const medicalKeywords = /أشعة|xray|x-ray|x ray|mri|رنين|ct scan|سكان|تحليل دم|فحص دم|صورة طبية|تقرير طبي|مختبر|مخبر|lab|blood test|صورة صدر|قلب|كلية|كبد|دماغ|brain|lung|kidney|liver|heart|ultrasound|سونار|إيكو|echo|تخطيط|ecg|ekg|نتائج|results|تقرير|report|فحص/i;
-    return medicalKeywords.test(text || '');
+    const keywords = /أشعة|xray|x-ray|mri|رنين|ct scan|تحليل دم|فحص دم|صورة طبية|تقرير طبي|مختبر|مخبر|lab|blood test|صورة صدر|قلب|كلية|كبد|دماغ|brain|lung|kidney|liver|heart|ultrasound|سونار|إيكو|echo|ecg|ekg|نتائج|results|تقرير|فحص/i;
+    return keywords.test(text || '');
 }
 
 async function askAIWithImage(base64Image, userQuestion, userName) {
     try {
         const isMedical = isMedicalImage(userQuestion);
         const systemToUse = isMedical ? MEDICAL_IMAGE_PROMPT : SYSTEM_PROMPT;
-        const questionText = userQuestion || (isMedical ? 'حلل هذه الصورة الطبية بالتفصيل' : 'احكيلي شو في هالصورة بالتفصيل');
+        const questionText = userQuestion || (isMedical ? 'حلل هذه الصورة الطبية بالتفصيل' : 'صف ما تراه في هذه الصورة بالتفصيل');
 
         const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
             method: 'POST',
@@ -147,19 +150,13 @@ async function askAIWithImage(base64Image, userQuestion, userName) {
                     {
                         role: 'user',
                         content: [
-                            {
-                                type: 'image_url',
-                                image_url: { url: `data:image/jpeg;base64,${base64Image}` }
-                            },
-                            {
-                                type: 'text',
-                                text: userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText
-                            }
+                            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+                            { type: 'text', text: userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText }
                         ]
                     }
                 ],
                 max_tokens: isMedical ? 2000 : 1500,
-                temperature: isMedical ? 0.3 : 0.7
+                temperature: isMedical ? 0.3 : 0.5
             })
         });
 
@@ -169,69 +166,109 @@ async function askAIWithImage(base64Image, userQuestion, userName) {
 
     } catch (e) {
         console.log("AI IMAGE ERROR:", e.message);
-        return "ما قدرت أحلل الصورة هلق، جرب مرة ثانية 😕";
+        return "عذراً، لم أتمكن من تحليل الصورة. يرجى المحاولة مرة أخرى.";
     }
 }
 
-async function analyzeDocument(text, userQuestion, userName) {
-    try {
-        const prompt = `${userName ? `اسم المستخدم: ${userName}\n` : ''}المستخدم بعت ملف وسأل: "${userQuestion || 'احكيلي عن هالملف'}"
+// ===== BROADCAST TO ALL USERS =====
+async function broadcastToAll(text) {
+    const allUsers = Object.keys(welcomedUsers);
+    let sent = 0;
+    let failed = 0;
 
-محتوى الملف:
-${text.slice(0, 6000)}
-
-اشرح الملف وجاوب على سؤاله بشكل مفيد.`;
-
-        const messages = [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: prompt }
-        ];
-
-        return await askAI(messages);
-    } catch (e) {
-        return "ما قدرت أقرأ الملف، تأكد إنو ملف نصي 📄";
-    }
-}
-
-// ===== GET USER NAME FROM WHATSAPP =====
-async function getUserName(jid) {
-    try {
-        // محاولة جلب الاسم من جهات الاتصال
-        if (sock?.store?.contacts) {
-            const contact = sock.store.contacts[jid];
-            if (contact?.name || contact?.notify) {
-                return contact.name || contact.notify;
-            }
+    for (const num of allUsers) {
+        try {
+            await sock.sendMessage(`${num}@s.whatsapp.net`, { text });
+            sent++;
+            await new Promise(r => setTimeout(r, 800)); // تأخير لتجنب الحظر
+        } catch (e) {
+            failed++;
         }
-        return null;
-    } catch (e) {
-        return null;
     }
+    return { sent, failed, total: allUsers.length };
 }
+
+// ===== PRAYER TIMES (بتوقيت فلسطين - القدس) =====
+// مواعيد تقريبية - يمكن تعديلها حسب المنطقة
+const PRAYER_SCHEDULE = [
+    { name: 'الفجر',    hour: 4,  minute: 30 },
+    { name: 'الظهر',    hour: 12, minute: 15 },
+    { name: 'العصر',    hour: 15, minute: 30 },
+    { name: 'المغرب',   hour: 18, minute: 15 },
+    { name: 'العشاء',   hour: 20, minute: 0  }
+];
+
+// ===== DHIKR MESSAGES =====
+const DHIKR_MESSAGES = [
+    "سبحان الله وبحمده، سبحان الله العظيم\n\nاللهم أعنّا على ذكرك وشكرك وحسن عبادتك",
+    "أستغفر الله العظيم الذي لا إله إلا هو الحي القيوم وأتوب إليه\n\nاستغفروا ربكم إنه كان غفاراً",
+    "لا إله إلا الله وحده لا شريك له، له الملك وله الحمد وهو على كل شيء قدير\n\nأكثروا من هذا الذكر في صباحكم ومسائكم",
+    "اللهم صلِّ على محمد وعلى آل محمد كما صليت على إبراهيم وعلى آل إبراهيم إنك حميد مجيد\n\nأكثروا من الصلاة على النبي في كل وقت",
+    "سبحان الله والحمد لله ولا إله إلا الله والله أكبر\n\nهذه الكلمات أحب إلى الله من كل ما طلعت عليه الشمس",
+    "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ\n\nاللهم آمين",
+];
+
+const SALAH_ON_PROPHET = [
+    "اللهم صلِّ على محمد وعلى آل محمد\nكما صليت على إبراهيم وعلى آل إبراهيم\nإنك حميد مجيد",
+    "اللهم صلِّ وسلِّم وبارك على نبينا محمد\nمن صلّى عليّ مرة صلى الله عليه بها عشراً",
+    "اللهم صلِّ على محمد النبي الأمي وعلى آله وصحبه وسلِّم\nأكثروا من الصلاة على النبي يوم الجمعة",
+];
 
 // ===== WELCOME MESSAGE =====
 function buildWelcomeMessage(name) {
     const firstName = name ? name.split(' ')[0] : null;
-    const greeting = firstName ? `أهلاً ${firstName}! 👋` : `أهلاً! 👋`;
+    const greeting = firstName ? `أهلاً ${firstName}` : `أهلاً`;
 
-    return `${greeting}
+    return `${greeting} 👋
 
-أنا *نادر*، مساعدك الذكي على واتساب. 🤖
+أنا *${BOT_NAME}*، بوت ذكاء اصطناعي على واتساب.
 
-قادر أساعدك في:
-• أي سؤال أو استفسار 💬
-• تحليل الصور والصور الطبية 🏥
-• قراءة وشرح الملفات 📄
+أستطيع مساعدتك في:
+• الإجابة على أي سؤال
+• تحليل الصور والصور الطبية
 • معلومات طبية وعلمية دقيقة
-• والكثير غيرها...
 
-شغال *24/7* على مدار الساعة ⏰
-لو صار أي مشكلة: اكتب *!بلاغ* ووصف المشكلة
+للإبلاغ عن مشكلة اكتب: *!بلاغ* ثم وصف المشكلة
 
-اسأل بدون تردد! 😄
+اسأل بدون تردد 🤝`;
+}
 
----
-_إذا عجبك البوت، شاركه مع أصحابك عشان يستفيدوا هم كمان_ 🙌`;
+// ===== SCHEDULERS =====
+function startSchedulers() {
+
+    // فحص أوقات الصلاة كل دقيقة
+    setInterval(async () => {
+        if (!sock) return;
+        const now = new Date();
+        const hour = now.getHours();
+        const minute = now.getMinutes();
+
+        for (const prayer of PRAYER_SCHEDULE) {
+            if (prayer.hour === hour && prayer.minute === minute) {
+                const msg = `🕌 *حان وقت صلاة ${prayer.name}*\n\nاللهم اجعلنا من المحافظين على الصلوات\nحي على الصلاة، حي على الفلاح`;
+                await broadcastToAll(msg).catch(() => {});
+                console.log(`📿 تم إرسال تنبيه صلاة ${prayer.name}`);
+            }
+        }
+    }, 60 * 1000);
+
+    // ذكر واستغفار كل ساعة
+    setInterval(async () => {
+        if (!sock) return;
+        const dhikr = DHIKR_MESSAGES[Math.floor(Math.random() * DHIKR_MESSAGES.length)];
+        const msg = `📿 *ذكر الساعة*\n\n${dhikr}`;
+        await broadcastToAll(msg).catch(() => {});
+        console.log('📿 تم إرسال الذكر');
+    }, 60 * 60 * 1000);
+
+    // صلاة على النبي كل ساعتين
+    setInterval(async () => {
+        if (!sock) return;
+        const salah = SALAH_ON_PROPHET[Math.floor(Math.random() * SALAH_ON_PROPHET.length)];
+        const msg = `💚 *صلاة على النبي ﷺ*\n\n${salah}`;
+        await broadcastToAll(msg).catch(() => {});
+        console.log('💚 تم إرسال الصلاة على النبي');
+    }, 2 * 60 * 60 * 1000);
 }
 
 // ===== MAIN BOT =====
@@ -256,6 +293,7 @@ async function startBot() {
 
         if (connection === 'open') {
             console.log('✅ البوت جاهز وشغال!');
+            startSchedulers();
         }
 
         if (connection === 'close') {
@@ -280,28 +318,17 @@ async function startBot() {
 
             const message = msg.message || {};
 
-            // استخراج نوع الرسالة
             const msgType = (() => {
                 const keys = Object.keys(message || {});
-                if (!Array.isArray(keys) || keys.length === 0) return null;
+                if (!keys.length) return null;
                 for (let k of keys) {
-                    if (
-                        message[k] !== undefined &&
-                        message[k] !== null &&
-                        k !== 'messageContextInfo'
-                    ) return k;
+                    if (message[k] !== undefined && message[k] !== null && k !== 'messageContextInfo') return k;
                 }
                 return null;
             })();
 
             if (!msgType) return;
-
-            if (
-                msgType === 'protocolMessage' ||
-                msgType === 'senderKeyDistributionMessage' ||
-                msgType === 'messageContextInfo' ||
-                msgType === 'reactionMessage'
-            ) return;
+            if (['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo', 'reactionMessage'].includes(msgType)) return;
 
             const jid = msg.key?.remoteJid;
             if (!jid) return;
@@ -312,7 +339,6 @@ async function startBot() {
                 ? msg.key.participant.replace('@s.whatsapp.net', '').replace('@lid', '')
                 : jid.replace('@s.whatsapp.net', '').replace('@lid', '').replace('@g.us', '');
 
-            // استخراج الرسالة النصية
             const body =
                 (typeof message?.conversation === 'string' && message.conversation) ||
                 (typeof message?.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text) ||
@@ -322,10 +348,9 @@ async function startBot() {
                 '';
 
             const safeBody = body.trim();
-
             const isAdmin = sender === ADMIN_NUMBER;
 
-            console.log(`📨 رسالة من: ${sender} | النوع: ${msgType} | المجموعة: ${isGroup}`);
+            console.log(`📨 من: ${sender} | النوع: ${msgType}`);
 
             const reply = async (text) => {
                 try {
@@ -337,52 +362,57 @@ async function startBot() {
 
             const react = async (emoji) => {
                 try {
-                    await sock.sendMessage(jid, {
-                        react: { text: emoji, key: msg.key }
-                    });
+                    await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
                 } catch {}
             };
 
-            // ===== ADMIN COMMANDS =====
+            // ===== أوامر الأدمن =====
             if (isAdmin) {
+                // بث رسالة لجميع المستخدمين
+                if (safeBody.startsWith('!بث ') || safeBody.startsWith('!broadcast ')) {
+                    const broadcastText = safeBody.split(' ').slice(1).join(' ').trim();
+                    if (!broadcastText) {
+                        await reply('اكتب الرسالة بعد الأمر\nمثال: !بث مرحباً بالجميع');
+                        return;
+                    }
+                    await reply('⏳ جاري إرسال الرسالة للجميع...');
+                    const result = await broadcastToAll(`📢 *رسالة من الإدارة*\n\n${broadcastText}`);
+                    await reply(`✅ تم الإرسال\nالمُرسَل: ${result.sent}\nفشل: ${result.failed}\nالإجمالي: ${result.total}`);
+                    return;
+                }
+
                 if (safeBody.startsWith('!vip ')) {
                     const num = safeBody.split(' ')[1]?.trim();
-                    if (num && !vipNumbers.includes(num)) {
-                        vipNumbers.push(num);
-                        saveData();
-                    }
+                    if (num && !vipNumbers.includes(num)) { vipNumbers.push(num); saveData(); }
                     await reply('✅ تم إضافة VIP');
                     return;
                 }
 
-                if (safeBody.startsWith('!حذف ') || safeBody.startsWith('!دل ')) {
+                if (safeBody.startsWith('!حذف ')) {
                     const num = safeBody.split(' ')[1]?.trim();
                     vipNumbers = vipNumbers.filter(n => n !== num);
                     saveData();
-                    await reply('🗑️ تم الحذف من VIP');
+                    await reply('تم الحذف من VIP');
                     return;
                 }
 
                 if (safeBody === '!قائمة') {
-                    await reply(vipNumbers.length
-                        ? `قائمة VIP:\n${vipNumbers.join('\n')}`
-                        : 'ما في أرقام VIP حالياً');
+                    await reply(vipNumbers.length ? `قائمة VIP:\n${vipNumbers.join('\n')}` : 'لا يوجد أرقام VIP حالياً');
                     return;
                 }
 
                 if (safeBody === '!احصائيات') {
-                    const activeUsers = Object.keys(userChats).filter(k => !k.includes('_')).length;
+                    const activeUsers = Object.keys(userChats).length;
                     const welcomedCount = Object.keys(welcomedUsers).length;
                     await reply(
-                        `📊 *إحصائيات البوت:*\n\n` +
-                        `👥 مستخدمين مسجلين: ${welcomedCount}\n` +
-                        `🟢 مستخدمين نشطين الآن: ${activeUsers}\n` +
-                        `⭐ أرقام VIP: ${vipNumbers.length}\n\n` +
-                        `💬 رسائل نصية: ${stats.totalMessages}\n` +
-                        `🖼️ صور محللة: ${stats.totalImages}\n` +
-                        `🏥 صور طبية: ${stats.totalMedical}\n` +
-                        `📄 ملفات: ${stats.totalDocs}\n` +
-                        `🚨 بلاغات: ${reports.length}`
+                        `إحصائيات ${BOT_NAME}:\n\n` +
+                        `المستخدمون المسجلون: ${welcomedCount}\n` +
+                        `المستخدمون النشطون: ${activeUsers}\n` +
+                        `أرقام VIP: ${vipNumbers.length}\n\n` +
+                        `الرسائل النصية: ${stats.totalMessages}\n` +
+                        `الصور المحللة: ${stats.totalImages}\n` +
+                        `الصور الطبية: ${stats.totalMedical}\n` +
+                        `البلاغات: ${reports.length}`
                     );
                     return;
                 }
@@ -392,52 +422,53 @@ async function startBot() {
                     delete userChats[num];
                     delete welcomedUsers[num];
                     saveData();
-                    await reply('🗑️ تم مسح محادثة ' + num);
+                    await reply('تم مسح محادثة ' + num);
                     return;
                 }
 
                 if (safeBody === '!مسح_كل') {
                     userChats = {};
-                    await reply('✅ تم مسح كل الجلسات');
-                    return;
-                }
-
-                if (safeBody === '!مساعدة') {
-                    await reply(
-                        `🛠️ أوامر الأدمن:\n` +
-                        `!vip [رقم] - إضافة VIP\n` +
-                        `!حذف [رقم] - حذف VIP\n` +
-                        `!قائمة - عرض VIP\n` +
-                        `!احصائيات - إحصائيات البوت\n` +
-                        `!بلاغات - عرض البلاغات الأخيرة\n` +
-                        `!مسح [رقم] - مسح محادثة\n` +
-                        `!مسح_كل - مسح كل الجلسات`
-                    );
+                    await reply('تم مسح كل الجلسات');
                     return;
                 }
 
                 if (safeBody === '!بلاغات') {
                     if (!reports.length) {
-                        await reply('📭 ما في بلاغات حالياً');
+                        await reply('لا يوجد بلاغات حالياً');
                     } else {
                         const last10 = reports.slice(-10).reverse();
-                        let msg = `📋 آخر ${last10.length} بلاغات:\n\n`;
+                        let txt = `آخر ${last10.length} بلاغات:\n\n`;
                         last10.forEach((r, i) => {
-                            msg += `${i+1}. 👤 ${r.name || r.sender}\n📞 ${r.sender}\n📝 ${r.text}\n🕐 ${r.time}\n\n`;
+                            txt += `${i+1}. ${r.name || r.sender}\n${r.sender}\n${r.text}\n${r.time}\n\n`;
                         });
-                        await reply(msg);
+                        await reply(txt);
                     }
+                    return;
+                }
+
+                if (safeBody === '!مساعدة') {
+                    await reply(
+                        `أوامر الأدمن:\n\n` +
+                        `!بث [رسالة] - إرسال رسالة لجميع المستخدمين\n` +
+                        `!vip [رقم] - إضافة VIP\n` +
+                        `!حذف [رقم] - حذف VIP\n` +
+                        `!قائمة - عرض VIP\n` +
+                        `!احصائيات - إحصائيات البوت\n` +
+                        `!بلاغات - عرض البلاغات\n` +
+                        `!مسح [رقم] - مسح محادثة\n` +
+                        `!مسح_كل - مسح كل الجلسات`
+                    );
                     return;
                 }
             }
 
             await react('👍');
 
-            // ===== نظام الإبلاغ عن مشكلة =====
-            if (safeBody.startsWith('!بلاغ ') || safeBody.startsWith('!مشكلة ') || safeBody.toLowerCase().startsWith('!report ')) {
+            // ===== نظام الإبلاغ =====
+            if (safeBody.startsWith('!بلاغ ') || safeBody.startsWith('!مشكلة ')) {
                 const reportText = safeBody.split(' ').slice(1).join(' ').trim();
                 if (!reportText) {
-                    await reply('❓ اكتب المشكلة بعد الأمر، مثال:\n!بلاغ البوت ما رد عليّ بشكل صحيح');
+                    await reply('اكتب المشكلة بعد الأمر\nمثال: !بلاغ البوت لم يرد بشكل صحيح');
                     return;
                 }
                 const report = {
@@ -450,63 +481,41 @@ async function startBot() {
                 if (reports.length > 500) reports = reports.slice(-500);
                 saveData();
 
-                // إشعار الأدمن
                 try {
                     await sock.sendMessage(`${ADMIN_NUMBER}@s.whatsapp.net`, {
-                        text: `🚨 *بلاغ جديد*\n👤 ${report.name}\n📞 ${report.sender}\n📝 ${report.text}\n🕐 ${report.time}`
+                        text: `بلاغ جديد\nالمستخدم: ${report.name}\nالرقم: ${report.sender}\nالمشكلة: ${report.text}\nالوقت: ${report.time}`
                     });
                 } catch {}
 
-                await reply('✅ تم استلام بلاغك وسيتم مراجعته. شكراً على تواصلك!');
+                await reply('تم استلام بلاغك وسيتم مراجعته. شكراً على تواصلك.');
                 await react('✅');
                 return;
             }
 
             // ===== استخراج اسم المستخدم =====
             let userName = userNames[sender];
-
-            if (!userName) {
-                // محاولة جلب الاسم من push name أو الـ contact info
-                const pushName = msg.pushName;
-                if (pushName && pushName.trim()) {
-                    userName = pushName.trim();
-                    userNames[sender] = userName;
-                    saveData();
-                    console.log(`💾 حفظ اسم: ${userName} لـ ${sender}`);
-                }
+            if (!userName && msg.pushName?.trim()) {
+                userName = msg.pushName.trim();
+                userNames[sender] = userName;
+                saveData();
             }
 
-            // ===== رسالة الترحيب (مرة واحدة فقط) =====
+            // ===== رسالة الترحيب =====
             if (!welcomedUsers[sender]) {
                 welcomedUsers[sender] = true;
+                if (!userName && msg.pushName) { userName = msg.pushName.trim(); userNames[sender] = userName; }
                 saveData();
-
-                // تحديث الاسم إذا وصل مع أول رسالة
-                if (!userName && msg.pushName) {
-                    userName = msg.pushName.trim();
-                    userNames[sender] = userName;
-                    saveData();
-                }
-
                 await reply(buildWelcomeMessage(userName));
-
-                // تهيئة الجلسة مع معلومة الاسم
                 if (!userChats[sender]) userChats[sender] = [];
                 if (userName) {
-                    userChats[sender].push({
-                        role: 'user',
-                        content: `[معلومة: اسم هذا المستخدم هو "${userName}"]`
-                    });
-                    userChats[sender].push({
-                        role: 'assistant',
-                        content: `أهلاً ${userName}! كيف أقدر أساعدك؟ 😊`
-                    });
+                    userChats[sender].push({ role: 'user', content: `[اسم المستخدم: ${userName}]` });
+                    userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
                 }
                 return;
             }
 
             // تحديث الاسم إذا تغير
-            if (msg.pushName && msg.pushName.trim() && msg.pushName.trim() !== userNames[sender]) {
+            if (msg.pushName?.trim() && msg.pushName.trim() !== userNames[sender]) {
                 userNames[sender] = msg.pushName.trim();
                 userName = userNames[sender];
                 saveData();
@@ -521,155 +530,95 @@ async function startBot() {
                     stats.totalImages++;
                     if (isMed) stats.totalMedical++;
                     saveData();
-
                     const res = await askAIWithImage(base64, safeBody, userName);
                     await reply(res);
                     await react('✅');
                 } catch (e) {
-                    console.log('خطأ في معالجة الصورة:', e.message);
-                    await reply('ما قدرت أحمل الصورة، جرب مرة ثانية 😕');
+                    await reply('لم أتمكن من تحليل الصورة، يرجى المحاولة مرة أخرى.');
                     await react('❌');
                 }
                 return;
             }
 
-            // ===== معالجة الفيديو بالتعليق =====
-            if (msgType === 'videoMessage') {
-                if (safeBody) {
-                    // لو في سؤال على الفيديو
-                    if (!userChats[sender]) userChats[sender] = [];
-                    userChats[sender].push({
-                        role: 'user',
-                        content: `المستخدم بعت فيديو وسأل: "${safeBody}". أخبره إنك ما تقدر تشوف الفيديو بس ممكن تساعده بأي سؤال ثاني.`
-                    });
-                    const res = await askAI([
-                        { role: 'system', content: SYSTEM_PROMPT },
-                        ...userChats[sender]
-                    ]);
-                    userChats[sender].push({ role: 'assistant', content: res });
-                    await reply(res);
-                } else {
-                    await reply("🎬 مشان الله، ما أقدر أشوف الفيديوهات حالياً، بس لو عندك سؤال أنا هون!");
-                }
-                await react('✅');
-                return;
-            }
-
-            // ===== معالجة الملفات =====
+            // ===== الملفات غير مدعومة =====
             if (msgType === 'documentMessage') {
-                try {
-                    stats.totalDocs++;
-                    saveData();
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: { level: 'silent', child: () => ({ level: 'silent' }) } });
-                    const mimeType = message.documentMessage?.mimetype || '';
-                    let fileText = '';
-
-                    if (mimeType.includes('text') || mimeType.includes('json') || mimeType.includes('xml')) {
-                        fileText = buffer.toString('utf-8');
-                    } else if (mimeType.includes('pdf')) {
-                        fileText = `[ملف PDF - حجم: ${(buffer.length / 1024).toFixed(1)} KB]\n${buffer.toString('utf-8', 0, 3000)}`;
-                    } else {
-                        fileText = buffer.toString('utf-8');
-                    }
-
-                    if (!userChats[sender]) userChats[sender] = [];
-
-                    const question_text = safeBody || 'احكيلي عن هالملف وشو مهم فيه';
-
-                    userChats[sender].push({
-                        role: 'user',
-                        content: `${userName ? `اسمي ${userName}. ` : ''}بعتلك ملف وبدي: ${question_text}\n\n--- محتوى الملف ---\n${fileText.slice(0, 6000)}`
-                    });
-
-                    const res = await askAI([
-                        { role: 'system', content: SYSTEM_PROMPT },
-                        ...userChats[sender]
-                    ]);
-
-                    userChats[sender].push({ role: 'assistant', content: res });
-
-                    if (userChats[sender].length > 30)
-                        userChats[sender] = userChats[sender].slice(-30);
-
-                    await reply(res);
-                    await react('✅');
-                } catch (e) {
-                    console.log('خطأ في معالجة الملف:', e.message);
-                    await reply('ما قدرت أقرأ الملف، تأكد إنو ملف نصي أو PDF 📄');
-                    await react('❌');
-                }
+                await reply(
+                    `عذراً، الملفات غير مدعومة حالياً.\n\n` +
+                    `ما يدعمه ${BOT_NAME}:\n` +
+                    `الرسائل النصية\n` +
+                    `الصور وتحليلها\n` +
+                    `الصور الطبية\n\n` +
+                    `يمكنك نسخ محتوى الملف وإرساله كنص.`
+                );
+                await react('ℹ️');
                 return;
             }
 
-            // ===== رسائل الصوت =====
+            // ===== الفيديو غير مدعوم =====
+            if (msgType === 'videoMessage') {
+                await reply(
+                    `عذراً، الفيديوهات غير مدعومة حالياً.\n\n` +
+                    `ما يدعمه ${BOT_NAME}:\n` +
+                    `الرسائل النصية\n` +
+                    `الصور وتحليلها\n` +
+                    `الصور الطبية`
+                );
+                await react('ℹ️');
+                return;
+            }
+
+            // ===== الصوت غير مدعوم =====
             if (msgType === 'audioMessage' || msgType === 'pttMessage') {
-                await reply("🎤 الرسائل الصوتية ما أقدر أسمعها حالياً، بس لو حكيتلي نص أساعدك بثواني! 😊");
-                await react('✅');
+                await reply(
+                    `عذراً، الرسائل الصوتية غير مدعومة حالياً.\n\n` +
+                    `ما يدعمه ${BOT_NAME}:\n` +
+                    `الرسائل النصية\n` +
+                    `الصور وتحليلها\n` +
+                    `الصور الطبية`
+                );
+                await react('ℹ️');
                 return;
             }
 
             // ===== الرسائل النصية =====
             if (!safeBody) return;
 
-            // فحص إذا المستخدم سأل عن اسمه
-            const askingAboutName = /اسم[يك]|من أنت|من انت|who are you|your name/i.test(safeBody);
-
             if (!userChats[sender]) userChats[sender] = [];
 
-            // إضافة الاسم للسياق لو ما كان موجود
+            // إضافة الاسم للسياق إذا لم يكن موجوداً
             if (userName && userChats[sender].length === 0) {
-                userChats[sender].push({
-                    role: 'user',
-                    content: `[اسم المستخدم: ${userName}]`
-                });
-                userChats[sender].push({
-                    role: 'assistant',
-                    content: `أهلاً ${userName}!`
-                });
+                userChats[sender].push({ role: 'user', content: `[اسم المستخدم: ${userName}]` });
+                userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
             }
 
-            userChats[sender].push({
-                role: 'user',
-                content: safeBody
-            });
+            userChats[sender].push({ role: 'user', content: safeBody });
             stats.totalMessages++;
 
-            // الحفاظ على آخر 20 رسالة فقط
-            if (userChats[sender].length > 25)
-                userChats[sender] = userChats[sender].slice(-25);
+            // الاحتفاظ بآخر 30 رسالة لسياق كامل
+            if (userChats[sender].length > 30)
+                userChats[sender] = userChats[sender].slice(-30);
 
             const res = await askAI([
                 { role: 'system', content: SYSTEM_PROMPT },
                 ...userChats[sender]
             ]);
 
-            userChats[sender].push({
-                role: 'assistant',
-                content: res
-            });
+            userChats[sender].push({ role: 'assistant', content: res });
 
-            // إضافة رسالة المشاركة بشكل عشوائي (1 من كل 10 رسائل)
-            const shouldAddShare = Math.random() < 0.1;
-            const finalRes = shouldAddShare
-                ? `${res}\n\n---\n_إذا عجبك البوت، شاركه مع أصحابك عشان يستفيدوا هم كمان_ 😊`
-                : res;
-
-            await reply(finalRes);
+            await reply(res);
             await react('✅');
 
         } catch (error) {
-            console.log('❌ خطأ عام:', error.message);
+            console.log('خطأ عام:', error.message);
             try {
                 await sock.sendMessage(msg.key.remoteJid, {
-                    text: 'صار خطأ تقني، جرب مرة ثانية 🔧'
+                    text: 'حدث خطأ تقني، يرجى المحاولة مرة أخرى.'
                 }, { quoted: msg });
             } catch {}
         }
     });
 }
 
-
-
 // ===== START =====
-console.log('🚀 جاري تشغيل البوت...');
+console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
 startBot();
