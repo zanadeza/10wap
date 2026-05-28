@@ -699,11 +699,7 @@ console.log('🚀 جاري تشغيل البوت...');
  */
 
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 
-const DATA_FILE = './bot_data.json';
-const ADMIN_NUMBER = '972593850520';
 const PORT = process.env.DASHBOARD_PORT || 3000;
 
 // ===== بيانات حية (مشتركة مع البوت عبر الملف) =====
