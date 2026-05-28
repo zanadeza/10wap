@@ -14,14 +14,6 @@ const fs = require('fs');
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER = '972593850520';
 
-// ===== WORK HOURS =====
-// البوت شغال من 7 صباحاً لـ 7 مساءً
-function isWorkingHours() {
-    const now = new Date();
-    const hour = now.getHours();
-    return hour >= 7 && hour < 19;
-}
-
 // ===== PERSISTENCE =====
 const DATA_FILE = './bot_data.json';
 
@@ -233,7 +225,7 @@ function buildWelcomeMessage(name) {
 • معلومات طبية وعلمية دقيقة
 • والكثير غيرها...
 
-شغال من *7 الصبح لـ 7 المسا* ⏰
+شغال *24/7* على مدار الساعة ⏰
 لو صار أي مشكلة: اكتب *!بلاغ* ووصف المشكلة
 
 اسأل بدون تردد! 😄
@@ -350,19 +342,6 @@ async function startBot() {
                     });
                 } catch {}
             };
-
-            // ===== التحقق من ساعات العمل (ليس للأدمن) =====
-            if (!isAdmin && !isWorkingHours()) {
-                if (!userChats[sender + '_offhours_notified']) {
-                    userChats[sender + '_offhours_notified'] = true;
-                    await reply(
-                        `عذراً، أنا بشتغل من *7 الصبح لـ 7 المسا* فقط ⏰\n\nجرب تتواصل معي خلال هالأوقات وأنا هون! 😊`
-                    );
-                }
-                return;
-            }
-            // تصفير إشعار خارج أوقات العمل عند العودة
-            delete userChats[sender + '_offhours_notified'];
 
             // ===== ADMIN COMMANDS =====
             if (isAdmin) {
