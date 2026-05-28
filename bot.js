@@ -248,15 +248,9 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
+        printQRInTerminal: true,
         browser: ['نادر Bot', 'Chrome', '1.0.0']
     });
-
-    if (!state.creds.registered) {
-        const number = await question('اكتب رقمك (مع كود البلد بدون +): ');
-        const code = await sock.requestPairingCode(number.trim());
-        console.log('\n🔑 كود الربط: ' + code + '\n');
-    }
 
     sock.ev.on('creds.update', saveCreds);
 
