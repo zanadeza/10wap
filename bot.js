@@ -1,12 +1,13 @@
 const {
     default: makeWASocket,
     useMultiFileAuthState,
+    fetchLatestBaileysVersion,
     DisconnectReason,
+    Browsers,
     downloadMediaMessage
 } = require('@whiskeysockets/baileys');
 
-const { Boom } = require('@hapi/boom');
-const readline = require('readline');
+const QRCode = require('qrcode-terminal');
 const fs = require('fs');
 
 // ===== CONFIG =====
@@ -55,8 +56,6 @@ if (!stats) stats = { totalMessages: 0, totalImages: 0, totalDocs: 0, totalMedic
 let userChats = {};
 let sock = null;
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
 // ===== SYSTEM PROMPT =====
 const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي ومتخصص على واتساب.
@@ -245,30 +244,38 @@ _إذا عجبك البوت، شاركه مع أصحابك عشان يستفيد
 
 // ===== MAIN BOT =====
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    const { state, saveCreds } = await useMultiFileAuthState('./session');
+    const { version } = await fetchLatestBaileysVersion();
     sock = makeWASocket({
+        version,
         auth: state,
-        printQRInTerminal: true,
-        browser: ['نادر Bot', 'Chrome', '1.0.0']
+        browser: Browsers.macOS('Desktop')
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, qr, lastDisconnect } = update;
+
+        if (qr) {
+            console.log('\n📱 امسح QR التالي:\n');
+            QRCode.generate(qr, { small: true });
+        }
+
+        if (connection === 'open') {
+            console.log('✅ البوت جاهز وشغال!');
+        }
+
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = code !== DisconnectReason.loggedOut;
-            console.log('الاتصال انقطع، الكود:', code);
+            console.log('❌ انقطع الاتصال، الكود:', code);
             if (shouldReconnect) {
                 console.log('إعادة الاتصال خلال 5 ثواني...');
                 setTimeout(startBot, 5000);
             } else {
                 console.log('تم تسجيل الخروج، يجب ربط الجلسة من جديد.');
             }
-        } else if (connection === 'open') {
-            console.log('✅ البوت جاهز وشغال!');
-        } else if (connection === 'connecting') {
-            console.log('⏳ جاري الاتصال...');
         }
     });
 
@@ -686,7 +693,4 @@ async function startBot() {
 
 // ===== START =====
 console.log('🚀 جاري تشغيل البوت...');
-startBot().catch(e => {
-    console.error('خطأ في تشغيل البوت:', e);
-    setTimeout(startBot, 5000);
-});
+startBot();
