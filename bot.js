@@ -1,5 +1,3 @@
-console.log("🚀 BOT STARTING...");
-
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -9,105 +7,77 @@ const {
 
 const { Boom } = require('@hapi/boom');
 const readline = require('readline');
-const admin = require('firebase-admin');
 const fs = require('fs');
 
-/* =========================
-   FETCH FIX (Render/Railway)
-========================= */
-const fetch = (...args) =>
-    import('node-fetch').then(({ default: fetch }) => fetch(...args));
-
-/* =========================
-   AI CONFIG (Mistral)
-========================= */
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
-
-/* =========================
-   ADMIN SETTINGS
-========================= */
+// ===== CONFIG =====
+const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER = '972593850520';
-const DAILY_LIMIT = 50;
 
-/* =========================
-   MEMORY STORAGE (NO CHANGE)
-========================= */
-let vipNumbers = [];
-let userMessages = {};
-let userChats = {};
-let knownUsers = {};
-let sock = null;
-let db = null;
+// ===== WORK HOURS =====
+// البوت شغال من 7 صباحاً لـ 7 مساءً
+function isWorkingHours() {
+    const now = new Date();
+    const hour = now.getHours();
+    return hour >= 7 && hour < 19;
+}
 
-/* =========================
-   AUTO CLEAN MEMORY
-========================= */
-setInterval(() => {
-    userMessages = {};
-}, 24 * 60 * 60 * 1000);
+// ===== PERSISTENCE =====
+const DATA_FILE = './bot_data.json';
 
-setInterval(() => {
-    for (let key in userChats) {
-        if (userChats[key]?.length > 30) {
-            userChats[key] = userChats[key].slice(-20);
+function loadData() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
         }
+    } catch (e) {
+        console.log('تحميل بيانات جديدة...');
     }
-}, 60000);
+    return { userNames: {}, welcomedUsers: {}, vipNumbers: [] };
+}
 
-/* =========================
-   SAFE ERROR HANDLERS
-========================= */
-process.on('uncaughtException', (err) => {
-    console.log('UNCAUGHT ERROR:', err);
-});
+function saveData() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify({
+            userNames,
+            welcomedUsers,
+            vipNumbers
+        }, null, 2));
+    } catch (e) {
+        console.log('خطأ في حفظ البيانات:', e.message);
+    }
+}
 
-process.on('unhandledRejection', (err) => {
-    console.log('PROMISE ERROR:', err);
-});
+let { userNames, welcomedUsers, vipNumbers } = loadData();
+let userChats = {};
+let sock = null;
 
-/* =========================
-   CLI INPUT (FIXED FOR RAILWAY)
-   ❗ بدل readline التفاعلي نخليه optional
-========================= */
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text) => new Promise(resolve => rl.question(text, resolve));
 
-const question = (text) => {
-    return new Promise(resolve => {
-        // Railway fix: لا يعلق إذا ما في input
-        try {
-            rl.question(text, answer => resolve(answer));
-        } catch {
-            resolve('');
-        }
-    });
-};
-
-/* =========================
-   SYSTEM PROMPT (UNCHANGED STYLE)
-========================= */
-const SYSTEM_PROMPT = `أنت بوت ذكاء اصطناعي اسمك "MEDTERM"، قام ببرمجتك المهندس نادر.
+// ===== SYSTEM PROMPT =====
+const SYSTEM_PROMPT = `اسمك "نادر"، مساعد ذكي على واتساب.
 
 أسلوبك:
-- تتكلم بشكل رسمي وجدي
-- ردودك دقيقة ومختصرة ومفيدة
-- لا تستخدم كلام فارغ
-- العربية الفصحى أو الإنجليزية
+- تحكي بالعامية العربية بشكل طبيعي ومريح
+- تمزح وتضحك مع الناس بس بنفس الوقت بتعطي معلومات دقيقة وصح
+- ردودك مفيدة ومباشرة، ما تحشو الكلام
+- لو حدا حكيلك بالإنجليزي رد عليه بالإنجليزي
+- لو سألك عن اسمك قلو: "أنا نادر 😄" بس ما تضل تكرر معلومات عن نفسك كل مرة
+- كن ودود وطبيعي زي الصاحب
 
-في الطب:
-- شرح دقيق
-- أعراض وأسباب وعلاج
-- جرعات عند الحاجة
-- تنصح بالطبيب
+في المجال الطبي والعلمي:
+- معلومات دقيقة وموثوقة
+- اذكر الجرعات والأدوية بدقة لما يلزم
+- نصح بمراجعة الطبيب للحالات المهمة
 
-إذا سُئلت عنك:
-"أنا MEDTERM، بوت ذكاء اصطناعي متخصص، قام ببرمجتي المهندس نادر."`;
+في باقي المجالات:
+- إجابات علمية ودقيقة
+- أمثلة عملية عند الحاجة
+- لو ما بتعرف شي قول ما بعرف بدل ما تكذب
 
-/* =========================
-   MISTRAL AI (UNCHANGED LOGIC)
-========================= */
+تذكر: اسم المستخدم اللي عم تحكي معو موجود في سياق المحادثة، استخدمو أحياناً بشكل طبيعي.`;
+
+// ===== AI FUNCTIONS =====
 async function askAI(messages) {
     try {
         const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
@@ -119,27 +89,22 @@ async function askAI(messages) {
             body: JSON.stringify({
                 model: 'mistral-small-latest',
                 messages,
-                max_tokens: 1000
+                max_tokens: 1000,
+                temperature: 0.8
             })
         });
 
         const data = await response.json();
-
-        if (!data?.choices?.[0]) {
-            return "النظام مشغول حالياً";
-        }
-
+        if (!data?.choices?.[0]) throw new Error('No response from AI');
         return data.choices[0].message.content;
 
     } catch (e) {
-        return "AI ERROR";
+        console.log("AI ERROR:", e.message);
+        return "عندي مشكلة تقنية هلق، جرب مرة ثانية 😅";
     }
 }
 
-/* =========================
-   IMAGE AI (UNCHANGED LOGIC)
-========================= */
-async function askAIWithImage(base64Image, question) {
+async function askAIWithImage(base64Image, userQuestion, userName) {
     try {
         const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
             method: 'POST',
@@ -160,99 +125,118 @@ async function askAIWithImage(base64Image, question) {
                             },
                             {
                                 type: 'text',
-                                text: question || 'اشرح الصورة'
+                                text: userQuestion || 'احكيلي شو في هالصورة بالتفصيل'
                             }
                         ]
                     }
                 ],
-                max_tokens: 1000
+                max_tokens: 1500,
+                temperature: 0.7
             })
         });
 
         const data = await response.json();
-        return data?.choices?.[0]?.message?.content || "IMAGE ERROR";
+        if (!data?.choices?.[0]) throw new Error('AI image error');
+        return data.choices[0].message.content;
 
     } catch (e) {
-        return "IMAGE ERROR";
+        console.log("AI IMAGE ERROR:", e.message);
+        return "ما قدرت أحلل الصورة هلق، جرب مرة ثانية 😕";
     }
 }
 
-/* =========================
-   FIREBASE (FIX ONLY)
-========================= */
-try {
-    const serviceAccount = {
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-    };
-
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-
-    db = admin.firestore();
-    console.log("🔥 Firebase connected");
-
-} catch (e) {
-    console.log("⚠️ Firebase error:", e.message);
-}
-
-/* =========================
-   SAVE / LOAD FIREBASE (UNCHANGED)
-========================= */
-async function saveToFirebase(key, value) {
+async function analyzeDocument(text, userQuestion, userName) {
     try {
-        await db.collection('bot_data').doc(key).set({
-            value,
-            updatedAt: new Date()
-        });
+        const prompt = `${userName ? `اسم المستخدم: ${userName}\n` : ''}المستخدم بعت ملف وسأل: "${userQuestion || 'احكيلي عن هالملف'}"
+
+محتوى الملف:
+${text.slice(0, 6000)}
+
+اشرح الملف وجاوب على سؤاله بشكل مفيد.`;
+
+        const messages = [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: prompt }
+        ];
+
+        return await askAI(messages);
     } catch (e) {
-        console.log('Firebase error:', e.message);
+        return "ما قدرت أقرأ الملف، تأكد إنو ملف نصي 📄";
     }
 }
 
-async function loadFromFirebase(key) {
+// ===== GET USER NAME FROM WHATSAPP =====
+async function getUserName(jid) {
     try {
-        const doc = await db.collection('bot_data').doc(key).get();
-        return doc.exists ? doc.data().value : null;
+        // محاولة جلب الاسم من جهات الاتصال
+        if (sock?.store?.contacts) {
+            const contact = sock.store.contacts[jid];
+            if (contact?.name || contact?.notify) {
+                return contact.name || contact.notify;
+            }
+        }
+        return null;
     } catch (e) {
         return null;
     }
 }
 
-/* =========================
-   BOT START (FIX ONLY)
-   ❗ حذفنا readline الإجباري + pairing problem
-========================= */
+// ===== WELCOME MESSAGE =====
+function buildWelcomeMessage(name) {
+    const firstName = name ? name.split(' ')[0] : null;
+    const greeting = firstName ? `أهلاً ${firstName}! 👋` : `أهلاً! 👋`;
+
+    return `${greeting}
+
+أنا *نادر*، مساعدك الذكي على واتساب! 🤖✨
+
+قادر أساعدك في:
+• أي سؤال أو استفسار 💬
+• تحليل الصور 🖼️
+• قراءة وشرح الملفات 📄
+• معلومات طبية وعلمية 🏥
+• والكثير غيرها...
+
+بس خليك عارف إني شغال من *7 الصبح لـ 7 المسا* كل يوم ⏰
+
+اسأل بدون تردد، أنا هون! 😄
+
+---
+_إذا عجبك البوت، شاركه مع أصحابك عشان يستفيدوا هم كمان_ 🙌`;
+}
+
+// ===== MAIN BOT =====
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true
+        printQRInTerminal: false,
+        browser: ['نادر Bot', 'Chrome', '1.0.0']
     });
+
+    if (!state.creds.registered) {
+        const number = await question('اكتب رقمك (مع كود البلد بدون +): ');
+        const code = await sock.requestPairingCode(number.trim());
+        console.log('\n🔑 كود الربط: ' + code + '\n');
+    }
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
-
-            console.log("Disconnected:", code);
-
-            if (code !== DisconnectReason.loggedOut) {
-                setTimeout(() => {
-                    startBot();
-                }, 7000);
+            const shouldReconnect = code !== DisconnectReason.loggedOut;
+            console.log('الاتصال انقطع، الكود:', code);
+            if (shouldReconnect) {
+                console.log('إعادة الاتصال خلال 5 ثواني...');
+                setTimeout(startBot, 5000);
             } else {
-                console.log("Logged out → delete auth_info");
+                console.log('تم تسجيل الخروج، يجب ربط الجلسة من جديد.');
             }
-        }
-
-        if (connection === 'open') {
-            console.log("WhatsApp Connected");
+        } else if (connection === 'open') {
+            console.log('✅ البوت جاهز وشغال!');
+        } else if (connection === 'connecting') {
+            console.log('⏳ جاري الاتصال...');
         }
     });
 
@@ -261,20 +245,64 @@ async function startBot() {
             if (type !== 'notify') return;
 
             const msg = messages?.[0];
-            if (!msg?.message || msg.key.fromMe) return;
+            if (!msg?.message || msg?.key?.fromMe) return;
 
-            const jid = msg.key.remoteJid;
-            const sender = msg.key.participant || jid;
-            const senderNumber = sender.replace('@s.whatsapp.net', '');
+            const message = msg.message || {};
 
+            // استخراج نوع الرسالة
+            const msgType = (() => {
+                const keys = Object.keys(message || {});
+                if (!Array.isArray(keys) || keys.length === 0) return null;
+                for (let k of keys) {
+                    if (
+                        message[k] !== undefined &&
+                        message[k] !== null &&
+                        k !== 'messageContextInfo'
+                    ) return k;
+                }
+                return null;
+            })();
+
+            if (!msgType) return;
+
+            if (
+                msgType === 'protocolMessage' ||
+                msgType === 'senderKeyDistributionMessage' ||
+                msgType === 'messageContextInfo' ||
+                msgType === 'reactionMessage'
+            ) return;
+
+            const jid = msg.key?.remoteJid;
+            if (!jid) return;
+
+            const isGroup = jid.endsWith('@g.us');
+
+            const sender = msg.key?.participant
+                ? msg.key.participant.replace('@s.whatsapp.net', '').replace('@lid', '')
+                : jid.replace('@s.whatsapp.net', '').replace('@lid', '').replace('@g.us', '');
+
+            // استخراج الرسالة النصية
             const body =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                msg.message?.imageMessage?.caption ||
-                msg.message?.documentMessage?.caption ||
+                (typeof message?.conversation === 'string' && message.conversation) ||
+                (typeof message?.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text) ||
+                (typeof message?.imageMessage?.caption === 'string' && message.imageMessage.caption) ||
+                (typeof message?.documentMessage?.caption === 'string' && message.documentMessage.caption) ||
+                (typeof message?.videoMessage?.caption === 'string' && message.videoMessage.caption) ||
                 '';
 
-            const reply = (t) => sock.sendMessage(jid, { text: t });
+            const safeBody = body.trim();
+
+            const isAdmin = sender === ADMIN_NUMBER;
+
+            console.log(`📨 رسالة من: ${sender} | النوع: ${msgType} | المجموعة: ${isGroup}`);
+
+            const reply = async (text) => {
+                try {
+                    await sock.sendMessage(jid, { text }, { quoted: msg });
+                } catch (e) {
+                    console.log('خطأ في الرد:', e.message);
+                }
+            };
 
             const react = async (emoji) => {
                 try {
@@ -284,71 +312,291 @@ async function startBot() {
                 } catch {}
             };
 
-            const isAdmin = senderNumber === ADMIN_NUMBER;
-            const isVip = vipNumbers.includes(senderNumber);
-
-            /* ================= ADMIN ================= */
-            if (isAdmin) {
-                if (body.startsWith('!vip ')) {
-                    const num = body.split(' ')[1];
-                    if (!vipNumbers.includes(num)) vipNumbers.push(num);
-                    return reply('VIP added');
+            // ===== التحقق من ساعات العمل (ليس للأدمن) =====
+            if (!isAdmin && !isWorkingHours()) {
+                if (!userChats[sender + '_offhours_notified']) {
+                    userChats[sender + '_offhours_notified'] = true;
+                    await reply(
+                        `عذراً، أنا بشتغل من *7 الصبح لـ 7 المسا* فقط ⏰\n\nجرب تتواصل معي خلال هالأوقات وأنا هون! 😊`
+                    );
                 }
-
-                if (body.startsWith('!del ')) {
-                    const num = body.split(' ')[1];
-                    vipNumbers = vipNumbers.filter(n => n !== num);
-                    return reply('VIP removed');
-                }
-
-                if (body === '!list') {
-                    return reply(vipNumbers.join('\n') || 'empty');
-                }
+                return;
             }
+            // تصفير إشعار خارج أوقات العمل عند العودة
+            delete userChats[sender + '_offhours_notified'];
 
-            /* ================= LIMIT ================= */
-            if (!isAdmin && !isVip) {
-                if (!userMessages[senderNumber]) userMessages[senderNumber] = 0;
-
-                if (userMessages[senderNumber] >= DAILY_LIMIT) {
-                    return reply('LIMIT REACHED');
+            // ===== ADMIN COMMANDS =====
+            if (isAdmin) {
+                if (safeBody.startsWith('!vip ')) {
+                    const num = safeBody.split(' ')[1]?.trim();
+                    if (num && !vipNumbers.includes(num)) {
+                        vipNumbers.push(num);
+                        saveData();
+                    }
+                    await reply('✅ تم إضافة VIP');
+                    return;
                 }
 
-                userMessages[senderNumber]++;
+                if (safeBody.startsWith('!حذف ') || safeBody.startsWith('!دل ')) {
+                    const num = safeBody.split(' ')[1]?.trim();
+                    vipNumbers = vipNumbers.filter(n => n !== num);
+                    saveData();
+                    await reply('🗑️ تم الحذف من VIP');
+                    return;
+                }
+
+                if (safeBody === '!قائمة') {
+                    await reply(vipNumbers.length
+                        ? `قائمة VIP:\n${vipNumbers.join('\n')}`
+                        : 'ما في أرقام VIP حالياً');
+                    return;
+                }
+
+                if (safeBody === '!احصائيات') {
+                    const activeUsers = Object.keys(userChats).filter(k => !k.includes('_')).length;
+                    const welcomedCount = Object.keys(welcomedUsers).length;
+                    await reply(
+                        `📊 إحصائيات البوت:\n` +
+                        `• مستخدمين تم استقبالهم: ${welcomedCount}\n` +
+                        `• مستخدمين نشطين في الجلسة: ${activeUsers}\n` +
+                        `• أرقام VIP: ${vipNumbers.length}`
+                    );
+                    return;
+                }
+
+                if (safeBody.startsWith('!مسح ')) {
+                    const num = safeBody.split(' ')[1]?.trim();
+                    delete userChats[num];
+                    delete welcomedUsers[num];
+                    saveData();
+                    await reply('🗑️ تم مسح محادثة ' + num);
+                    return;
+                }
+
+                if (safeBody === '!مسح_كل') {
+                    userChats = {};
+                    await reply('✅ تم مسح كل الجلسات');
+                    return;
+                }
+
+                if (safeBody === '!مساعدة') {
+                    await reply(
+                        `🛠️ أوامر الأدمن:\n` +
+                        `!vip [رقم] - إضافة VIP\n` +
+                        `!حذف [رقم] - حذف VIP\n` +
+                        `!قائمة - عرض VIP\n` +
+                        `!احصائيات - إحصائيات البوت\n` +
+                        `!مسح [رقم] - مسح محادثة\n` +
+                        `!مسح_كل - مسح كل الجلسات`
+                    );
+                    return;
+                }
             }
 
             await react('👍');
 
-            /* ================= IMAGE ================= */
-            if (msg.message?.imageMessage) {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console });
-                const base64 = buffer.toString('base64');
+            // ===== استخراج اسم المستخدم =====
+            let userName = userNames[sender];
 
-                const res = await askAIWithImage(base64, body);
-                await reply(res);
-                return react('✅');
+            if (!userName) {
+                // محاولة جلب الاسم من push name أو الـ contact info
+                const pushName = msg.pushName;
+                if (pushName && pushName.trim()) {
+                    userName = pushName.trim();
+                    userNames[sender] = userName;
+                    saveData();
+                    console.log(`💾 حفظ اسم: ${userName} لـ ${sender}`);
+                }
             }
 
-            /* ================= CHAT ================= */
-            if (!userChats[senderNumber]) userChats[senderNumber] = [];
+            // ===== رسالة الترحيب (مرة واحدة فقط) =====
+            if (!welcomedUsers[sender]) {
+                welcomedUsers[sender] = true;
+                saveData();
 
-            userChats[senderNumber].push({ role: 'user', content: body });
+                // تحديث الاسم إذا وصل مع أول رسالة
+                if (!userName && msg.pushName) {
+                    userName = msg.pushName.trim();
+                    userNames[sender] = userName;
+                    saveData();
+                }
+
+                await reply(buildWelcomeMessage(userName));
+
+                // تهيئة الجلسة مع معلومة الاسم
+                if (!userChats[sender]) userChats[sender] = [];
+                if (userName) {
+                    userChats[sender].push({
+                        role: 'user',
+                        content: `[معلومة: اسم هذا المستخدم هو "${userName}"]`
+                    });
+                    userChats[sender].push({
+                        role: 'assistant',
+                        content: `أهلاً ${userName}! كيف أقدر أساعدك؟ 😊`
+                    });
+                }
+                return;
+            }
+
+            // تحديث الاسم إذا تغير
+            if (msg.pushName && msg.pushName.trim() && msg.pushName.trim() !== userNames[sender]) {
+                userNames[sender] = msg.pushName.trim();
+                userName = userNames[sender];
+                saveData();
+            }
+
+            // ===== معالجة الصور =====
+            if (msgType === 'imageMessage') {
+                try {
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: { level: 'silent', child: () => ({ level: 'silent' }) } });
+                    const base64 = buffer.toString('base64');
+
+                    const res = await askAIWithImage(base64, safeBody, userName);
+                    await reply(res);
+                    await react('✅');
+                } catch (e) {
+                    console.log('خطأ في معالجة الصورة:', e.message);
+                    await reply('ما قدرت أحمل الصورة، جرب مرة ثانية 😕');
+                    await react('❌');
+                }
+                return;
+            }
+
+            // ===== معالجة الفيديو بالتعليق =====
+            if (msgType === 'videoMessage') {
+                if (safeBody) {
+                    // لو في سؤال على الفيديو
+                    if (!userChats[sender]) userChats[sender] = [];
+                    userChats[sender].push({
+                        role: 'user',
+                        content: `المستخدم بعت فيديو وسأل: "${safeBody}". أخبره إنك ما تقدر تشوف الفيديو بس ممكن تساعده بأي سؤال ثاني.`
+                    });
+                    const res = await askAI([
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        ...userChats[sender]
+                    ]);
+                    userChats[sender].push({ role: 'assistant', content: res });
+                    await reply(res);
+                } else {
+                    await reply("🎬 مشان الله، ما أقدر أشوف الفيديوهات حالياً، بس لو عندك سؤال أنا هون!");
+                }
+                await react('✅');
+                return;
+            }
+
+            // ===== معالجة الملفات =====
+            if (msgType === 'documentMessage') {
+                try {
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: { level: 'silent', child: () => ({ level: 'silent' }) } });
+                    const mimeType = message.documentMessage?.mimetype || '';
+                    let fileText = '';
+
+                    if (mimeType.includes('text') || mimeType.includes('json') || mimeType.includes('xml')) {
+                        fileText = buffer.toString('utf-8');
+                    } else if (mimeType.includes('pdf')) {
+                        fileText = `[ملف PDF - حجم: ${(buffer.length / 1024).toFixed(1)} KB]\n${buffer.toString('utf-8', 0, 3000)}`;
+                    } else {
+                        fileText = buffer.toString('utf-8');
+                    }
+
+                    if (!userChats[sender]) userChats[sender] = [];
+
+                    const question_text = safeBody || 'احكيلي عن هالملف وشو مهم فيه';
+
+                    userChats[sender].push({
+                        role: 'user',
+                        content: `${userName ? `اسمي ${userName}. ` : ''}بعتلك ملف وبدي: ${question_text}\n\n--- محتوى الملف ---\n${fileText.slice(0, 6000)}`
+                    });
+
+                    const res = await askAI([
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        ...userChats[sender]
+                    ]);
+
+                    userChats[sender].push({ role: 'assistant', content: res });
+
+                    if (userChats[sender].length > 30)
+                        userChats[sender] = userChats[sender].slice(-30);
+
+                    await reply(res);
+                    await react('✅');
+                } catch (e) {
+                    console.log('خطأ في معالجة الملف:', e.message);
+                    await reply('ما قدرت أقرأ الملف، تأكد إنو ملف نصي أو PDF 📄');
+                    await react('❌');
+                }
+                return;
+            }
+
+            // ===== رسائل الصوت =====
+            if (msgType === 'audioMessage' || msgType === 'pttMessage') {
+                await reply("🎤 الرسائل الصوتية ما أقدر أسمعها حالياً، بس لو حكيتلي نص أساعدك بثواني! 😊");
+                await react('✅');
+                return;
+            }
+
+            // ===== الرسائل النصية =====
+            if (!safeBody) return;
+
+            // فحص إذا المستخدم سأل عن اسمه
+            const askingAboutName = /اسم[يك]|من أنت|من انت|who are you|your name/i.test(safeBody);
+
+            if (!userChats[sender]) userChats[sender] = [];
+
+            // إضافة الاسم للسياق لو ما كان موجود
+            if (userName && userChats[sender].length === 0) {
+                userChats[sender].push({
+                    role: 'user',
+                    content: `[اسم المستخدم: ${userName}]`
+                });
+                userChats[sender].push({
+                    role: 'assistant',
+                    content: `أهلاً ${userName}!`
+                });
+            }
+
+            userChats[sender].push({
+                role: 'user',
+                content: safeBody
+            });
+
+            // الحفاظ على آخر 20 رسالة فقط
+            if (userChats[sender].length > 25)
+                userChats[sender] = userChats[sender].slice(-25);
 
             const res = await askAI([
                 { role: 'system', content: SYSTEM_PROMPT },
-                ...userChats[senderNumber]
+                ...userChats[sender]
             ]);
 
-            userChats[senderNumber].push({ role: 'assistant', content: res });
+            userChats[sender].push({
+                role: 'assistant',
+                content: res
+            });
 
-            await reply(res);
+            // إضافة رسالة المشاركة بشكل عشوائي (1 من كل 10 رسائل)
+            const shouldAddShare = Math.random() < 0.1;
+            const finalRes = shouldAddShare
+                ? `${res}\n\n---\n_إذا عجبك البوت، شاركه مع أصحابك عشان يستفيدوا هم كمان_ 😊`
+                : res;
+
+            await reply(finalRes);
             await react('✅');
 
-        } catch (e) {
-            console.log('ERROR:', e.message);
+        } catch (error) {
+            console.log('❌ خطأ عام:', error.message);
+            try {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: 'صار خطأ تقني، جرب مرة ثانية 🔧'
+                }, { quoted: msg });
+            } catch {}
         }
     });
 }
 
-
-startBot();
+// ===== START =====
+console.log('🚀 جاري تشغيل البوت...');
+startBot().catch(e => {
+    console.error('خطأ في تشغيل البوت:', e);
+    setTimeout(startBot, 5000);
+});
