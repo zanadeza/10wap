@@ -894,22 +894,24 @@ setInterval(loadData, 10000);
     });
 
     function tryListen(port) {
-        server.listen(port, '0.0.0.0', () => {
-            console.log(`\n🌐 لوحة التحكم: http://localhost:${port}`);
-            console.log(`🌐 من جهاز ثاني على الشبكة: http://<IP الجهاز>:${port}\n`);
+        const s = require('net').createServer();
+        s.once('error', () => {
+            console.log(`⚠️ البورت ${port} مشغول، جاري المحاولة على ${port + 1}...`);
+            tryListen(port + 1);
         });
+        s.once('listening', () => {
+            s.close(() => {
+                server.listen(port, '0.0.0.0', () => {
+                    console.log(`\n🌐 لوحة التحكم: http://localhost:${port}`);
+                    console.log(`🌐 من جهاز ثاني: http://10.158.171.59:${port}\n`);
+                });
+            });
+        });
+        s.listen(port, '0.0.0.0');
     }
 
     server.on('error', (e) => {
-        if (e.code === 'EADDRINUSE') {
-            const currentPort = server.address()?.port || WEB_PORT;
-            const nextPort = currentPort + 1;
-            console.log(`⚠️ البورت ${currentPort} مشغول، جاري المحاولة على ${nextPort}...`);
-            server.close();
-            tryListen(nextPort);
-        } else {
-            console.error('[server]', e.message);
-        }
+        console.error('[server]', e.message);
     });
 
     tryListen(WEB_PORT);
