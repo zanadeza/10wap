@@ -365,9 +365,7 @@ async function startBot() {
     sock = makeWASocket({
         version,
         auth:    state,
-        browser: Browsers.macOS('Desktop'),
-        // إخفاء logs الـ baileys غير الضرورية
-        logger:  { level: 'silent', child: () => ({ level: 'silent', trace: ()=>{}, debug: ()=>{}, info: ()=>{}, warn: ()=>{}, error: ()=>{}, fatal: ()=>{} }) }
+        browser: Browsers.macOS('Desktop')
     });
 
     sock.ev.on('creds.update', saveCreds);
