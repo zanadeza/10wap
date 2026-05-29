@@ -21,7 +21,7 @@ const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER    = '972593850520';   // بدون + أو @
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
-const WEB_PORT        = 3000;
+const WEB_PORT        = 8080;
 
 let currentQR = null;
 let isConnected = false;
