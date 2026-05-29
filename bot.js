@@ -358,86 +358,490 @@ function startSchedulers() {
 // ============================================================
 function startQRServer() {
     const server = http.createServer(async (req, res) => {
-        if (req.url === '/qr-image' && currentQR) {
+        const url = req.url.split('?')[0];
+
+        // ===== QR IMAGE =====
+        if (url === '/qr-image' && currentQR) {
             try {
-                const imgBuffer = await QRCodeImg.toBuffer(currentQR, {
-                    errorCorrectionLevel: 'H',
-                    width: 400,
-                    margin: 2
-                });
+                const buf = await QRCodeImg.toBuffer(currentQR, { errorCorrectionLevel: 'H', width: 400, margin: 2 });
                 res.writeHead(200, { 'Content-Type': 'image/png' });
-                res.end(imgBuffer);
-            } catch {
-                res.writeHead(500); res.end();
-            }
+                res.end(buf);
+            } catch { res.writeHead(500); res.end(); }
             return;
         }
 
+        // ===== API =====
+        if (url === '/api' && req.method === 'POST') {
+            let body = '';
+            req.on('data', d => body += d);
+            req.on('end', async () => {
+                try {
+                    const { action, data } = JSON.parse(body);
+                    let result = { ok: true };
+
+                    if (action === 'addVip') {
+                        const num = (data.num || '').replace(/\D/g, '');
+                        if (num && !vipNumbers.includes(num)) { vipNumbers.push(num); saveData(); }
+                    }
+                    else if (action === 'removeVip') {
+                        vipNumbers = vipNumbers.filter(n => n !== data.num);
+                        saveData();
+                    }
+                    else if (action === 'deleteUser') {
+                        const num = data.num;
+                        delete userChats[num];
+                        delete welcomedUsers[num];
+                        delete userNames[num];
+                        saveData();
+                    }
+                    else if (action === 'clearReports') {
+                        reports = [];
+                        saveData();
+                    }
+                    else if (action === 'clearSessions') {
+                        userChats = {};
+                        result.msg = 'تم مسح الجلسات';
+                    }
+                    else if (action === 'broadcast') {
+                        if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
+                        else {
+                            const txt = data.text || '';
+                            if (!txt) { result = { ok: false, msg: 'الرسالة فارغة' }; }
+                            else {
+                                broadcastToAll(`📢 *رسالة من الإدارة*\n\n${txt}`).then(r => {
+                                    console.log(`📢 بث: ${r.sent} نجح، ${r.failed} فشل`);
+                                }).catch(console.error);
+                                result.msg = 'بدأ الإرسال في الخلفية';
+                            }
+                        }
+                    }
+                    else if (action === 'stats') {
+                        result.data = {
+                            connected: isConnected,
+                            users: Object.keys(welcomedUsers).length,
+                            active: Object.keys(userChats).length,
+                            vip: vipNumbers.length,
+                            reports: reports.length,
+                            stats
+                        };
+                    }
+
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(result));
+                } catch (e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, msg: e.message }));
+                }
+            });
+            return;
+        }
+
+        // ===== DATA API =====
+        if (url === '/data') {
+            const d = {
+                connected: isConnected,
+                hasQR: !!currentQR,
+                botName: BOT_NAME,
+                stats: {
+                    users: Object.keys(welcomedUsers).length,
+                    active: Object.keys(userChats).length,
+                    vip: vipNumbers.length,
+                    messages: stats.totalMessages || 0,
+                    images: stats.totalImages || 0,
+                    medical: stats.totalMedical || 0,
+                    reports: reports.length
+                },
+                vipNumbers,
+                userNames,
+                welcomedUsers: Object.keys(welcomedUsers),
+                reports: reports.slice(-50).reverse()
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(d));
+            return;
+        }
+
+        // ===== MAIN DASHBOARD =====
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="5">
-<title>${BOT_NAME} - ربط واتساب</title>
+<title>${BOT_NAME} - لوحة التحكم</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; min-height:100vh; display:flex; align-items:center; justify-content:center; }
-  .card { background: #1e293b; border-radius: 20px; padding: 40px; text-align: center; max-width: 440px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
-  h1 { color: #38bdf8; font-size: 24px; margin-bottom: 8px; }
-  .sub { color: #64748b; font-size: 14px; margin-bottom: 30px; }
-  .qr-box { background: white; border-radius: 16px; padding: 16px; display: inline-block; margin-bottom: 24px; }
-  .qr-box img { display: block; width: 280px; height: 280px; }
-  .status { padding: 10px 20px; border-radius: 99px; font-size: 14px; font-weight: 600; display: inline-block; }
-  .status.waiting { background: rgba(245,158,11,0.15); color: #f59e0b; }
-  .status.connected { background: rgba(34,197,94,0.15); color: #22c55e; }
-  .status.loading { background: rgba(56,189,248,0.15); color: #38bdf8; }
-  .steps { margin-top: 24px; text-align: right; background: #0f172a; border-radius: 12px; padding: 16px; }
-  .steps p { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
-  .steps p span { color: #38bdf8; font-weight: 600; }
-  .refresh { margin-top: 16px; font-size: 12px; color: #475569; }
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.topbar{background:linear-gradient(135deg,#1e293b,#0f172a);border-bottom:1px solid #334155;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.topbar h1{font-size:18px;color:#38bdf8;display:flex;align-items:center;gap:8px}
+.dot{width:10px;height:10px;border-radius:50%;background:#64748b;display:inline-block;transition:.3s}
+.dot.on{background:#22c55e;box-shadow:0 0 8px #22c55e;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.container{max-width:1100px;margin:0 auto;padding:20px}
+.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap}
+.tab{padding:8px 16px;border-radius:8px;cursor:pointer;font-size:13px;border:1px solid #334155;background:#1e293b;color:#94a3b8;transition:.2s}
+.tab.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8;font-weight:700}
+.panel{display:none}.panel.active{display:block}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.sc{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;text-align:center}
+.sc .n{font-size:32px;font-weight:700;color:#38bdf8}
+.sc.g .n{color:#22c55e}.sc.y .n{color:#f59e0b}.sc.r .n{color:#f87171}.sc.p .n{color:#a78bfa}
+.sc .l{font-size:12px;color:#64748b;margin-top:4px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;overflow:hidden;margin-bottom:16px}
+.ch{padding:14px 18px;background:#0f172a;border-bottom:1px solid #334155;display:flex;align-items:center;justify-content:space-between}
+.ch h3{font-size:14px;color:#e2e8f0}
+table{width:100%;border-collapse:collapse}
+th{padding:10px 14px;text-align:right;font-size:12px;color:#64748b;background:#0f172a;border-bottom:1px solid #334155}
+td{padding:10px 14px;font-size:13px;border-bottom:1px solid #0f172a}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(56,189,248,.04)}
+.empty{text-align:center;color:#475569;padding:24px;font-size:13px}
+.btn{border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-r{background:#dc2626;color:#fff}
+.btn-g{background:#16a34a;color:#fff}
+.btn-b{background:#38bdf8;color:#0f172a}
+.btn-y{background:#f59e0b;color:#0f172a}
+.inp{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;width:100%}
+.inp:focus{outline:none;border-color:#38bdf8}
+.form-row{display:flex;gap:8px;padding:14px 18px;background:#0f172a;border-top:1px solid #334155}
+textarea.inp{resize:vertical;min-height:80px}
+.badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
+.badge-g{background:rgba(34,197,94,.15);color:#22c55e}
+.badge-r{background:rgba(248,113,113,.15);color:#f87171}
+.badge-b{background:rgba(56,189,248,.15);color:#38bdf8}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:10px 24px;border-radius:10px;font-size:13px;opacity:0;transition:.3s;pointer-events:none;z-index:999;font-weight:600}
+.toast.show{opacity:1}
+.qr-wrap{display:flex;align-items:center;justify-content:center;padding:30px;flex-direction:column;gap:16px}
+.qr-wrap img{border-radius:12px;width:260px;height:260px}
+.qr-steps{background:#0f172a;border-radius:12px;padding:16px;text-align:right;font-size:13px;color:#94a3b8;line-height:2}
+.qr-steps span{color:#38bdf8;font-weight:700}
+.connected-badge{background:rgba(34,197,94,.15);color:#22c55e;padding:12px 24px;border-radius:12px;font-size:16px;font-weight:700}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>🤖 ${BOT_NAME}</h1>
-  <p class="sub">ربط واتساب</p>
-
-  ${isConnected ? `
-    <div style="font-size:64px; margin-bottom:16px;">✅</div>
-    <span class="status connected">متصل وشغال!</span>
-  ` : currentQR ? `
-    <div class="qr-box">
-      <img src="/qr-image" alt="QR Code"/>
-    </div>
-    <br>
-    <span class="status waiting">في انتظار المسح...</span>
-    <div class="steps">
-      <p><span>1.</span> افتح واتساب على هاتفك</p>
-      <p><span>2.</span> اضغط النقاط الثلاث ← الأجهزة المرتبطة</p>
-      <p><span>3.</span> اضغط "ربط جهاز"</p>
-      <p><span>4.</span> امسح الكود أعلاه</p>
-    </div>
-  ` : `
-    <div style="font-size:48px; margin-bottom:16px;">⏳</div>
-    <span class="status loading">جاري التحميل...</span>
-  `}
-
-  <p class="refresh">تتجدد الصفحة كل 5 ثواني</p>
+<div class="topbar">
+  <h1>🤖 ${BOT_NAME} <span class="dot" id="dot"></span></h1>
+  <span id="connLabel" style="font-size:12px;color:#64748b">جاري التحقق...</span>
 </div>
+<div class="container">
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('overview')">📊 نظرة عامة</div>
+    <div class="tab" onclick="showTab('qr')">📱 ربط واتساب</div>
+    <div class="tab" onclick="showTab('broadcast')">📢 البث</div>
+    <div class="tab" onclick="showTab('users')">👥 المستخدمون</div>
+    <div class="tab" onclick="showTab('vip')">⭐ VIP</div>
+    <div class="tab" onclick="showTab('reports')">🚨 البلاغات</div>
+  </div>
+
+  <!-- نظرة عامة -->
+  <div class="panel active" id="panel-overview">
+    <div class="stats" id="stats-grid">
+      <div class="sc"><div class="n" id="s-users">—</div><div class="l">👥 المستخدمون</div></div>
+      <div class="sc g"><div class="n" id="s-active">—</div><div class="l">🟢 جلسات نشطة</div></div>
+      <div class="sc y"><div class="n" id="s-vip">—</div><div class="l">⭐ VIP</div></div>
+      <div class="sc"><div class="n" id="s-msgs">—</div><div class="l">💬 رسائل</div></div>
+      <div class="sc p"><div class="n" id="s-imgs">—</div><div class="l">🖼️ صور</div></div>
+      <div class="sc"><div class="n" id="s-med">—</div><div class="l">🏥 طبية</div></div>
+      <div class="sc r"><div class="n" id="s-rep">—</div><div class="l">🚨 بلاغات</div></div>
+    </div>
+    <div class="card">
+      <div class="ch"><h3>⚡ إجراءات سريعة</h3></div>
+      <div style="padding:16px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-r" onclick="doAction('clearSessions')">🗑️ مسح الجلسات</button>
+        <button class="btn btn-y" onclick="showTab('broadcast')">📢 إرسال بث</button>
+        <button class="btn btn-b" onclick="loadData()">🔄 تحديث</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ربط واتساب -->
+  <div class="panel" id="panel-qr">
+    <div class="card">
+      <div class="ch"><h3>📱 حالة الاتصال</h3></div>
+      <div class="qr-wrap" id="qr-section">
+        <div style="color:#64748b;font-size:14px">جاري التحميل...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- البث -->
+  <div class="panel" id="panel-broadcast">
+    <div class="card">
+      <div class="ch"><h3>📢 إرسال رسالة لجميع المستخدمين</h3></div>
+      <div style="padding:18px;display:flex;flex-direction:column;gap:12px">
+        <textarea class="inp" id="broadcast-text" placeholder="اكتب الرسالة هنا..."></textarea>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-b" onclick="sendBroadcast()">📢 إرسال للجميع</button>
+          <span id="broadcast-count" style="font-size:12px;color:#64748b"></span>
+        </div>
+        <div style="background:#0f172a;border-radius:8px;padding:12px;font-size:12px;color:#64748b">
+          ⚠️ الرسالة ستُرسل لجميع المستخدمين. هناك تأخير 5 ثواني بين كل رسالة.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- المستخدمون -->
+  <div class="panel" id="panel-users">
+    <div class="card">
+      <div class="ch">
+        <h3>👥 المستخدمون</h3>
+        <input class="inp" style="width:200px;padding:6px 10px" id="user-search" placeholder="بحث..." oninput="filterUsers()">
+      </div>
+      <table>
+        <thead><tr><th>الرقم</th><th>الاسم</th><th>النوع</th><th>إجراء</th></tr></thead>
+        <tbody id="users-table"><tr><td colspan="4" class="empty">جاري التحميل...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- VIP -->
+  <div class="panel" id="panel-vip">
+    <div class="card">
+      <div class="ch"><h3>⭐ أرقام VIP</h3></div>
+      <table>
+        <thead><tr><th>الرقم</th><th>الاسم</th><th>إجراء</th></tr></thead>
+        <tbody id="vip-table"><tr><td colspan="3" class="empty">جاري التحميل...</td></tr></tbody>
+      </table>
+      <div class="form-row">
+        <input class="inp" id="new-vip" placeholder="أدخل رقم الهاتف مع كود الدولة" dir="ltr">
+        <button class="btn btn-g" onclick="addVip()">+ إضافة</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- البلاغات -->
+  <div class="panel" id="panel-reports">
+    <div class="card">
+      <div class="ch">
+        <h3>🚨 البلاغات</h3>
+        <button class="btn btn-r" onclick="clearReports()">مسح الكل</button>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>الاسم</th><th>الرقم</th><th>المشكلة</th><th>الوقت</th></tr></thead>
+        <tbody id="reports-table"><tr><td colspan="5" class="empty">جاري التحميل...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let _data = null;
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const names = ['overview','qr','broadcast','users','vip','reports'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  loadData();
+}
+
+function toast(msg, color) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = color || '#22c55e';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+async function api(action, data = {}) {
+  try {
+    const r = await fetch('/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, data })
+    });
+    return await r.json();
+  } catch (e) {
+    toast('خطأ في الاتصال', '#dc2626');
+    return { ok: false };
+  }
+}
+
+async function loadData() {
+  try {
+    const r = await fetch('/data');
+    _data = await r.json();
+    updateUI();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function updateUI() {
+  if (!_data) return;
+  const d = _data;
+
+  // topbar
+  const dot = document.getElementById('dot');
+  const lbl = document.getElementById('connLabel');
+  dot.className = 'dot' + (d.connected ? ' on' : '');
+  lbl.textContent = d.connected ? '✅ متصل وشغال' : '❌ غير متصل';
+
+  // stats
+  const s = d.stats;
+  setText('s-users', s.users);
+  setText('s-active', s.active);
+  setText('s-vip', s.vip);
+  setText('s-msgs', s.messages);
+  setText('s-imgs', s.images);
+  setText('s-med', s.medical);
+  setText('s-rep', s.reports);
+
+  // broadcast count
+  const bc = document.getElementById('broadcast-count');
+  if (bc) bc.textContent = 'سيصل لـ ' + (s.users - 1) + ' مستخدم';
+
+  // QR
+  const qrSec = document.getElementById('qr-section');
+  if (d.connected) {
+    qrSec.innerHTML = '<div class="connected-badge">✅ البوت متصل بواتساب وشغال!</div>';
+  } else if (d.hasQR) {
+    qrSec.innerHTML = \`
+      <img src="/qr-image?t=\${Date.now()}" alt="QR">
+      <div class="qr-steps">
+        <div><span>1.</span> افتح واتساب على هاتفك</div>
+        <div><span>2.</span> الإعدادات ← الأجهزة المرتبطة</div>
+        <div><span>3.</span> اضغط "ربط جهاز"</div>
+        <div><span>4.</span> امسح الكود</div>
+      </div>
+    \`;
+  } else {
+    qrSec.innerHTML = '<div style="color:#64748b;font-size:14px">⏳ في انتظار رمز QR...</div>';
+  }
+
+  // Users
+  renderUsers(d);
+
+  // VIP
+  renderVip(d);
+
+  // Reports
+  renderReports(d);
+}
+
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val ?? '—';
+}
+
+let _allUsers = [];
+function renderUsers(d) {
+  _allUsers = d.welcomedUsers.map(num => ({
+    num,
+    name: d.userNames[num] || '—',
+    isVip: d.vipNumbers.includes(num)
+  }));
+  filterUsers();
+}
+
+function filterUsers() {
+  const q = (document.getElementById('user-search')?.value || '').toLowerCase();
+  const filtered = q ? _allUsers.filter(u => u.num.includes(q) || u.name.toLowerCase().includes(q)) : _allUsers;
+  const tb = document.getElementById('users-table');
+  if (!filtered.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">لا يوجد مستخدمون</td></tr>'; return; }
+  tb.innerHTML = filtered.slice(0,100).map(u => \`<tr>
+    <td dir="ltr">\${u.num}</td>
+    <td>\${u.name}</td>
+    <td><span class="badge \${u.isVip ? 'badge-b' : 'badge-g'}">\${u.isVip ? '⭐ VIP' : 'عادي'}</span></td>
+    <td style="display:flex;gap:6px">
+      \${!u.isVip ? \`<button class="btn btn-b" onclick="addVipNum('\${u.num}')">+ VIP</button>\` : \`<button class="btn btn-y" onclick="removeVipNum('\${u.num}')">إزالة VIP</button>\`}
+      <button class="btn btn-r" onclick="deleteUser('\${u.num}')">حذف</button>
+    </td>
+  </tr>\`).join('');
+}
+
+function renderVip(d) {
+  const tb = document.getElementById('vip-table');
+  if (!d.vipNumbers.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">لا يوجد أرقام VIP</td></tr>'; return; }
+  tb.innerHTML = d.vipNumbers.map(num => \`<tr>
+    <td dir="ltr">\${num}</td>
+    <td>\${d.userNames[num] || '—'}</td>
+    <td><button class="btn btn-r" onclick="removeVipNum('\${num}')">حذف</button></td>
+  </tr>\`).join('');
+}
+
+function renderReports(d) {
+  const tb = document.getElementById('reports-table');
+  if (!d.reports.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">لا يوجد بلاغات</td></tr>'; return; }
+  tb.innerHTML = d.reports.map((r,i) => \`<tr>
+    <td>\${i+1}</td>
+    <td>\${r.name || '—'}</td>
+    <td dir="ltr" style="font-size:12px">\${r.sender}</td>
+    <td>\${r.text}</td>
+    <td style="font-size:11px;color:#64748b">\${r.time}</td>
+  </tr>\`).join('');
+}
+
+async function addVip() {
+  const num = document.getElementById('new-vip').value.replace(/\D/g,'');
+  if (!num) { toast('أدخل رقماً صحيحاً', '#f59e0b'); return; }
+  const r = await api('addVip', { num });
+  if (r.ok) { toast('✅ تم إضافة VIP'); document.getElementById('new-vip').value = ''; loadData(); }
+}
+
+async function addVipNum(num) {
+  const r = await api('addVip', { num });
+  if (r.ok) { toast('✅ تم إضافة VIP'); loadData(); }
+}
+
+async function removeVipNum(num) {
+  if (!confirm('حذف من VIP؟')) return;
+  const r = await api('removeVip', { num });
+  if (r.ok) { toast('تم الحذف'); loadData(); }
+}
+
+async function deleteUser(num) {
+  if (!confirm('حذف هذا المستخدم نهائياً؟')) return;
+  const r = await api('deleteUser', { num });
+  if (r.ok) { toast('تم الحذف'); loadData(); }
+}
+
+async function clearReports() {
+  if (!confirm('مسح كل البلاغات؟')) return;
+  const r = await api('clearReports');
+  if (r.ok) { toast('تم مسح البلاغات'); loadData(); }
+}
+
+async function doAction(action) {
+  if (action === 'clearSessions' && !confirm('مسح كل الجلسات النشطة؟')) return;
+  const r = await api(action);
+  toast(r.msg || '✅ تم');
+  loadData();
+}
+
+async function sendBroadcast() {
+  const text = document.getElementById('broadcast-text').value.trim();
+  if (!text) { toast('اكتب الرسالة أولاً', '#f59e0b'); return; }
+  if (!confirm('إرسال لجميع المستخدمين؟')) return;
+  const r = await api('broadcast', { text });
+  if (r.ok) {
+    toast('✅ ' + (r.msg || 'بدأ الإرسال'));
+    document.getElementById('broadcast-text').value = '';
+  } else {
+    toast(r.msg || 'فشل الإرسال', '#dc2626');
+  }
+}
+
+// تحديث كل 10 ثواني
+loadData();
+setInterval(loadData, 10000);
+</script>
 </body>
 </html>`);
     });
 
     server.listen(WEB_PORT, () => {
-        console.log(`\n🌐 افتح في المتصفح: http://localhost:${WEB_PORT}`);
-        console.log(`📱 أو من هاتفك: http://127.0.0.1:${WEB_PORT}\n`);
+        console.log(`\n🌐 لوحة التحكم: http://localhost:${WEB_PORT}\n`);
     });
 
     server.on('error', (e) => {
         if (e.code === 'EADDRINUSE') {
-            console.log(`⚠️ البورت ${WEB_PORT} مشغول، جرب: http://localhost:${WEB_PORT}`);
+            console.log(`⚠️ البورت ${WEB_PORT} مشغول`);
         }
     });
 }
