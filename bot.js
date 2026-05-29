@@ -10,6 +10,8 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const QRCode = require('qrcode-terminal');
+const QRCodeImg = require('qrcode');
+const http = require('http');
 const fs   = require('fs');
 
 // ============================================================
@@ -19,6 +21,10 @@ const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
 const ADMIN_NUMBER    = '972593850520';   // بدون + أو @
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
+const WEB_PORT        = 3000;
+
+let currentQR = null;
+let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
 const API_TIMEOUT_MS  = 30_000;         // 30 ثانية timeout للـ API
 
@@ -346,6 +352,96 @@ function startSchedulers() {
     }, 24 * 60 * 60_000);
 }
 
+
+// ============================================================
+// QR WEB SERVER
+// ============================================================
+function startQRServer() {
+    const server = http.createServer(async (req, res) => {
+        if (req.url === '/qr-image' && currentQR) {
+            try {
+                const imgBuffer = await QRCodeImg.toBuffer(currentQR, {
+                    errorCorrectionLevel: 'H',
+                    width: 400,
+                    margin: 2
+                });
+                res.writeHead(200, { 'Content-Type': 'image/png' });
+                res.end(imgBuffer);
+            } catch {
+                res.writeHead(500); res.end();
+            }
+            return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="5">
+<title>${BOT_NAME} - ربط واتساب</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .card { background: #1e293b; border-radius: 20px; padding: 40px; text-align: center; max-width: 440px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  h1 { color: #38bdf8; font-size: 24px; margin-bottom: 8px; }
+  .sub { color: #64748b; font-size: 14px; margin-bottom: 30px; }
+  .qr-box { background: white; border-radius: 16px; padding: 16px; display: inline-block; margin-bottom: 24px; }
+  .qr-box img { display: block; width: 280px; height: 280px; }
+  .status { padding: 10px 20px; border-radius: 99px; font-size: 14px; font-weight: 600; display: inline-block; }
+  .status.waiting { background: rgba(245,158,11,0.15); color: #f59e0b; }
+  .status.connected { background: rgba(34,197,94,0.15); color: #22c55e; }
+  .status.loading { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .steps { margin-top: 24px; text-align: right; background: #0f172a; border-radius: 12px; padding: 16px; }
+  .steps p { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+  .steps p span { color: #38bdf8; font-weight: 600; }
+  .refresh { margin-top: 16px; font-size: 12px; color: #475569; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🤖 ${BOT_NAME}</h1>
+  <p class="sub">ربط واتساب</p>
+
+  ${isConnected ? `
+    <div style="font-size:64px; margin-bottom:16px;">✅</div>
+    <span class="status connected">متصل وشغال!</span>
+  ` : currentQR ? `
+    <div class="qr-box">
+      <img src="/qr-image" alt="QR Code"/>
+    </div>
+    <br>
+    <span class="status waiting">في انتظار المسح...</span>
+    <div class="steps">
+      <p><span>1.</span> افتح واتساب على هاتفك</p>
+      <p><span>2.</span> اضغط النقاط الثلاث ← الأجهزة المرتبطة</p>
+      <p><span>3.</span> اضغط "ربط جهاز"</p>
+      <p><span>4.</span> امسح الكود أعلاه</p>
+    </div>
+  ` : `
+    <div style="font-size:48px; margin-bottom:16px;">⏳</div>
+    <span class="status loading">جاري التحميل...</span>
+  `}
+
+  <p class="refresh">تتجدد الصفحة كل 5 ثواني</p>
+</div>
+</body>
+</html>`);
+    });
+
+    server.listen(WEB_PORT, () => {
+        console.log(`\n🌐 افتح في المتصفح: http://localhost:${WEB_PORT}`);
+        console.log(`📱 أو من هاتفك: http://127.0.0.1:${WEB_PORT}\n`);
+    });
+
+    server.on('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+            console.log(`⚠️ البورت ${WEB_PORT} مشغول، جرب: http://localhost:${WEB_PORT}`);
+        }
+    });
+}
+
 // ============================================================
 // WELCOME MESSAGE
 // ============================================================
@@ -374,13 +470,17 @@ async function startBot() {
         const { connection, qr, lastDisconnect } = update;
 
         if (qr) {
-            console.log('\n📱 امسح QR التالي:\n');
+            currentQR = qr;
+            isConnected = false;
+            console.log('\n📱 امسح QR من المتصفح: http://localhost:' + WEB_PORT + '\n');
             QRCode.generate(qr, { small: true });
         }
 
         if (connection === 'open') {
+            currentQR = null;
+            isConnected = true;
             console.log('✅ البوت متصل وجاهز!');
-            startSchedulers(); // لن تشتغل إلا مرة واحدة بفضل الـ flag
+            startSchedulers();
         }
 
         if (connection === 'close') {
@@ -724,4 +824,5 @@ function safeBody(body, cmd) { return body === cmd; }
 // START
 // ============================================================
 console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
+startQRServer();
 startBot();
