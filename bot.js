@@ -204,21 +204,21 @@ async function askAI(messages) {
     }
 }
 
-async function askAIWithDoc(docText, userQuestion, userName, mimeType) {
+async function askAIWithDoc(docText, userQuestion, userName) {
     try {
-        const docType = mimeType === 'application/pdf' ? 'PDF' :
-                        (mimeType || '').includes('word') ? 'Word' :
-                        (mimeType || '').includes('text') ? 'نص' : 'ملف';
-        const question = userQuestion || `حلّل محتوى هذا الـ ${docType} وأعطني ملخصاً شاملاً`;
+        const question = userQuestion || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه ومحتواه';
         const prompt = userName ? `اسم المستخدم: ${userName}\n${question}` : question;
         return await callMistral({
             model: 'pixtral-large-latest',
             messages: [
                 { role: 'system', content: getSystemPrompt() },
-                { role: 'user', content: `${prompt}\n\n--- محتوى الملف ---\n${docText.slice(0, 12000)}` }
+                {
+                    role: 'user',
+                    content: `${prompt}\n\n--- محتوى ملف PDF ---\n${docText.slice(0, 14000)}`
+                }
             ],
-            max_tokens: 2000,
-            temperature: 0.4
+            max_tokens: 2500,
+            temperature: 0.3
         });
     } catch (e) {
         console.error('[askAIWithDoc]', e.message);
@@ -1210,7 +1210,7 @@ async function startBot() {
                 return;
             }
 
-            // --- ملفات ---
+            // --- ملفات PDF ---
             if (msgType === 'documentMessage') {
                 await react('⏳');
                 try {
@@ -1219,73 +1219,58 @@ async function startBot() {
                     const fileName = docMsg?.fileName || 'ملف';
                     const caption = body || '';
 
-                    const isPDF  = mime === 'application/pdf';
-                    const isText = mime.startsWith('text/');
-                    const isWord = mime.includes('msword') || mime.includes('wordprocessingml');
-
-                    if (isPDF || isText || isWord) {
-                        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-                            logger: { level: 'silent', child: () => ({ level: 'silent' }) }
-                        });
-
-                        let docText = '';
-
-                        if (isPDF) {
-                            try {
-                                const parsed = await pdfParse(buffer);
-                                docText = parsed.text?.trim();
-                                if (!docText) throw new Error('PDF فارغ أو مشفر');
-                            } catch (pdfErr) {
-                                console.error('[pdf-parse]', pdfErr.message);
-                                await reply(`عذراً، لم أتمكن من قراءة الـ PDF.\nتأكد أن الملف غير مشفر أو محمي بكلمة مرور.`);
-                                await react('❌');
-                                return;
-                            }
-                        } else {
-                            docText = buffer.toString('utf-8');
-                        }
-
-                        if (!docText || docText.length < 10) {
-                            await reply('الملف فارغ أو لا يحتوي على نص قابل للقراءة.');
-                            await react('❌');
-                            return;
-                        }
-
-                        stats.totalDocs = (stats.totalDocs || 0) + 1;
-                        saveData();
-
-                        // إضافة الملف للسياق حتى يتذكره البوت
-                        if (!userChats[sender]) userChats[sender] = [];
-                        userChats[sender].push({
-                            role: 'user',
-                            content: `[أرسل المستخدم ملف "${fileName}" - محتواه:\n${docText.slice(0, 8000)}]`
-                        });
-                        userChats[sender].push({
-                            role: 'assistant',
-                            content: `تم استلام الملف "${fileName}" وقراءته بنجاح.`
-                        });
-
-                        const userQ = caption || `لخّص هذا الملف بشكل شامل واذكر أهم نقاطه`;
-                        const res = await askAIWithDoc(docText, userQ, userName, mime);
-
-                        userChats[sender].push({ role: 'assistant', content: res });
-
-                        await reply(res);
-                        await react('✅');
-                    } else {
+                    // فقط PDF مدعوم
+                    if (mime !== 'application/pdf') {
                         await react('ℹ️');
-                        await reply(
-                            `📎 استلمت ملف: ${fileName}\n` +
-                            `نوع الملف غير مدعوم للقراءة.\n\n` +
-                            `الملفات المدعومة:\n` +
-                            `• PDF\n` +
-                            `• ملفات نصية (.txt, .csv)\n` +
-                            `• الصور (أرسلها كصورة مباشرة)`
-                        );
+                        await reply(`📎 "${fileName}"\nأرسل ملفات PDF فقط، هذا النوع غير مدعوم.`);
+                        return;
                     }
+
+                    // تنزيل الملف
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                        logger: { level: 'silent', child: () => ({ level: 'silent' }) }
+                    });
+
+                    // استخراج النص
+                    let docText = '';
+                    try {
+                        const parsed = await pdfParse(buffer);
+                        docText = (parsed.text || '').trim();
+                        console.log(`[PDF] استُخرج ${docText.length} حرف من "${fileName}"`);
+                    } catch (pdfErr) {
+                        console.error('[pdf-parse]', pdfErr.message);
+                    }
+
+                    if (!docText || docText.length < 10) {
+                        await react('❌');
+                        await reply(`عذراً، لم أتمكن من استخراج النص من "${fileName}".\nتأكد أن الـ PDF يحتوي على نص وليس صوراً فقط.`);
+                        return;
+                    }
+
+                    // حفظ في السياق
+                    if (!userChats[sender]) userChats[sender] = [];
+                    userChats[sender].push({
+                        role: 'user',
+                        content: `[المستخدم أرسل ملف PDF اسمه "${fileName}"، محتواه:\n${docText.slice(0, 10000)}]`
+                    });
+                    userChats[sender].push({
+                        role: 'assistant',
+                        content: `استلمت الملف "${fileName}" وقرأته، يمكنك الآن سؤالي عن أي شيء فيه.`
+                    });
+
+                    stats.totalDocs = (stats.totalDocs || 0) + 1;
+                    saveData();
+
+                    const userQ = caption || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه';
+                    const res = await askAIWithDoc(docText, userQ, userName);
+
+                    userChats[sender].push({ role: 'assistant', content: res });
+                    await reply(res);
+                    await react('✅');
+
                 } catch (e) {
                     console.error('[document]', e.message);
-                    await reply('لم أتمكن من قراءة الملف، يرجى المحاولة مرة أخرى.');
+                    await reply('حدث خطأ أثناء قراءة الملف، يرجى المحاولة مرة أخرى.');
                     await react('❌');
                 }
                 return;
