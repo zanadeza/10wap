@@ -10,6 +10,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const QRCode = require('qrcode-terminal');
+const pdfParse = require('pdf-parse');
 const QRCodeImg = require('qrcode');
 const http = require('http');
 const fs   = require('fs');
@@ -1218,42 +1219,67 @@ async function startBot() {
                     const fileName = docMsg?.fileName || 'ملف';
                     const caption = body || '';
 
-                    // ملفات نصية وPDF نقرأها
-                    const isReadable = mime === 'application/pdf' ||
-                                       mime.startsWith('text/') ||
-                                       mime.includes('msword') ||
-                                       mime.includes('wordprocessingml') ||
-                                       mime.includes('spreadsheetml') ||
-                                       mime.includes('presentationml') ||
-                                       mime.includes('opendocument');
+                    const isPDF  = mime === 'application/pdf';
+                    const isText = mime.startsWith('text/');
+                    const isWord = mime.includes('msword') || mime.includes('wordprocessingml');
 
-                    if (isReadable) {
+                    if (isPDF || isText || isWord) {
                         const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
                             logger: { level: 'silent', child: () => ({ level: 'silent' }) }
                         });
-                        // نحاول نقرأ كنص
+
                         let docText = '';
-                        if (mime.startsWith('text/')) {
-                            docText = buffer.toString('utf-8');
+
+                        if (isPDF) {
+                            try {
+                                const parsed = await pdfParse(buffer);
+                                docText = parsed.text?.trim();
+                                if (!docText) throw new Error('PDF فارغ أو مشفر');
+                            } catch (pdfErr) {
+                                console.error('[pdf-parse]', pdfErr.message);
+                                await reply(`عذراً، لم أتمكن من قراءة الـ PDF.\nتأكد أن الملف غير مشفر أو محمي بكلمة مرور.`);
+                                await react('❌');
+                                return;
+                            }
                         } else {
-                            // لـ PDF وغيره نرسله كـ base64 مع سؤال
-                            docText = `[ملف: ${fileName} - ${mime}]\nمحتوى الملف بصيغة base64، الرجاء تلخيصه إن أمكن.`;
+                            docText = buffer.toString('utf-8');
                         }
+
+                        if (!docText || docText.length < 10) {
+                            await reply('الملف فارغ أو لا يحتوي على نص قابل للقراءة.');
+                            await react('❌');
+                            return;
+                        }
+
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
-                        const res = await askAIWithDoc(docText, caption, userName, mime);
+
+                        // إضافة الملف للسياق حتى يتذكره البوت
+                        if (!userChats[sender]) userChats[sender] = [];
+                        userChats[sender].push({
+                            role: 'user',
+                            content: `[أرسل المستخدم ملف "${fileName}" - محتواه:\n${docText.slice(0, 8000)}]`
+                        });
+                        userChats[sender].push({
+                            role: 'assistant',
+                            content: `تم استلام الملف "${fileName}" وقراءته بنجاح.`
+                        });
+
+                        const userQ = caption || `لخّص هذا الملف بشكل شامل واذكر أهم نقاطه`;
+                        const res = await askAIWithDoc(docText, userQ, userName, mime);
+
+                        userChats[sender].push({ role: 'assistant', content: res });
+
                         await reply(res);
                         await react('✅');
                     } else {
-                        // ملف غير مدعوم (exe, zip, etc)
                         await react('ℹ️');
                         await reply(
                             `📎 استلمت ملف: ${fileName}\n` +
-                            `نوع الملف (${mime || 'غير معروف'}) غير مدعوم للقراءة.\n\n` +
+                            `نوع الملف غير مدعوم للقراءة.\n\n` +
                             `الملفات المدعومة:\n` +
-                            `• ملفات نصية (.txt, .csv, .json)\n` +
-                            `• مستندات Word\n` +
-                            `• ملفات PDF\n` +
+                            `• PDF\n` +
+                            `• ملفات نصية (.txt, .csv)\n` +
                             `• الصور (أرسلها كصورة مباشرة)`
                         );
                     }
