@@ -835,15 +835,26 @@ setInterval(loadData, 10000);
 </html>`);
     });
 
-    server.listen(WEB_PORT, () => {
-        console.log(`\n🌐 لوحة التحكم: http://localhost:${WEB_PORT}\n`);
-    });
+    function tryListen(port) {
+        server.listen(port, '0.0.0.0', () => {
+            console.log(`\n🌐 لوحة التحكم: http://localhost:${port}`);
+            console.log(`🌐 من جهاز ثاني على الشبكة: http://<IP الجهاز>:${port}\n`);
+        });
+    }
 
     server.on('error', (e) => {
         if (e.code === 'EADDRINUSE') {
-            console.log(`⚠️ البورت ${WEB_PORT} مشغول`);
+            const currentPort = server.address()?.port || WEB_PORT;
+            const nextPort = currentPort + 1;
+            console.log(`⚠️ البورت ${currentPort} مشغول، جاري المحاولة على ${nextPort}...`);
+            server.close();
+            tryListen(nextPort);
+        } else {
+            console.error('[server]', e.message);
         }
     });
+
+    tryListen(WEB_PORT);
 }
 
 // ============================================================
