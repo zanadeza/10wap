@@ -19,6 +19,10 @@ const fs   = require('fs');
 // CONFIG
 // ============================================================
 const MISTRAL_API_KEY = 'fZ0TSrAOJK3cBjkmj461Msqhk90d0HiL';
+const GROQ_API_KEY    = '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';
+const GROQ_MODEL      = 'llama-3.3-70b-versatile'; // أقوى نموذج مجاني على Groq
+const GEMINI_API_KEY  = 'AQ.Ab8RN6I1MCbHtaVSES4cHYY03ug5oHY5xuAGxlQDvn5RR2IdQw';
+const GEMINI_MODEL    = 'gemini-2.0-flash'; // أقوى نموذج مجاني من Google
 const ADMIN_NUMBER    = '972593850520';   // بدون + أو @
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
@@ -270,7 +274,90 @@ async function callMistral(payload, retries = 2) {
     }
 }
 
+// Groq fallback — مجاني، سريع جداً
+async function callGroq(messages, maxTokens = 1500) {
+    const release = await aiSemaphore();
+    try {
+        const response = await fetchWithTimeout(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${GROQ_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: GROQ_MODEL,
+                    messages,
+                    max_tokens: maxTokens,
+                    temperature: 0.5
+                })
+            }
+        );
+        if (response.status === 429) throw new Error('Groq rate limit');
+        if (!response.ok) throw new Error(`Groq HTTP ${response.status}`);
+        const data = await response.json();
+        if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة من Groq');
+        return data.choices[0].message.content;
+    } finally {
+        release();
+    }
+}
+
+// Gemini 2.0 Flash — الأقوى مجاناً، يدعم نصوص وصور
+async function callGemini(messages, maxTokens = 1500) {
+    const release = await aiSemaphore();
+    try {
+        // تحويل messages من OpenAI format لـ Gemini format
+        const systemMsg = messages.find(m => m.role === 'system');
+        const chatMsgs  = messages.filter(m => m.role !== 'system');
+
+        const contents = chatMsgs.map(m => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: Array.isArray(m.content)
+                ? m.content.map(p => {
+                    if (p.type === 'text') return { text: p.text };
+                    if (p.type === 'image_url') {
+                        // data:mime;base64,xxx
+                        const [header, data] = p.image_url.url.split(',');
+                        const mimeType = header.split(':')[1].split(';')[0];
+                        return { inline_data: { mime_type: mimeType, data } };
+                    }
+                    return { text: JSON.stringify(p) };
+                })
+                : [{ text: m.content }]
+        }));
+
+        const body = {
+            contents,
+            generationConfig: { maxOutputTokens: maxTokens, temperature: 0.5 }
+        };
+        if (systemMsg) {
+            body.system_instruction = { parts: [{ text: systemMsg.content }] };
+        }
+
+        const response = await fetchWithTimeout(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            }
+        );
+        if (response.status === 429) throw new Error('Gemini rate limit');
+        if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
+        const data = await response.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error('استجابة فارغة من Gemini');
+        return text;
+    } finally {
+        release();
+    }
+}
+
+// askAI: Mistral → Gemini → Groq (نظام fallback ثلاثي)
 async function askAI(messages) {
+    // المحاولة الأولى: Mistral (يدعم الصور)
     try {
         return await callMistral({
             model: 'pixtral-large-latest',
@@ -279,9 +366,22 @@ async function askAI(messages) {
             temperature: 0.5
         });
     } catch (e) {
-        console.error('[askAI]', e.message);
-        if (e.name === 'AbortError') return 'انتهت مهلة الاستجابة، يرجى المحاولة مرة أخرى.';
-        return 'عذراً، حدث خطأ تقني. يرجى المحاولة مرة أخرى.';
+        console.warn('[askAI] Mistral فشل، جاري التحويل لـ Gemini...', e.message);
+    }
+
+    // المحاولة الثانية: Gemini 2.0 Flash
+    try {
+        return await callGemini(messages, 1500);
+    } catch (e) {
+        console.warn('[askAI] Gemini فشل، جاري التحويل لـ Groq...', e.message);
+    }
+
+    // المحاولة الثالثة: Groq
+    try {
+        return await callGroq(messages, 1500);
+    } catch (e) {
+        console.error('[askAI] كل النماذج فشلت:', e.message);
+        return 'عذراً، الخدمة غير متاحة حالياً. يرجى المحاولة مرة أخرى.';
     }
 }
 
@@ -1190,6 +1290,17 @@ async function startBot() {
                 if (safeBody(body, '!مسح_كل')) {
                     userChats = {};
                     await reply('تم مسح جميع الجلسات النشطة من الذاكرة');
+                    return;
+                }
+
+                if (safeBody(body, '!ai')) {
+                    await reply(
+                        `🤖 نماذج الذكاء الاصطناعي المفعّلة:\n\n` +
+                        `1️⃣ Mistral Pixtral Large — الرئيسي (نصوص + صور + PDF)\n` +
+                        `2️⃣ Gemini 2.0 Flash — احتياطي أول (أقوى مجاني من Google)\n` +
+                        `3️⃣ Groq Llama 3.3 70B — احتياطي ثاني (مجاني وسريع)\n\n` +
+                        `النظام يجرب بالترتيب تلقائياً عند أي فشل.`
+                    );
                     return;
                 }
 
