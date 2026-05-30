@@ -31,7 +31,7 @@ const WEB_PORT        = 8080;
 let currentQR = null;
 let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
-const API_TIMEOUT_MS  = 60_000;         // 60 ثانية timeout للـ API
+const API_TIMEOUT_MS  = 25_000;         // 25 ثانية timeout للـ API
 
 // ============================================================
 // PERSISTENCE
@@ -52,7 +52,7 @@ function loadData() {
 
 let _saveTimer = null;
 function saveData() {
-    // debounce: تأخير 2 ثانية، تمنع كتابات متعاقبة سريعة
+    // debounce: تأخير 500ms
     if (_saveTimer) clearTimeout(_saveTimer);
     _saveTimer = setTimeout(() => {
         try {
@@ -61,11 +61,11 @@ function saveData() {
                 { userNames, welcomedUsers, vipNumbers, reports, stats },
                 null, 2
             ));
-            fs.renameSync(tmp, DATA_FILE); // atomic write - لا يفسد الملف لو انقطع الكهرباء
+            fs.renameSync(tmp, DATA_FILE);
         } catch (e) {
             console.error('[saveData] خطأ:', e.message);
         }
-    }, 2000);
+    }, 500);
 }
 
 let { userNames, welcomedUsers, vipNumbers, reports, stats } = loadData();
@@ -224,13 +224,13 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 // ============================================================
 // AI FUNCTIONS
 // ============================================================
-// Semaphore: أقصى 3 طلبات متزامنة للـ AI
+// Semaphore: أقصى 8 طلبات متزامنة للـ AI
 let _aiActive = 0;
 const _aiQueue = [];
 function aiSemaphore() {
     return new Promise(resolve => {
         function tryAcquire() {
-            if (_aiActive < 3) { _aiActive++; resolve(() => { _aiActive--; if (_aiQueue.length) _aiQueue.shift()(); }); }
+            if (_aiActive < 8) { _aiActive++; resolve(() => { _aiActive--; if (_aiQueue.length) _aiQueue.shift()(); }); }
             else { _aiQueue.push(tryAcquire); }
         }
         tryAcquire();
@@ -254,7 +254,7 @@ async function callMistral(payload, retries = 2) {
                     }
                 );
                 if (response.status === 429) {
-                    const wait = (attempt + 1) * 5000;
+                    const wait = (attempt + 1) * 1000;
                     console.warn(`[Mistral] rate limit، انتظار ${wait/1000}ث...`);
                     await new Promise(r => setTimeout(r, wait));
                     continue;
@@ -266,7 +266,7 @@ async function callMistral(payload, retries = 2) {
             } catch (e) {
                 if (attempt === retries) throw e;
                 console.warn(`[Mistral] محاولة ${attempt + 1} فشلت:`, e.message);
-                await new Promise(r => setTimeout(r, 3000));
+                await new Promise(r => setTimeout(r, 500));
             }
         }
     } finally {
@@ -472,8 +472,8 @@ async function broadcastToAll(getTextFn) {
         const num = allUsers[i];
 
         if (i > 0 && i % 30 === 0) {
-            console.log(`⏸️ استراحة 30 ثانية بعد ${i} رسائل...`);
-            await new Promise(r => setTimeout(r, 30_000));
+            console.log(`⏸️ استراحة 10 ثواني بعد ${i} رسائل...`);
+            await new Promise(r => setTimeout(r, 10_000));
         }
 
         try {
@@ -488,7 +488,7 @@ async function broadcastToAll(getTextFn) {
             failed++;
         }
 
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 800));
     }
 
     console.log(`📢 اكتمل البث: ${sent} نجح، ${failed} فشل`);
