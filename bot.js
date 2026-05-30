@@ -27,7 +27,7 @@ const WEB_PORT        = 8080;
 let currentQR = null;
 let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
-const API_TIMEOUT_MS  = 60_000;         // 30 ثانية timeout للـ API
+const API_TIMEOUT_MS  = 60_000;         // 60 ثانية timeout للـ API
 
 // ============================================================
 // PERSISTENCE
@@ -46,15 +46,22 @@ function loadData() {
     };
 }
 
+let _saveTimer = null;
 function saveData() {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(
-            { userNames, welcomedUsers, vipNumbers, reports, stats },
-            null, 2
-        ));
-    } catch (e) {
-        console.error('[saveData] خطأ:', e.message);
-    }
+    // debounce: تأخير 2 ثانية، تمنع كتابات متعاقبة سريعة
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+        try {
+            const tmp = DATA_FILE + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(
+                { userNames, welcomedUsers, vipNumbers, reports, stats },
+                null, 2
+            ));
+            fs.renameSync(tmp, DATA_FILE); // atomic write - لا يفسد الملف لو انقطع الكهرباء
+        } catch (e) {
+            console.error('[saveData] خطأ:', e.message);
+        }
+    }, 2000);
 }
 
 let { userNames, welcomedUsers, vipNumbers, reports, stats } = loadData();
@@ -71,41 +78,102 @@ welcomedUsers[ADMIN_NUMBER] = true;
 saveData();
 
 let userChats       = {};   // سياق المحادثة (RAM فقط)
+let userChatLastSeen = {}; // آخر نشاط لكل مستخدم
 let sock            = null;
-let schedulersStarted = false;  // منع تشغيل المجدولات أكثر من مرة
+let isReconnecting  = false; // منع الاتصال المتعدد
+
+// تنظيف الذاكرة: احتفظ بآخر 800 جلسة الأكثر نشاطاً (LRU)
+function cleanMemory() {
+    const keys = Object.keys(userChats);
+    if (keys.length > 800) {
+        const sorted = keys.sort((a, b) => (userChatLastSeen[a] || 0) - (userChatLastSeen[b] || 0));
+        const toDelete = sorted.slice(0, keys.length - 800);
+        toDelete.forEach(k => { delete userChats[k]; delete userChatLastSeen[k]; });
+        console.log(`[cleanMemory] حُذف ${toDelete.length} جلسة قديمة (LRU)`);
+    }
+}
+
+// ============================================================
+// PURE HELPERS (no dependencies — must come before SYSTEM PROMPTS)
+// ============================================================
+
+// توقيت القدس
+function nowJerusalem() {
+    // طريقة موثوقة لجميع البيئات
+    const now = new Date();
+    const offset = now.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour12: false,
+        year:'numeric', month:'2-digit', day:'2-digit',
+        hour:'2-digit', minute:'2-digit', second:'2-digit' });
+    return new Date(offset);
+}
+
+// مساعد بسيط للمقارنة الكاملة
+function safeBody(body, cmd) { return body === cmd; }
+
+// ============================================================
+// RATE LIMITING & ANTI-SPAM
+// ============================================================
+const _userRateLimit = {}; // { sender: { count, firstTime, warned } }
+const RATE_LIMIT = {
+    text:  { max: 15, windowMs: 60_000 },   // 15 رسالة/دقيقة
+    image: { max: 5,  windowMs: 60_000 },   // 5 صور/دقيقة
+    pdf:   { max: 3,  windowMs: 60_000 },   // 3 PDF/دقيقة
+};
+const _userDailyLimit = {}; // { sender: { images, docs, date } }
+
+function getRateKey(sender, type) { return sender + ':' + type; }
+
+function checkRateLimit(sender, type) {
+    const key   = getRateKey(sender, type);
+    const limit = RATE_LIMIT[type] || RATE_LIMIT.text;
+    const now   = Date.now();
+    if (!_userRateLimit[key]) _userRateLimit[key] = { count: 0, firstTime: now };
+    const state = _userRateLimit[key];
+    // reset window
+    if (now - state.firstTime > limit.windowMs) {
+        state.count = 0;
+        state.firstTime = now;
+    }
+    state.count++;
+    if (state.count > limit.max) return false; // blocked
+    return true;
+}
+
+function checkDailyLimit(sender, type) {
+    const today = new Date().toISOString().slice(0,10);
+    if (!_userDailyLimit[sender] || _userDailyLimit[sender].date !== today)
+        _userDailyLimit[sender] = { images: 0, docs: 0, date: today };
+    const d = _userDailyLimit[sender];
+    if (type === 'image') { if (d.images >= 20) return false; d.images++; return true; }
+    if (type === 'pdf')   { if (d.docs   >= 10) return false; d.docs++;   return true; }
+    return true;
+}
+
+// تنظيف rate limits كل ساعة
+setInterval(() => {
+    const now = Date.now();
+    for (const key of Object.keys(_userRateLimit)) {
+        if (now - _userRateLimit[key].firstTime > 120_000) delete _userRateLimit[key];
+    }
+}, 60 * 60_000);
 
 // ============================================================
 // SYSTEM PROMPTS
 // ============================================================
+let _cachedSystemPrompt = null;
+let _cachedSystemPromptTime = 0;
 function getSystemPrompt() {
+    const nowMs = Date.now();
+    if (_cachedSystemPrompt && nowMs - _cachedSystemPromptTime < 60_000)
+        return _cachedSystemPrompt;
+    _cachedSystemPromptTime = nowMs;
     const now = nowJerusalem();
     const days = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
     const months = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
     const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
     const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-    return `اسمك "MedTerm"، بوت ذكاء اصطناعي متخصص على واتساب.
-
-التاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)
-يجب أن تستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.
-
-شخصيتك:
-- جدية ومهنية بنسبة 95٪، ردودك دقيقة ومباشرة بدون حشو
-- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها
-- أعطِ المعلومة الصحيحة الكاملة في أول مرة
-- إذا لم تعرف شيئاً قل: لا تتوفر لديّ معلومات كافية حول هذا الموضوع
-- لا تستخدم جداول، اكتب كل شيء كنص عادي منظّم
-- لا تستخدم مصطلحات أجنبية غير ضرورية، عربي وإنجليزي فقط عند الحاجة
-- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد
-- إذا سُئلت عن اسمك قل: أنا MedTerm، بوت ذكاء اصطناعي
-- تتعامل مع جميع أرقام دول العالم باحترام
-
-المجال الطبي والعلمي:
-- معلومات دقيقة 100٪ موثوقة
-- اذكر الجرعات والأدوية بدقة عند الحاجة
-- نبّه دائماً بمراجعة الطبيب للحالات الخطيرة أو المزمنة
-- في تحليل الصور الطبية: كن متخصصاً ودقيقاً واطلب مراجعة متخصص للتأكيد
-
-اسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`;
+    _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب.\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)\nاستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.\n\nشخصيتك:\n- مساعد شامل ومتعدد المعرفة: تجيب على أي سؤال في أي مجال بدون استثناء\n- جدي ومهني، ردودك دقيقة ومباشرة بدون حشو أو مقدمات زائدة\n- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها فوراً\n- أعطِ المعلومة الكاملة والصحيحة من أول رد\n- نظّم ردودك بشكل واضح: استخدم النقاط والعناوين والترقيم عند الحاجة لتسهيل القراءة\n- لا تستخدم مصطلحات أجنبية غير ضرورية\n- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد\n- إذا سُئلت عن اسمك قل: أنا MedTerm، مساعد ذكاء اصطناعي\n- تتعامل مع جميع المستخدمين باحترام بغض النظر عن جنسيتهم أو لغتهم\n\nمجالات خبرتك (غير محدودة):\n- الطب والصحة: معلومات دقيقة، أدوية، جرعات، أعراض، تشخيص أولي — مع التنبيه بمراجعة الطبيب للحالات الجدية\n- العلوم والتقنية: برمجة، ذكاء اصطناعي، رياضيات، فيزياء، كيمياء\n- القانون والأعمال: معلومات عامة، عقود، ريادة أعمال، تسويق\n- التاريخ والجغرافيا والثقافة العامة\n- الدين والفقه: إجابات موضوعية ومتوازنة\n- الأدب والكتابة والترجمة\n- الطبخ والسفر ونمط الحياة\n- أي موضوع آخر يسألك عنه المستخدم\n\nقاعدة ذهبية: لا تقل أبداً "هذا خارج نطاق تخصصي" — أجب على كل سؤال بأفضل ما لديك.\n\nاسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`
+    return _cachedSystemPrompt;
 }
 
 const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. حلّل الصورة الطبية بدقة عالية.
@@ -137,11 +205,6 @@ function cleanNumber(jidOrNumber) {
         .trim();
 }
 
-// توقيت القدس
-function nowJerusalem() {
-    return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
-}
-
 // API call مع timeout
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
     const controller = new AbortController();
@@ -157,35 +220,53 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 // ============================================================
 // AI FUNCTIONS
 // ============================================================
-async function callMistral(payload, retries = 2) {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-            const response = await fetchWithTimeout(
-                'https://api.mistral.ai/v1/chat/completions',
-                {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(payload)
-                }
-            );
-            if (response.status === 429) {
-                const wait = (attempt + 1) * 5000;
-                console.warn(`[Mistral] rate limit، انتظار ${wait/1000}ث...`);
-                await new Promise(r => setTimeout(r, wait));
-                continue;
-            }
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const data = await response.json();
-            if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة من API');
-            return data.choices[0].message.content;
-        } catch (e) {
-            if (attempt === retries) throw e;
-            console.warn(`[Mistral] محاولة ${attempt + 1} فشلت:`, e.message);
-            await new Promise(r => setTimeout(r, 3000));
+// Semaphore: أقصى 3 طلبات متزامنة للـ AI
+let _aiActive = 0;
+const _aiQueue = [];
+function aiSemaphore() {
+    return new Promise(resolve => {
+        function tryAcquire() {
+            if (_aiActive < 3) { _aiActive++; resolve(() => { _aiActive--; if (_aiQueue.length) _aiQueue.shift()(); }); }
+            else { _aiQueue.push(tryAcquire); }
         }
+        tryAcquire();
+    });
+}
+
+async function callMistral(payload, retries = 2) {
+    const release = await aiSemaphore();
+    try {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                const response = await fetchWithTimeout(
+                    'https://api.mistral.ai/v1/chat/completions',
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    }
+                );
+                if (response.status === 429) {
+                    const wait = (attempt + 1) * 5000;
+                    console.warn(`[Mistral] rate limit، انتظار ${wait/1000}ث...`);
+                    await new Promise(r => setTimeout(r, wait));
+                    continue;
+                }
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة من API');
+                return data.choices[0].message.content;
+            } catch (e) {
+                if (attempt === retries) throw e;
+                console.warn(`[Mistral] محاولة ${attempt + 1} فشلت:`, e.message);
+                await new Promise(r => setTimeout(r, 3000));
+            }
+        }
+    } finally {
+        release();
     }
 }
 
@@ -232,43 +313,41 @@ function isMedicalImage(text) {
         .test(text || '');
 }
 
-async function askAIWithImage(base64Image, userQuestion, userName) {
+async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
     try {
-        const isMedical   = isMedicalImage(userQuestion);
-        const systemToUse = isMedical ? MEDICAL_IMAGE_PROMPT : getSystemPrompt();
-        const questionText = userQuestion ||
-            (isMedical ? 'حلل هذه الصورة الطبية بالتفصيل' : 'صف ما تراه في هذه الصورة بالتفصيل');
+        const isMedical    = isMedicalImage(userQuestion);
+        const systemToUse  = isMedical ? MEDICAL_IMAGE_PROMPT : getSystemPrompt();
+        const mime         = mimeType || 'image/jpeg';
 
-        const response = await fetchWithTimeout(
-            'https://api.mistral.ai/v1/chat/completions',
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: 'pixtral-large-latest',
-                    messages: [
-                        { role: 'system', content: systemToUse },
-                        {
-                            role: 'user',
-                            content: [
-                                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
-                                { type: 'text', text: userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText }
-                            ]
-                        }
-                    ],
-                    max_tokens: isMedical ? 2000 : 1500,
-                    temperature: isMedical ? 0.3 : 0.5
-                })
-            }
-        );
+        // إذا ما في سؤال: استخرج النص أولاً ثم اشرح
+        const hasQuestion  = userQuestion && userQuestion.trim().length > 0;
+        const questionText = hasQuestion
+            ? userQuestion
+            : isMedical
+                ? 'حلل هذه الصورة الطبية بالتفصيل الكامل، واذكر كل ما تراه'
+                : `افحص هذه الصورة بدقة عالية:
+1. إذا فيها نص أو كلام أو أرقام: اقرأه كاملاً كما هو بالضبط دون أي تغيير
+2. إذا فيها جدول أو بيانات: اكتبها منظمة
+3. اشرح محتوى الصورة بالتفصيل
+كن دقيقاً جداً في قراءة النصوص ولا تخمّن`;
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة');
-        return data.choices[0].message.content;
+        const prompt = userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText;
+
+        return await callMistral({
+            model: 'pixtral-large-latest',
+            messages: [
+                { role: 'system', content: systemToUse },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'image_url', image_url: { url: `data:${mime};base64,${base64Image}` } },
+                        { type: 'text', text: prompt }
+                    ]
+                }
+            ],
+            max_tokens: isMedical ? 2500 : 2000,
+            temperature: isMedical ? 0.2 : 0.3
+        });
 
     } catch (e) {
         console.error('[askAIWithImage]', e.message);
@@ -292,9 +371,9 @@ async function broadcastToAll(getTextFn) {
     for (let i = 0; i < allUsers.length; i++) {
         const num = allUsers[i];
 
-        if (i > 0 && i % 20 === 0) {
-            console.log(`⏸️ استراحة 5 دقائق بعد ${i} رسائل...`);
-            await new Promise(r => setTimeout(r, 5 * 60_000));
+        if (i > 0 && i % 30 === 0) {
+            console.log(`⏸️ استراحة 30 ثانية بعد ${i} رسائل...`);
+            await new Promise(r => setTimeout(r, 30_000));
         }
 
         try {
@@ -309,103 +388,11 @@ async function broadcastToAll(getTextFn) {
             failed++;
         }
 
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, 1500));
     }
 
     console.log(`📢 اكتمل البث: ${sent} نجح، ${failed} فشل`);
     return { sent, failed, total: allUsers.length };
-}
-
-// ============================================================
-// PRAYER & DHIKR
-// ============================================================
-const PRAYER_SCHEDULE = [
-    { name: 'الفجر',  hour: 4,  minute: 30 },
-    { name: 'الظهر',  hour: 12, minute: 15 },
-    { name: 'العصر',  hour: 15, minute: 30 },
-    { name: 'المغرب', hour: 18, minute: 15 },
-    { name: 'العشاء', hour: 20, minute: 0  }
-];
-
-const DHIKR_LIST = [
-    'سبحان الله وبحمده، سبحان الله العظيم\n\nاللهم أعنّا على ذكرك وشكرك وحسن عبادتك',
-    'أستغفر الله العظيم الذي لا إله إلا هو الحي القيوم وأتوب إليه\n\nاستغفروا ربكم إنه كان غفاراً',
-    'لا إله إلا الله وحده لا شريك له، له الملك وله الحمد وهو على كل شيء قدير\n\nأكثروا من هذا الذكر في صباحكم ومسائكم',
-    'سبحان الله والحمد لله ولا إله إلا الله والله أكبر\n\nهذه الكلمات أحب إلى الله من كل ما طلعت عليه الشمس',
-    'رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ\n\nاللهم آمين',
-    'اللهم إني أسألك العفو والعافية في الدنيا والآخرة\n\nاللهم آمين يا رب العالمين',
-    'حسبي الله ونعم الوكيل، نعم المولى ونعم النصير\n\nمن قالها سبعاً كفاه الله ما أهمه',
-    'اللهم إنك عفو تحب العفو فاعفُ عنا\n\nأكثر من هذا الدعاء في ليالي القدر وفي كل وقت',
-    'بسم الله الرحمن الرحيم\nقل هو الله أحد، الله الصمد، لم يلد ولم يولد، ولم يكن له كفواً أحد\n\nمن قرأها ثلاثاً فكأنما قرأ القرآن كاملاً',
-    'لا حول ولا قوة إلا بالله العلي العظيم\n\nهي كنز من كنوز الجنة، أكثر منها في يومك',
-    'اللهم صل على محمد وأزواجه وذريته كما صليت على آل إبراهيم\nوبارك على محمد وأزواجه وذريته كما باركت على آل إبراهيم إنك حميد مجيد',
-    'سبحان الله وبحمده، عدد خلقه، ورضا نفسه، وزنة عرشه، ومداد كلماته\n\nقلها ثلاثاً في الصباح تعدل ساعات من الذكر'
-];
-
-const SALAH_LIST = [
-    'اللهم صلِّ على محمد وعلى آل محمد\nكما صليت على إبراهيم وعلى آل إبراهيم\nإنك حميد مجيد',
-    'اللهم صلِّ وسلِّم وبارك على نبينا محمد\nمن صلّى عليّ مرة صلى الله عليه بها عشراً',
-    'اللهم صلِّ على محمد النبي الأمي وعلى آله وصحبه وسلِّم\nأكثروا من الصلاة على النبي يوم الجمعة',
-    'اللهم صلِّ على محمد وعلى آله وصحبه أجمعين\nمن أكثر من الصلاة عليّ كنت له شفيعاً يوم القيامة',
-    'صلى الله على النبي الكريم وآله الطيبين الطاهرين\nوسلّم تسليماً كثيراً إلى يوم الدين',
-    'اللهم صلِّ وسلِّم على عبدك ورسولك محمد\nوعلى آله وأصحابه ومن تبعهم بإحسان'
-];
-
-// اختيار عشوائي مع تجنب التكرار
-const _lastPicked = {};
-function rand(arr, key) {
-    if (!key) return arr[Math.floor(Math.random() * arr.length)];
-    let idx;
-    do { idx = Math.floor(Math.random() * arr.length); }
-    while (arr.length > 1 && idx === _lastPicked[key]);
-    _lastPicked[key] = idx;
-    return arr[idx];
-}
-
-function startSchedulers() {
-    if (schedulersStarted) return;
-    schedulersStarted = true;
-    console.log('⏰ تشغيل المجدولات...');
-
-    // فحص أوقات الصلاة كل دقيقة (بتوقيت القدس)
-    setInterval(async () => {
-        if (!sock) return;
-        const now    = nowJerusalem();
-        const hour   = now.getHours();
-        const minute = now.getMinutes();
-
-        for (const prayer of PRAYER_SCHEDULE) {
-            if (prayer.hour === hour && prayer.minute === minute) {
-                const pName = prayer.name;
-                await broadcastToAll(() => {
-                    const extras = [
-                        'اللهم اجعلنا من المحافظين على الصلوات',
-                        'الصلاة نور، حافظ عليها',
-                        'قم إلى الصلاة رحمك الله',
-                        'الصلاة خير من النوم'
-                    ];
-                    return `🕌 *حان وقت صلاة ${pName}*\n\n${rand(extras)}\nحي على الصلاة، حي على الفلاح`;
-                }).catch(console.error);
-                console.log(`🕌 تم إرسال تنبيه صلاة ${prayer.name}`);
-            }
-        }
-    }, 60_000);
-
-    // ذكر واستغفار كل 6 ساعات — كل مستخدم رسالة مختلفة
-    setInterval(async () => {
-        if (!sock) return;
-        console.log('📿 بدء إرسال الذكر...');
-        await broadcastToAll(() => `📿 *ذكر*\n\n${rand(DHIKR_LIST, 'dhikr')}`).catch(console.error);
-        console.log('📿 تم إرسال الذكر');
-    }, 6 * 60 * 60_000);
-
-    // صلاة على النبي مرة يومياً — كل مستخدم رسالة مختلفة
-    setInterval(async () => {
-        if (!sock) return;
-        console.log('💚 بدء إرسال الصلاة على النبي...');
-        await broadcastToAll(() => `💚 *صلاة على النبي ﷺ*\n\n${rand(SALAH_LIST, 'salah')}`).catch(console.error);
-        console.log('💚 تم إرسال الصلاة على النبي');
-    }, 24 * 60 * 60_000);
 }
 
 
@@ -413,8 +400,32 @@ function startSchedulers() {
 // QR WEB SERVER
 // ============================================================
 function startQRServer() {
+    const _webRateLimit = {}; // IP-based rate limit للـ web server
+    function checkWebRate(ip) {
+        const now = Date.now();
+        if (!_webRateLimit[ip]) _webRateLimit[ip] = { count: 0, first: now };
+        const s = _webRateLimit[ip];
+        if (now - s.first > 60_000) { s.count = 0; s.first = now; }
+        s.count++;
+        return s.count <= 60; // 60 request/دقيقة لكل IP
+    }
+    setInterval(() => {
+        const now = Date.now();
+        for (const ip of Object.keys(_webRateLimit))
+            if (now - _webRateLimit[ip].first > 120_000) delete _webRateLimit[ip];
+    }, 5 * 60_000);
+
     const server = http.createServer(async (req, res) => {
+        // إغلاق الاتصال بعد الاستجابة
+        res.setHeader('Connection', 'close');
+        const ip  = req.socket.remoteAddress || 'unknown';
         const url = req.url.split('?')[0];
+
+        if (!checkWebRate(ip)) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, msg: 'Too many requests' }));
+            return;
+        }
 
         // ===== QR IMAGE =====
         if (url === '/qr-image' && currentQR) {
@@ -448,6 +459,8 @@ function startQRServer() {
                         delete userChats[num];
                         delete welcomedUsers[num];
                         delete userNames[num];
+                        vipNumbers = vipNumbers.filter(n => n !== num);
+                        reports = reports.filter(r => r.sender !== num);
                         saveData();
                     }
                     else if (action === 'clearReports') {
@@ -492,8 +505,18 @@ function startQRServer() {
             return;
         }
 
-        // ===== DATA API =====
+        // ===== DATA API (dashboard-only — requires Origin check) =====
         if (url === '/data') {
+            // Block cross-origin / external access: only allow requests from the
+            // same server (no Origin header = same-origin fetch/XHR).
+            const origin = req.headers['origin'];
+            if (origin) {
+                // Requests from a browser page on a different origin include Origin.
+                // Reject them to prevent drive-by data extraction.
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, msg: 'Forbidden' }));
+                return;
+            }
             const d = {
                 connected: isConnected,
                 hasQR: !!currentQR,
@@ -509,6 +532,8 @@ function startQRServer() {
                     reports: reports.length
                 },
                 vipNumbers,
+                // userNames exposed only as a lookup map — keys are already known
+                // from welcomedUsers; we keep the map so the dashboard can show names.
                 userNames,
                 welcomedUsers: Object.keys(welcomedUsers),
                 reports: reports.slice(-50).reverse()
@@ -686,6 +711,17 @@ textarea.inp{resize:vertical;min-height:80px}
 <div class="toast" id="toast"></div>
 
 <script>
+// XSS helper — escapes all dangerous HTML characters
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 let _data = null;
 
 function showTab(name) {
@@ -803,37 +839,51 @@ function filterUsers() {
   const filtered = q ? _allUsers.filter(u => u.num.includes(q) || u.name.toLowerCase().includes(q)) : _allUsers;
   const tb = document.getElementById('users-table');
   if (!filtered.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">لا يوجد مستخدمون</td></tr>'; return; }
-  tb.innerHTML = filtered.slice(0,100).map(u => \`<tr>
-    <td dir="ltr">\${u.num}</td>
-    <td>\${u.name}</td>
-    <td><span class="badge \${u.isVip ? 'badge-b' : 'badge-g'}">\${u.isVip ? '⭐ VIP' : 'عادي'}</span></td>
-    <td style="display:flex;gap:6px">
-      \${!u.isVip ? \`<button class="btn btn-b" onclick="addVipNum('\${u.num}')">+ VIP</button>\` : \`<button class="btn btn-y" onclick="removeVipNum('\${u.num}')">إزالة VIP</button>\`}
-      <button class="btn btn-r" onclick="deleteUser('\${u.num}')">حذف</button>
-    </td>
-  </tr>\`).join('');
+  tb.innerHTML = filtered.slice(0,100).map(u => {
+    const safeNum  = esc(u.num);
+    const safeName = esc(u.name);
+    // onclick values use JSON.stringify to safely embed the number as a JS string argument
+    const addVipBtn    = \`<button class="btn btn-b" onclick="addVipNum(\${JSON.stringify(u.num)})">+ VIP</button>\`;
+    const removeVipBtn = \`<button class="btn btn-y" onclick="removeVipNum(\${JSON.stringify(u.num)})">إزالة VIP</button>\`;
+    const deleteBtn    = \`<button class="btn btn-r" onclick="deleteUser(\${JSON.stringify(u.num)})">حذف</button>\`;
+    return \`<tr>
+      <td dir="ltr">\${safeNum}</td>
+      <td>\${safeName}</td>
+      <td><span class="badge \${u.isVip ? 'badge-b' : 'badge-g'}">\${u.isVip ? '⭐ VIP' : 'عادي'}</span></td>
+      <td style="display:flex;gap:6px">
+        \${!u.isVip ? addVipBtn : removeVipBtn}
+        \${deleteBtn}
+      </td>
+    </tr>\`;
+  }).join('');
 }
 
 function renderVip(d) {
   const tb = document.getElementById('vip-table');
   if (!d.vipNumbers.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">لا يوجد أرقام VIP</td></tr>'; return; }
-  tb.innerHTML = d.vipNumbers.map(num => \`<tr>
-    <td dir="ltr">\${num}</td>
-    <td>\${d.userNames[num] || '—'}</td>
-    <td><button class="btn btn-r" onclick="removeVipNum('\${num}')">حذف</button></td>
-  </tr>\`).join('');
+  tb.innerHTML = d.vipNumbers.map(num => {
+    const safeNum  = esc(num);
+    const safeName = esc(d.userNames[num] || '—');
+    return \`<tr>
+      <td dir="ltr">\${safeNum}</td>
+      <td>\${safeName}</td>
+      <td><button class="btn btn-r" onclick="removeVipNum(\${JSON.stringify(num)})">حذف</button></td>
+    </tr>\`;
+  }).join('');
 }
 
 function renderReports(d) {
   const tb = document.getElementById('reports-table');
   if (!d.reports.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">لا يوجد بلاغات</td></tr>'; return; }
-  tb.innerHTML = d.reports.map((r,i) => \`<tr>
-    <td>\${i+1}</td>
-    <td>\${r.name || '—'}</td>
-    <td dir="ltr" style="font-size:12px">\${r.sender}</td>
-    <td>\${r.text}</td>
-    <td style="font-size:11px;color:#64748b">\${r.time}</td>
-  </tr>\`).join('');
+  tb.innerHTML = d.reports.map((r,i) => {
+    return \`<tr>
+      <td>\${i+1}</td>
+      <td>\${esc(r.name || '—')}</td>
+      <td dir="ltr" style="font-size:12px">\${esc(r.sender)}</td>
+      <td>\${esc(r.text)}</td>
+      <td style="font-size:11px;color:#64748b">\${esc(r.time)}</td>
+    </tr>\`;
+  }).join('');
 }
 
 async function addVip() {
@@ -888,7 +938,8 @@ async function sendBroadcast() {
 
 // تحديث كل 10 ثواني
 loadData();
-setInterval(loadData, 10000);
+// تحديث الداشبورد كل 30 ثانية فقط إذا كانت الصفحة نشطة
+setInterval(loadData, 30000);
 </script>
 </body>
 </html>`);
@@ -956,18 +1007,30 @@ async function startBot() {
             currentQR = null;
             isConnected = true;
             console.log('✅ البوت متصل وجاهز!');
-            startSchedulers();
         }
 
         if (connection === 'close') {
-            const code           = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = code !== DisconnectReason.loggedOut;
-            console.log('❌ انقطع الاتصال، الكود:', code);
+            isConnected = false;
+            const errCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = errCode !== DisconnectReason.loggedOut;
+            console.log('❌ انقطع الاتصال، الكود:', errCode);
             if (shouldReconnect) {
-                console.log('🔄 إعادة الاتصال خلال 5 ثواني...');
-                setTimeout(startBot, 5000);
+                if (!isReconnecting) {
+                    isReconnecting = true;
+                    let delay = 5000;
+                    const tryReconnect = () => {
+                        console.log(`🔄 محاولة إعادة الاتصال خلال ${delay/1000}ث...`);
+                        setTimeout(() => {
+                            isReconnecting = false;
+                            startBot();
+                        }, delay);
+                        delay = Math.min(delay * 2, 60_000); // exponential backoff حتى دقيقة
+                    };
+                    tryReconnect();
+                }
             } else {
                 console.log('🚪 تم تسجيل الخروج. احذف مجلد session وأعد التشغيل.');
+                isReconnecting = false;
             }
         }
     });
@@ -1004,6 +1067,7 @@ async function startBot() {
             if (!sender) return;
 
             const isAdmin = sender === ADMIN_NUMBER;
+            userChatLastSeen[sender] = Date.now(); // تحديث آخر نشاط
 
             // استخراج نص الرسالة
             const body = (
@@ -1115,8 +1179,11 @@ async function startBot() {
                     const num = cleanNumber(body.split(' ')[1] || '');
                     delete userChats[num];
                     delete welcomedUsers[num];
+                    delete userNames[num];
+                    vipNumbers = vipNumbers.filter(n => n !== num);
+                    reports = reports.filter(r => r.sender !== num);
                     saveData();
-                    await reply(`تم مسح بيانات ${num}`);
+                    await reply(`تم مسح جميع بيانات ${num}`);
                     return;
                 }
 
@@ -1147,11 +1214,13 @@ async function startBot() {
                 reports.push(report);
                 if (reports.length > 500) reports = reports.slice(-500);
                 saveData();
-                try {
-                    await sock.sendMessage(`${ADMIN_NUMBER}@s.whatsapp.net`, {
-                        text: `🚨 بلاغ جديد\nالمستخدم: ${report.name}\nالرقم: ${report.sender}\nالمشكلة: ${report.text}\nالوقت: ${report.time}`
-                    });
-                } catch {}
+                if (sender !== ADMIN_NUMBER) {
+                    try {
+                        await sock.sendMessage(`${ADMIN_NUMBER}@s.whatsapp.net`, {
+                            text: `🚨 بلاغ جديد\nالمستخدم: ${report.name}\nالرقم: ${report.sender}\nالمشكلة: ${report.text}\nالوقت: ${report.time}`
+                        });
+                    } catch {}
+                }
                 await reply('تم استلام بلاغك وسيتم مراجعته. شكراً على تواصلك.');
                 await react('✅');
                 return;
@@ -1173,15 +1242,16 @@ async function startBot() {
             // ============================================================
             if (!welcomedUsers[sender]) {
                 welcomedUsers[sender] = true;
-                saveData();
-                await reply(buildWelcome(userName));
-                // بناء سياق أولي
                 userChats[sender] = [];
                 if (userName) {
                     userChats[sender].push({ role: 'user',      content: `[اسم المستخدم: ${userName}]` });
                     userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
                 }
-                return;
+                saveData();
+                await reply(buildWelcome(userName));
+                // نكمل معالجة الرسالة الأولى فقط إذا كانت نصية أو وسائط حقيقية
+                const isProcessable = body || ['imageMessage','documentMessage'].includes(msgType);
+                if (!isProcessable) return;
             }
 
             // ============================================================
@@ -1190,16 +1260,41 @@ async function startBot() {
 
             // --- صور ---
             if (msgType === 'imageMessage') {
+                if (!checkRateLimit(sender, 'image')) {
+                    await reply('⚠️ أرسلت صوراً كثيرة، انتظر دقيقة ثم أعد المحاولة.');
+                    return;
+                }
+                if (!checkDailyLimit(sender, 'image')) {
+                    await reply('⚠️ وصلت للحد اليومي للصور (20 صورة/يوم).');
+                    return;
+                }
                 await react('👍');
                 try {
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                    const imgMsg   = message.imageMessage;
+                    const imgSize  = imgMsg?.fileLength || 0;
+                    if (imgSize > 8 * 1024 * 1024) {
+                        await react('❌');
+                        await reply(`حجم الصورة كبير جداً (${(imgSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى 8MB.`);
+                        return;
+                    }
+                    const mime     = imgMsg?.mimetype || 'image/jpeg';
+                    const buffer   = await downloadMediaMessage(msg, 'buffer', {}, {
                         logger: { level: 'silent', child: () => ({ level: 'silent' }) }
                     });
+                    if (!buffer || buffer.length === 0) {
+                        await react('❌');
+                        await reply('لم أتمكن من تنزيل الصورة، يرجى المحاولة مرة أخرى.');
+                        return;
+                    }
                     const isMed = isMedicalImage(body);
                     stats.totalImages++;
                     if (isMed) stats.totalMedical++;
                     saveData();
-                    const res = await askAIWithImage(buffer.toString('base64'), body, userName);
+                    const res = await askAIWithImage(buffer.toString('base64'), body, userName, mime);
+                    // حفظ وصف الصورة في السياق
+                    if (!userChats[sender]) userChats[sender] = [];
+                    userChats[sender].push({ role: 'user',      content: body ? `[أرسل صورة مع رسالة: ${body}]` : '[أرسل صورة]' });
+                    userChats[sender].push({ role: 'assistant', content: res });
                     await reply(res);
                     await react('✅');
                 } catch (e) {
@@ -1212,6 +1307,14 @@ async function startBot() {
 
             // --- ملفات PDF ---
             if (msgType === 'documentMessage') {
+                if (!checkRateLimit(sender, 'pdf')) {
+                    await reply('⚠️ أرسلت ملفات كثيرة، انتظر دقيقة ثم أعد المحاولة.');
+                    return;
+                }
+                if (!checkDailyLimit(sender, 'pdf')) {
+                    await reply('⚠️ وصلت للحد اليومي للملفات (10 ملفات/يوم).');
+                    return;
+                }
                 await react('⏳');
                 try {
                     const docMsg = message.documentMessage;
@@ -1226,10 +1329,31 @@ async function startBot() {
                         return;
                     }
 
+                    // فحص حجم الملف (أقصى 10MB)
+                    const fileSize = docMsg?.fileLength || 0;
+                    if (fileSize > 10 * 1024 * 1024) {
+                        await react('❌');
+                        await reply(`حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 10MB.`);
+                        return;
+                    }
+
                     // تنزيل الملف
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
                         logger: { level: 'silent', child: () => ({ level: 'silent' }) }
                     });
+
+                    if (!buffer || buffer.length === 0) {
+                        await react('❌');
+                        await reply('لم أتمكن من تنزيل الملف، يرجى المحاولة مرة أخرى.');
+                        return;
+                    }
+
+                    // فحص Magic Bytes — التحقق أن الملف PDF حقيقي
+                    if (!buffer || buffer.length < 4 || buffer.slice(0,4).toString() !== '%PDF') {
+                        await react('❌');
+                        await reply('الملف ليس PDF حقيقياً، يرجى إرسال ملف PDF صحيح.');
+                        return;
+                    }
 
                     // استخراج النص
                     let docText = '';
@@ -1241,21 +1365,53 @@ async function startBot() {
                         console.error('[pdf-parse]', pdfErr.message);
                     }
 
+                    // لو النص فارغ: الـ PDF مصوّر - نرسله للـ AI مباشرة
                     if (!docText || docText.length < 10) {
-                        await react('❌');
-                        await reply(`عذراً، لم أتمكن من استخراج النص من "${fileName}".\nتأكد أن الـ PDF يحتوي على نص وليس صوراً فقط.`);
+                        console.log(`[PDF] "${fileName}" مصوّر، يُرسل للـ AI كـ base64`);
+                        try {
+                            const base64pdf = buffer.toString('base64');
+                            const userQ2 = caption || 'اقرأ كل النصوص الموجودة في هذا الملف بدقة كاملة وقدمها منظمة، ثم لخص المحتوى';
+                            const prompt2 = userName ? `اسم المستخدم: ${userName}\n${userQ2}` : userQ2;
+                            const res2 = await callMistral({
+                                model: 'pixtral-large-latest',
+                                messages: [
+                                    { role: 'system', content: getSystemPrompt() },
+                                    {
+                                        role: 'user',
+                                        content: [
+                                            { type: 'image_url', image_url: { url: `data:application/pdf;base64,${base64pdf}` } },
+                                            { type: 'text', text: prompt2 }
+                                        ]
+                                    }
+                                ],
+                                max_tokens: 2500,
+                                temperature: 0.2
+                            });
+                            stats.totalDocs = (stats.totalDocs || 0) + 1;
+                            saveData();
+                            if (!userChats[sender]) userChats[sender] = [];
+                            userChats[sender].push({ role: 'user',      content: `[أرسل PDF مصوّر: "${fileName}"]` });
+                            userChats[sender].push({ role: 'assistant', content: res2 });
+                            await reply(res2);
+                            await react('✅');
+                        } catch (imgErr) {
+                            console.error('[PDF scanned]', imgErr.message);
+                            await react('❌');
+                            await reply(`لم أتمكن من قراءة "${fileName}"، جرب تحويله لصورة JPG وأرسلها.`);
+                        }
                         return;
                     }
 
-                    // حفظ في السياق
+                    // حفظ ملخص مختصر في السياق (ليس النص الكامل)
                     if (!userChats[sender]) userChats[sender] = [];
+                    const pdfSummaryCtx = docText.slice(0, 2000); // 2000 حرف فقط للسياق
                     userChats[sender].push({
                         role: 'user',
-                        content: `[المستخدم أرسل ملف PDF اسمه "${fileName}"، محتواه:\n${docText.slice(0, 10000)}]`
+                        content: `[أرسل PDF: "${fileName}" - مقتطف أول: ${pdfSummaryCtx}...]`
                     });
                     userChats[sender].push({
                         role: 'assistant',
-                        content: `استلمت الملف "${fileName}" وقرأته، يمكنك الآن سؤالي عن أي شيء فيه.`
+                        content: `قرأت الملف "${fileName}". يمكنك سؤالي عن أي شيء فيه.`
                     });
 
                     stats.totalDocs = (stats.totalDocs || 0) + 1;
@@ -1299,7 +1455,15 @@ async function startBot() {
             // --- نص ---
             if (!body) return;
 
+            if (!checkRateLimit(sender, 'text')) {
+                await reply('⚠️ أرسلت رسائل كثيرة جداً، انتظر دقيقة ثم أعد المحاولة.');
+                return;
+            }
+
             await react('👍');
+
+            const isVIP = vipNumbers.includes(sender);
+            const maxHist = isVIP ? 60 : MAX_HISTORY; // VIP يحصل على سياق أطول
 
             if (!userChats[sender]) userChats[sender] = [];
 
@@ -1309,13 +1473,14 @@ async function startBot() {
                 userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
             }
 
-            userChats[sender].push({ role: 'user', content: body });
             stats.totalMessages++;
             saveData();
 
-            // تقليم السياق
-            if (userChats[sender].length > MAX_HISTORY)
-                userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
+            // تقليم السياق قبل الإضافة
+            if (userChats[sender].length >= maxHist)
+                userChats[sender] = userChats[sender].slice(-(maxHist - 1));
+
+            userChats[sender].push({ role: 'user', content: body });
 
             const res = await askAI([
                 { role: 'system', content: getSystemPrompt() },
@@ -1340,12 +1505,16 @@ async function startBot() {
     });
 }
 
-// مساعد بسيط للمقارنة الكاملة
-function safeBody(body, cmd) { return body === cmd; }
-
 // ============================================================
 // START
 // ============================================================
+// تنظيف الذاكرة كل ساعة
+setInterval(cleanMemory, 60 * 60_000);
+
+
+
+
+
 console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
 startQRServer();
 startBot();
