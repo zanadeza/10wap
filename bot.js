@@ -14,6 +14,7 @@ const pdfParse = require('pdf-parse');
 const QRCodeImg = require('qrcode');
 const http = require('http');
 const fs   = require('fs');
+const { fromBuffer } = require('pdf2pic');
 
 // ============================================================
 // CONFIG
@@ -27,7 +28,7 @@ const WEB_PORT        = 8080;
 let currentQR = null;
 let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
-const API_TIMEOUT_MS  = 25_000;         // 25 ثانية timeout للـ API
+const API_TIMEOUT_MS  = 60_000;         // 60 ثانية timeout للـ API (pixtral-large يحتاج وقت أكثر)
 
 // ============================================================
 // PERSISTENCE
@@ -253,7 +254,23 @@ function aiSemaphore() {
     });
 }
 
-async function callMistral(payload, retries = 2) {
+// إشعار الأدمن بمشاكل حرجة
+let _lastAdminNotify = {}; // throttle: لا نرسل نفس التنبيه أكثر من مرة كل 30 دقيقة
+async function notifyAdmin(message) {
+    const key = message.slice(0, 30);
+    const now = Date.now();
+    if (_lastAdminNotify[key] && now - _lastAdminNotify[key] < 30 * 60_000) return;
+    _lastAdminNotify[key] = now;
+    try {
+        if (sock && isConnected) {
+            await sock.sendMessage(`${ADMIN_NUMBER}@s.whatsapp.net`, { text: message });
+        }
+    } catch (e) {
+        console.error('[notifyAdmin] فشل:', e.message);
+    }
+}
+
+async function callMistral(payload, retries = 3) {
     const release = await aiSemaphore();
     try {
         for (let attempt = 0; attempt <= retries; attempt++) {
@@ -269,20 +286,57 @@ async function callMistral(payload, retries = 2) {
                         body: JSON.stringify(payload)
                     }
                 );
+
+                // Rate limit: انتظر أطول مع كل محاولة
                 if (response.status === 429) {
-                    const wait = (attempt + 1) * 1000;
-                    console.warn(`[Mistral] rate limit، انتظار ${wait/1000}ث...`);
+                    const wait = Math.min(3000 * Math.pow(2, attempt), 30_000);
+                    console.warn(`[Mistral] rate limit (429)، انتظار ${wait/1000}ث... (محاولة ${attempt + 1}/${retries + 1})`);
                     await new Promise(r => setTimeout(r, wait));
                     continue;
                 }
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                // خطأ في المصادقة — API Key منتهي أو غلط
+                if (response.status === 401) {
+                    console.error('[Mistral] ❌ خطأ 401: API Key غير صالح أو منتهي الصلاحية!');
+                    notifyAdmin('⚠️ تنبيه: Mistral API Key غير صالح (401). البوت لن يرد على الرسائل حتى يتم تحديث الـ Key.');
+                    throw new Error('AUTH_ERROR');
+                }
+
+                // نفاد الرصيد
+                if (response.status === 402) {
+                    console.error('[Mistral] ❌ خطأ 402: نفاد رصيد Mistral API!');
+                    notifyAdmin('⚠️ تنبيه: نفاد رصيد Mistral API (402). يرجى شحن الحساب على console.mistral.ai');
+                    throw new Error('QUOTA_ERROR');
+                }
+
+                // أخطاء السيرفر (5xx) — يستحق retry
+                if (response.status >= 500) {
+                    console.warn(`[Mistral] خطأ سيرفر ${response.status}، محاولة ${attempt + 1}/${retries + 1}`);
+                    if (attempt < retries) {
+                        const wait = 2000 * (attempt + 1);
+                        await new Promise(r => setTimeout(r, wait));
+                        continue;
+                    }
+                    throw new Error(`SERVER_ERROR_${response.status}`);
+                }
+
+                if (!response.ok) throw new Error(`HTTP_${response.status}`);
+
                 const data = await response.json();
                 if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة من API');
+
                 return data.choices[0].message.content;
+
             } catch (e) {
+                // لا نعيد المحاولة على أخطاء المصادقة والرصيد
+                if (e.message === 'AUTH_ERROR' || e.message === 'QUOTA_ERROR') throw e;
+
                 if (attempt === retries) throw e;
-                console.warn(`[Mistral] محاولة ${attempt + 1} فشلت:`, e.message);
-                await new Promise(r => setTimeout(r, 500));
+
+                const isTimeout = e.name === 'AbortError';
+                const wait = isTimeout ? 1000 : 1500 * (attempt + 1);
+                console.warn(`[Mistral] محاولة ${attempt + 1}/${retries + 1} فشلت (${e.message})، انتظار ${wait/1000}ث...`);
+                await new Promise(r => setTimeout(r, wait));
             }
         }
     } finally {
@@ -294,14 +348,17 @@ async function callMistral(payload, retries = 2) {
 async function askAI(messages) {
     try {
         return await callMistral({
-            model: 'pixtral-large-latest',
+            model: 'mistral-large-latest',
             messages,
             max_tokens: 1500,
             temperature: 0.5
         });
     } catch (e) {
-        console.error('[askAI] Mistral فشل:', e.message);
-        return 'عذراً، الخدمة غير متاحة حالياً. يرجى المحاولة مرة أخرى.';
+        console.error('[askAI] فشل نهائي:', e.message);
+        if (e.name === 'AbortError') return 'الرد يأخذ وقتاً أطول من المعتاد، يرجى إعادة المحاولة.';
+        if (e.message === 'AUTH_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
+        if (e.message === 'QUOTA_ERROR') return 'عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.';
+        return 'عذراً، تعذّر الرد الآن. يرجى المحاولة مرة أخرى.';
     }
 }
 
@@ -324,6 +381,7 @@ async function askAIWithDoc(docText, userQuestion, userName) {
     } catch (e) {
         console.error('[askAIWithDoc]', e.message);
         if (e.name === 'AbortError') return 'انتهت مهلة تحليل الملف، يرجى المحاولة مرة أخرى.';
+        if (e.message === 'AUTH_ERROR' || e.message === 'QUOTA_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
         return 'عذراً، لم أتمكن من تحليل الملف. يرجى المحاولة مرة أخرى.';
     }
 }
@@ -372,6 +430,7 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
     } catch (e) {
         console.error('[askAIWithImage]', e.message);
         if (e.name === 'AbortError') return 'انتهت مهلة التحليل، يرجى المحاولة مرة أخرى.';
+        if (e.message === 'AUTH_ERROR' || e.message === 'QUOTA_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
         return 'عذراً، لم أتمكن من تحليل الصورة. يرجى المحاولة مرة أخرى.';
     }
 }
@@ -1264,13 +1323,41 @@ async function startBot() {
                         console.error('[pdf-parse]', pdfErr.message);
                     }
 
-                    // لو النص فارغ: الـ PDF مصوّر - نرسله للـ AI مباشرة
+                    // لو النص فارغ: الـ PDF مصوّر - نحوّل صفحاته لصور JPG
                     if (!docText || docText.length < 10) {
-                        console.log(`[PDF] "${fileName}" مصوّر، يُرسل للـ AI كـ base64`);
+                        console.log(`[PDF] "${fileName}" مصوّر، جاري تحويله لصور...`);
                         try {
-                            const base64pdf = buffer.toString('base64');
+                            // تحويل صفحات PDF لصور JPG باستخدام pdf2pic
+                            const converter = fromBuffer(buffer, {
+                                density: 150,        // جودة معقولة وسريعة
+                                format: 'jpeg',
+                                width: 1200,
+                                height: 1600,
+                                saveFilename: 'page',
+                                savePath: '/tmp'
+                            });
+
+                            // نحوّل أول 4 صفحات كحد أقصى (لتجنب timeout)
+                            let pages = [];
+                            for (let p = 1; p <= 4; p++) {
+                                try {
+                                    const result = await converter(p, { responseType: 'base64' });
+                                    if (result?.base64) pages.push(result.base64);
+                                } catch (_) { break; } // توقفنا عند آخر صفحة
+                            }
+
+                            if (pages.length === 0) throw new Error('فشل تحويل الصفحات');
+                            console.log(`[PDF] تم تحويل ${pages.length} صفحة من "${fileName}"`);
+
                             const userQ2 = caption || 'اقرأ كل النصوص الموجودة في هذا الملف بدقة كاملة وقدمها منظمة، ثم لخص المحتوى';
                             const prompt2 = userName ? `اسم المستخدم: ${userName}\n${userQ2}` : userQ2;
+
+                            // بناء محتوى الرسالة: كل صفحة كصورة JPG منفصلة
+                            const imageContents = pages.map(b64 => ({
+                                type: 'image_url',
+                                image_url: { url: `data:image/jpeg;base64,${b64}` }
+                            }));
+
                             const res2 = await callMistral({
                                 model: 'pixtral-large-latest',
                                 messages: [
@@ -1278,7 +1365,7 @@ async function startBot() {
                                     {
                                         role: 'user',
                                         content: [
-                                            { type: 'image_url', image_url: { url: `data:application/pdf;base64,${base64pdf}` } },
+                                            ...imageContents,
                                             { type: 'text', text: prompt2 }
                                         ]
                                     }
@@ -1286,17 +1373,18 @@ async function startBot() {
                                 max_tokens: 2500,
                                 temperature: 0.2
                             });
+
                             stats.totalDocs = (stats.totalDocs || 0) + 1;
                             saveData();
                             if (!userChats[sender]) userChats[sender] = [];
-                            userChats[sender].push({ role: 'user',      content: `[أرسل PDF مصوّر: "${fileName}"]` });
+                            userChats[sender].push({ role: 'user',      content: `[أرسل PDF مصوّر: "${fileName}" - ${pages.length} صفحة]` });
                             userChats[sender].push({ role: 'assistant', content: res2 });
                             await reply(res2);
                             await react('✅');
                         } catch (imgErr) {
                             console.error('[PDF scanned]', imgErr.message);
                             await react('❌');
-                            await reply(`لم أتمكن من قراءة "${fileName}"، جرب تحويله لصورة JPG وأرسلها.`);
+                            await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور، أو أرسله كصورة JPG.`);
                         }
                         return;
                     }
