@@ -111,49 +111,69 @@ function nowJerusalem() {
 function safeBody(body, cmd) { return body === cmd; }
 
 // ============================================================
-// RATE LIMITING & ANTI-SPAM
+// RATE LIMITING & DAILY MESSAGE QUOTA
 // ============================================================
-const _userRateLimit = {}; // { sender: { count, firstTime, warned } }
-const RATE_LIMIT = {
-    text:  { max: 15, windowMs: 60_000 },   // 15 رسالة/دقيقة
-    image: { max: 5,  windowMs: 60_000 },   // 5 صور/دقيقة
-    pdf:   { max: 3,  windowMs: 60_000 },   // 3 PDF/دقيقة
-};
-const _userDailyLimit = {}; // { sender: { images, docs, date } }
+const DAILY_MSG_LIMIT = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
+const _userDailyLimit = {}; // { sender: { messages, images, docs, resetAt } }
 
-function getRateKey(sender, type) { return sender + ':' + type; }
-
-function checkRateLimit(sender, type) {
-    const key   = getRateKey(sender, type);
-    const limit = RATE_LIMIT[type] || RATE_LIMIT.text;
-    const now   = Date.now();
-    if (!_userRateLimit[key]) _userRateLimit[key] = { count: 0, firstTime: now };
-    const state = _userRateLimit[key];
-    // reset window
-    if (now - state.firstTime > limit.windowMs) {
-        state.count = 0;
-        state.firstTime = now;
-    }
-    state.count++;
-    if (state.count > limit.max) return false; // blocked
-    return true;
+// حساب بداية اليوم التالي (منتصف الليل بتوقيت القدس)
+function getNextMidnightMs() {
+    const now = new Date();
+    const tomorrow = new Date(now.toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' }));
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return tomorrow.getTime();
 }
 
+function getDailyRecord(sender) {
+    const now = Date.now();
+    if (!_userDailyLimit[sender] || now >= _userDailyLimit[sender].resetAt) {
+        _userDailyLimit[sender] = {
+            messages: 0,
+            images:   0,
+            docs:     0,
+            resetAt:  getNextMidnightMs()
+        };
+    }
+    return _userDailyLimit[sender];
+}
+
+// فحص الحد اليومي للرسائل النصية — يُعيد { allowed, remaining }
+function checkDailyMessages(sender) {
+    const rec = getDailyRecord(sender);
+    if (rec.messages >= DAILY_MSG_LIMIT) return { allowed: false, remaining: 0 };
+    rec.messages++;
+    return { allowed: true, remaining: DAILY_MSG_LIMIT - rec.messages };
+}
+
+// فحص الحد اليومي للصور والملفات
 function checkDailyLimit(sender, type) {
-    const today = new Date().toISOString().slice(0,10);
-    if (!_userDailyLimit[sender] || _userDailyLimit[sender].date !== today)
-        _userDailyLimit[sender] = { images: 0, docs: 0, date: today };
-    const d = _userDailyLimit[sender];
+    const d = getDailyRecord(sender);
     if (type === 'image') { if (d.images >= 20) return false; d.images++; return true; }
     if (type === 'pdf')   { if (d.docs   >= 10) return false; d.docs++;   return true; }
     return true;
 }
 
-// تنظيف rate limits كل ساعة
+// Anti-spam فقط: منع إرسال الرسائل بشكل متسارع جداً (3 رسائل/5 ثواني)
+const _spamCheck = {}; // { sender: [timestamps] }
+function checkSpam(sender) {
+    const now = Date.now();
+    if (!_spamCheck[sender]) _spamCheck[sender] = [];
+    _spamCheck[sender] = _spamCheck[sender].filter(t => now - t < 5_000);
+    if (_spamCheck[sender].length >= 3) return false; // spam
+    _spamCheck[sender].push(now);
+    return true;
+}
+
+// تنظيف سجلات anti-spam كل ساعة
 setInterval(() => {
     const now = Date.now();
-    for (const key of Object.keys(_userRateLimit)) {
-        if (now - _userRateLimit[key].firstTime > 120_000) delete _userRateLimit[key];
+    for (const k of Object.keys(_spamCheck)) {
+        _spamCheck[k] = (_spamCheck[k] || []).filter(t => now - t < 10_000);
+        if (!_spamCheck[k].length) delete _spamCheck[k];
+    }
+    // تنظيف سجلات Daily المنتهية
+    for (const k of Object.keys(_userDailyLimit)) {
+        if (now >= (_userDailyLimit[k].resetAt || 0)) delete _userDailyLimit[k];
     }
 }, 60 * 60_000);
 
@@ -1134,8 +1154,8 @@ async function startBot() {
 
             // --- صور ---
             if (msgType === 'imageMessage') {
-                if (!checkRateLimit(sender, 'image')) {
-                    await reply('⚠️ أرسلت صوراً كثيرة، انتظر دقيقة ثم أعد المحاولة.');
+                if (!checkSpam(sender)) {
+                    await reply('⚠️ أرسلت صوراً بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
                 }
                 if (!checkDailyLimit(sender, 'image')) {
@@ -1181,8 +1201,8 @@ async function startBot() {
 
             // --- ملفات PDF ---
             if (msgType === 'documentMessage') {
-                if (!checkRateLimit(sender, 'pdf')) {
-                    await reply('⚠️ أرسلت ملفات كثيرة، انتظر دقيقة ثم أعد المحاولة.');
+                if (!checkSpam(sender)) {
+                    await reply('⚠️ أرسلت ملفات بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
                 }
                 if (!checkDailyLimit(sender, 'pdf')) {
@@ -1329,14 +1349,36 @@ async function startBot() {
             // --- نص ---
             if (!body) return;
 
-            if (!checkRateLimit(sender, 'text')) {
-                await reply('⚠️ أرسلت رسائل كثيرة جداً، انتظر دقيقة ثم أعد المحاولة.');
+            // anti-spam: منع الإرسال المتسارع جداً
+            if (!checkSpam(sender)) {
+                await reply('⚠️ أرسلت رسائل بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                 return;
+            }
+
+            // الحد اليومي للرسائل (الأدمن وVIP بلا حدود)
+            const isVIP = vipNumbers.includes(sender);
+            if (!isAdmin && !isVIP) {
+                const quota = checkDailyMessages(sender);
+                if (!quota.allowed) {
+                    await reply(
+                        `⚠️ *وصلت للحد اليومي*
+
+` +
+                        `استخدمت كل رسائلك المجانية الـ ${DAILY_MSG_LIMIT} لهذا اليوم.
+` +
+                        `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄
+
+` +
+                        `للاستمرار الآن، تواصل مع الأدمن:
+` +
+                        `👤 wa.me/${ADMIN_NUMBER}`
+                    );
+                    return;
+                }
             }
 
             await react('👍');
 
-            const isVIP = vipNumbers.includes(sender);
             const maxHist = isVIP ? 60 : MAX_HISTORY; // VIP يحصل على سياق أطول
 
             if (!userChats[sender]) userChats[sender] = [];
