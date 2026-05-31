@@ -367,16 +367,46 @@ async function callMistral(payload, retries = 3) {
     }
 }
 
-// askAI: Mistral فقط
+// كشف الأسئلة المعقدة التي تحتاج نموذج أقوى
+function isComplexQuery(text) {
+    return /تشخيص|خطة علاج|تحليل مفصل|اشرح بالتفصيل|قارن بين|ما الفرق بين|برمج|اكتب كود|code|برنامج|خوارزمية|قانون|عقد|فتوى|حكم شرعي|ترجم هذا النص|essay|مقال|تقرير|بحث|summarize|خلاصة شاملة/i
+        .test(text || '');
+}
+
+// askAI: نموذج سريع للمحادثات العادية، قوي للأسئلة المعقدة
 async function askAI(messages) {
+    // آخر رسالة من المستخدم لتحديد النموذج المناسب
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')?.content || '';
+    const useLarge = isComplexQuery(lastUserMsg) || lastUserMsg.length > 400;
+    const model = useLarge ? 'mistral-large-latest' : 'mistral-small-latest';
+
+    console.log(`[askAI] نموذج: ${model} | طول الرسالة: ${lastUserMsg.length}`);
     try {
         return await callMistral({
-            model: 'mistral-large-latest',
+            model,
             messages,
             max_tokens: 1500,
             temperature: 0.5
         });
     } catch (e) {
+        // إذا فشل الصغير، جرّب الكبير تلقائياً
+        if (model === 'mistral-small-latest') {
+            console.warn('[askAI] small فشل، محاولة large...');
+            try {
+                return await callMistral({
+                    model: 'mistral-large-latest',
+                    messages,
+                    max_tokens: 1500,
+                    temperature: 0.5
+                });
+            } catch (e2) {
+                console.error('[askAI] large فشل أيضاً:', e2.message);
+                if (e2.name === 'AbortError') return 'الرد يأخذ وقتاً أطول من المعتاد، يرجى إعادة المحاولة.';
+                if (e2.message === 'AUTH_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
+                if (e2.message === 'QUOTA_ERROR') return 'عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.';
+                return 'عذراً، تعذّر الرد الآن. يرجى المحاولة مرة أخرى.';
+            }
+        }
         console.error('[askAI] فشل نهائي:', e.message);
         if (e.name === 'AbortError') return 'الرد يأخذ وقتاً أطول من المعتاد، يرجى إعادة المحاولة.';
         if (e.message === 'AUTH_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
