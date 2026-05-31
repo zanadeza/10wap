@@ -73,6 +73,7 @@ if (!stats)                    stats   = { totalMessages: 0, totalImages: 0, tot
 if (!stats.totalMessages)      stats.totalMessages = 0;
 if (!stats.totalImages)        stats.totalImages   = 0;
 if (!stats.totalMedical)       stats.totalMedical  = 0;
+if (!stats.totalDocs)          stats.totalDocs     = 0;
 
 // إضافة الأدمن للمستخدمين المرحّب بهم تلقائياً حتى لا يستقبل رسالة ترحيب
 welcomedUsers[ADMIN_NUMBER] = true;
@@ -98,18 +99,21 @@ function cleanMemory() {
 // PURE HELPERS (no dependencies — must come before SYSTEM PROMPTS)
 // ============================================================
 
-// توقيت القدس
+// توقيت القدس — طريقة موثوقة على جميع البيئات (Linux/Windows/Mac)
 function nowJerusalem() {
-    // طريقة موثوقة لجميع البيئات
     const now = new Date();
-    const offset = now.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour12: false,
-        year:'numeric', month:'2-digit', day:'2-digit',
-        hour:'2-digit', minute:'2-digit', second:'2-digit' });
-    return new Date(offset);
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Jerusalem',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    });
+    const parts = fmt.formatToParts(now);
+    const get = type => parts.find(p => p.type === type)?.value || '00';
+    // ISO string صريح لتجنب أي ambiguity في الـ parsing
+    const isoStr = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}`;
+    return new Date(isoStr);
 }
-
-// مساعد بسيط للمقارنة الكاملة
-function safeBody(body, cmd) { return body === cmd; }
 
 // ============================================================
 // RATE LIMITING & DAILY MESSAGE QUOTA
@@ -120,9 +124,16 @@ const _userDailyLimit = {}; // { sender: { messages, images, docs, resetAt } }
 // حساب بداية اليوم التالي (منتصف الليل بتوقيت القدس)
 function getNextMidnightMs() {
     const now = new Date();
-    const tomorrow = new Date(now.toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' }));
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    return tomorrow.getTime();
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Jerusalem',
+        year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const parts = fmt.formatToParts(now);
+    const get = type => parts.find(p => p.type === type)?.value || '00';
+    // منتصف ليل اليوم التالي بتوقيت القدس
+    const todayMidnightJerusalem = new Date(`${get('year')}-${get('month')}-${get('day')}T00:00:00`);
+    todayMidnightJerusalem.setDate(todayMidnightJerusalem.getDate() + 1);
+    return todayMidnightJerusalem.getTime();
 }
 
 function getDailyRecord(sender) {
@@ -272,6 +283,7 @@ async function notifyAdmin(message) {
 
 async function callMistral(payload, retries = 3) {
     const release = await aiSemaphore();
+    let lastError = new Error('لم تكتمل أي محاولة');
     try {
         for (let attempt = 0; attempt <= retries; attempt++) {
             try {
@@ -291,6 +303,7 @@ async function callMistral(payload, retries = 3) {
                 if (response.status === 429) {
                     const wait = Math.min(3000 * Math.pow(2, attempt), 30_000);
                     console.warn(`[Mistral] rate limit (429)، انتظار ${wait/1000}ث... (محاولة ${attempt + 1}/${retries + 1})`);
+                    lastError = new Error('RATE_LIMIT');
                     await new Promise(r => setTimeout(r, wait));
                     continue;
                 }
@@ -311,19 +324,26 @@ async function callMistral(payload, retries = 3) {
 
                 // أخطاء السيرفر (5xx) — يستحق retry
                 if (response.status >= 500) {
+                    lastError = new Error(`SERVER_ERROR_${response.status}`);
                     console.warn(`[Mistral] خطأ سيرفر ${response.status}، محاولة ${attempt + 1}/${retries + 1}`);
                     if (attempt < retries) {
                         const wait = 2000 * (attempt + 1);
                         await new Promise(r => setTimeout(r, wait));
                         continue;
                     }
-                    throw new Error(`SERVER_ERROR_${response.status}`);
+                    throw lastError;
                 }
 
-                if (!response.ok) throw new Error(`HTTP_${response.status}`);
+                if (!response.ok) {
+                    lastError = new Error(`HTTP_${response.status}`);
+                    throw lastError;
+                }
 
                 const data = await response.json();
-                if (!data?.choices?.[0]?.message?.content) throw new Error('استجابة فارغة من API');
+                if (!data?.choices?.[0]?.message?.content) {
+                    lastError = new Error('استجابة فارغة من API');
+                    throw lastError;
+                }
 
                 return data.choices[0].message.content;
 
@@ -331,7 +351,8 @@ async function callMistral(payload, retries = 3) {
                 // لا نعيد المحاولة على أخطاء المصادقة والرصيد
                 if (e.message === 'AUTH_ERROR' || e.message === 'QUOTA_ERROR') throw e;
 
-                if (attempt === retries) throw e;
+                lastError = e;
+                if (attempt === retries) break; // اخرج من الحلقة وارمِ lastError
 
                 const isTimeout = e.name === 'AbortError';
                 const wait = isTimeout ? 1000 : 1500 * (attempt + 1);
@@ -339,6 +360,8 @@ async function callMistral(payload, retries = 3) {
                 await new Promise(r => setTimeout(r, wait));
             }
         }
+        // وصلنا هنا = فشلت كل المحاولات
+        throw lastError;
     } finally {
         release();
     }
@@ -367,7 +390,7 @@ async function askAIWithDoc(docText, userQuestion, userName) {
         const question = userQuestion || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه ومحتواه';
         const prompt = userName ? `اسم المستخدم: ${userName}\n${question}` : question;
         return await callMistral({
-            model: 'pixtral-large-latest',
+            model: 'mistral-large-latest',   // نص فقط — لا حاجة لـ pixtral
             messages: [
                 { role: 'system', content: getSystemPrompt() },
                 {
@@ -1099,11 +1122,12 @@ async function startBot() {
                     let delay = 5000;
                     const tryReconnect = () => {
                         console.log(`🔄 محاولة إعادة الاتصال خلال ${delay/1000}ث...`);
+                        const currentDelay = delay;
+                        delay = Math.min(delay * 2, 60_000); // exponential backoff حتى دقيقة
                         setTimeout(() => {
                             isReconnecting = false;
                             startBot();
-                        }, delay);
-                        delay = Math.min(delay * 2, 60_000); // exponential backoff حتى دقيقة
+                        }, currentDelay);
                     };
                     tryReconnect();
                 }
