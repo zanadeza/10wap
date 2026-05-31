@@ -1219,7 +1219,12 @@ async function startBot() {
                     // فقط PDF مدعوم
                     if (mime !== 'application/pdf') {
                         await react('ℹ️');
-                        await reply(`📎 "${fileName}"\nأرسل ملفات PDF فقط، هذا النوع غير مدعوم.`);
+                        const ext = fileName.split('.').pop().toUpperCase();
+                        await reply(
+                            `📎 "${fileName}"\n` +
+                            `النوع (${ext}) غير مدعوم حالياً.\n` +
+                            `أرسل الملف بصيغة PDF، أو إذا كان Word/Excel يمكنك تصديره كـ PDF وإرساله. 📄`
+                        );
                         return;
                     }
 
@@ -1243,7 +1248,7 @@ async function startBot() {
                     }
 
                     // فحص Magic Bytes — التحقق أن الملف PDF حقيقي
-                    if (!buffer || buffer.length < 4 || buffer.slice(0,4).toString() !== '%PDF') {
+                    if (!buffer || buffer.length < 4 || buffer.slice(0,4).toString('ascii') !== '%PDF') {
                         await react('❌');
                         await reply('الملف ليس PDF حقيقياً، يرجى إرسال ملف PDF صحيح.');
                         return;
@@ -1296,17 +1301,9 @@ async function startBot() {
                         return;
                     }
 
-                    // حفظ ملخص مختصر في السياق (ليس النص الكامل)
+                    // حفظ السياق: السؤال + الرد الحقيقي فقط (بدون تكرار)
                     if (!userChats[sender]) userChats[sender] = [];
-                    const pdfSummaryCtx = docText.slice(0, 2000); // 2000 حرف فقط للسياق
-                    userChats[sender].push({
-                        role: 'user',
-                        content: `[أرسل PDF: "${fileName}" - مقتطف أول: ${pdfSummaryCtx}...]`
-                    });
-                    userChats[sender].push({
-                        role: 'assistant',
-                        content: `قرأت الملف "${fileName}". يمكنك سؤالي عن أي شيء فيه.`
-                    });
+                    const pdfSummaryCtx = docText.slice(0, 2000);
 
                     stats.totalDocs = (stats.totalDocs || 0) + 1;
                     saveData();
@@ -1314,6 +1311,11 @@ async function startBot() {
                     const userQ = caption || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه';
                     const res = await askAIWithDoc(docText, userQ, userName);
 
+                    // نضيف للسياق: السؤال + الرد الفعلي فقط
+                    userChats[sender].push({
+                        role: 'user',
+                        content: `[أرسل PDF: "${fileName}" - مقتطف: ${pdfSummaryCtx}...]`
+                    });
                     userChats[sender].push({ role: 'assistant', content: res });
                     await reply(res);
                     await react('✅');
