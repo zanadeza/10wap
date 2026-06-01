@@ -43,19 +43,20 @@ function loadData() {
         welcomedUsers:  {},
         vipNumbers:     [],
         reports:        [],
+        userLimits:     {},   // حدود مخصصة لكل مستخدم { sender: limit }
         stats:          { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 }
     };
 }
 
 let _saveTimer = null;
 function saveData() {
-    // debounce: تأخير 500ms
+    // debounce: تأخير 200ms
     if (_saveTimer) clearTimeout(_saveTimer);
     _saveTimer = setTimeout(() => {
         try {
             const tmp = DATA_FILE + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(
-                { userNames, welcomedUsers, vipNumbers, reports, stats },
+                { userNames, welcomedUsers, vipNumbers, reports, userLimits, stats },
                 null, 2
             ));
             fs.renameSync(tmp, DATA_FILE);
@@ -65,10 +66,11 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, reports, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, reports, userLimits, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
+if (!userLimits)               userLimits = {};
 if (!stats)                    stats   = { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 };
 if (!stats.totalMessages)      stats.totalMessages = 0;
 if (!stats.totalImages)        stats.totalImages   = 0;
@@ -121,6 +123,11 @@ function nowJerusalem() {
 const DAILY_MSG_LIMIT = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
 const _userDailyLimit = {}; // { sender: { messages, images, docs, resetAt } }
 
+// الحد اليومي الفعلي: مخصص إن وُجد، وإلا الافتراضي
+function getUserDailyLimit(sender) {
+    return (userLimits && userLimits[sender] != null) ? userLimits[sender] : DAILY_MSG_LIMIT;
+}
+
 // حساب بداية اليوم التالي (منتصف الليل بتوقيت القدس)
 function getNextMidnightMs() {
     const now = new Date();
@@ -151,10 +158,11 @@ function getDailyRecord(sender) {
 
 // فحص الحد اليومي للرسائل النصية — يُعيد { allowed, remaining }
 function checkDailyMessages(sender) {
+    const limit = getUserDailyLimit(sender);
     const rec = getDailyRecord(sender);
-    if (rec.messages >= DAILY_MSG_LIMIT) return { allowed: false, remaining: 0 };
+    if (rec.messages >= limit) return { allowed: false, remaining: 0, limit };
     rec.messages++;
-    return { allowed: true, remaining: DAILY_MSG_LIMIT - rec.messages };
+    return { allowed: true, remaining: limit - rec.messages, limit };
 }
 
 // فحص الحد اليومي للصور والملفات
@@ -252,13 +260,13 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 // ============================================================
 // AI FUNCTIONS
 // ============================================================
-// Semaphore: أقصى 8 طلبات متزامنة للـ AI
+// Semaphore: أقصى 15 طلباً متزامناً للـ AI (زيادة السرعة)
 let _aiActive = 0;
 const _aiQueue = [];
 function aiSemaphore() {
     return new Promise(resolve => {
         function tryAcquire() {
-            if (_aiActive < 8) { _aiActive++; resolve(() => { _aiActive--; if (_aiQueue.length) _aiQueue.shift()(); }); }
+            if (_aiActive < 15) { _aiActive++; resolve(() => { _aiActive--; if (_aiQueue.length) _aiQueue.shift()(); }); }
             else { _aiQueue.push(tryAcquire); }
         }
         tryAcquire();
@@ -603,6 +611,44 @@ function startQRServer() {
                         userChats = {};
                         result.msg = 'تم مسح الجلسات';
                     }
+                    else if (action === 'setUserLimit') {
+                        // تعيين حد مخصص لمستخدم: { num, limit }
+                        const num   = (data.num || '').replace(/\D/g, '');
+                        const limit = parseInt(data.limit, 10);
+                        if (!num || isNaN(limit) || limit < 0) {
+                            result = { ok: false, msg: 'بيانات غير صحيحة' };
+                        } else {
+                            userLimits[num] = limit;
+                            // إعادة ضبط عداد اليوم ليطبّق الحد الجديد فوراً
+                            if (_userDailyLimit[num]) {
+                                _userDailyLimit[num].messages = 0;
+                            }
+                            saveData();
+                            // إشعار المستخدم تلقائياً
+                            if (sock && isConnected) {
+                                try {
+                                    const jid = `${num}@s.whatsapp.net`;
+                                    const name = userNames[num] ? `${userNames[num]}` : '';
+                                    await sock.sendMessage(jid, {
+                                        text: `🎉 ${name ? `أهلاً ${name}، ` : ''}تم رفع حد رسائلك اليومي إلى *${limit}* رسالة!\n\nيمكنك الآن الاستمرار في المحادثة. 🚀`
+                                    });
+                                } catch (e) {
+                                    console.error('[setUserLimit notify]', e.message);
+                                }
+                            }
+                            result.msg = `تم تعيين حد ${limit} رسالة للمستخدم ${num}`;
+                        }
+                    }
+                    else if (action === 'resetUserLimit') {
+                        // إعادة المستخدم للحد الافتراضي
+                        const num = (data.num || '').replace(/\D/g, '');
+                        if (num) {
+                            delete userLimits[num];
+                            if (_userDailyLimit[num]) _userDailyLimit[num].messages = 0;
+                            saveData();
+                        }
+                        result.msg = 'تم إعادة الحد للافتراضي';
+                    }
                     else if (action === 'broadcast') {
                         if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
                         else {
@@ -653,6 +699,7 @@ function startQRServer() {
                 connected: isConnected,
                 hasQR: !!currentQR,
                 botName: BOT_NAME,
+                defaultLimit: DAILY_MSG_LIMIT,
                 stats: {
                     users: Object.keys(welcomedUsers).length,
                     active: Object.keys(userChats).length,
@@ -664,8 +711,7 @@ function startQRServer() {
                     reports: reports.length
                 },
                 vipNumbers,
-                // userNames exposed only as a lookup map — keys are already known
-                // from welcomedUsers; we keep the map so the dashboard can show names.
+                userLimits,
                 userNames,
                 welcomedUsers: Object.keys(welcomedUsers),
                 reports: reports.slice(-50).reverse()
@@ -743,6 +789,7 @@ textarea.inp{resize:vertical;min-height:80px}
     <div class="tab" onclick="showTab('qr')">📱 ربط واتساب</div>
     <div class="tab" onclick="showTab('broadcast')">📢 البث</div>
     <div class="tab" onclick="showTab('users')">👥 المستخدمون</div>
+    <div class="tab" onclick="showTab('limits')">🔢 حدود الرسائل</div>
     <div class="tab" onclick="showTab('vip')">⭐ VIP</div>
     <div class="tab" onclick="showTab('reports')">🚨 البلاغات</div>
   </div>
@@ -810,6 +857,27 @@ textarea.inp{resize:vertical;min-height:80px}
     </div>
   </div>
 
+  <!-- حدود الرسائل -->
+  <div class="panel" id="panel-limits">
+    <div class="card">
+      <div class="ch">
+        <h3>🔢 حدود الرسائل اليومية</h3>
+        <span id="default-limit-label" style="font-size:12px;color:#64748b"></span>
+      </div>
+      <div style="padding:14px 18px;background:#0f172a;border-bottom:1px solid #334155;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <span style="font-size:13px;color:#94a3b8">تعيين حد لمستخدم محدد:</span>
+        <input class="inp" id="limit-num" placeholder="رقم الهاتف" dir="ltr" style="width:180px">
+        <input class="inp" id="limit-val" placeholder="عدد الرسائل" type="number" min="0" style="width:130px">
+        <button class="btn btn-b" onclick="setUserLimit()">✅ تعيين وإشعار</button>
+        <button class="btn btn-r" onclick="resetUserLimit()">↩️ إعادة للافتراضي</button>
+      </div>
+      <table>
+        <thead><tr><th>الرقم</th><th>الاسم</th><th>الحد المخصص</th><th>إجراء</th></tr></thead>
+        <tbody id="limits-table"><tr><td colspan="4" class="empty">لا يوجد حدود مخصصة</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- VIP -->
   <div class="panel" id="panel-vip">
     <div class="card">
@@ -858,7 +926,7 @@ let _data = null;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['overview','qr','broadcast','users','vip','reports'];
+    const names = ['overview','qr','broadcast','users','limits','vip','reports'];
     t.classList.toggle('active', names[i] === name);
   });
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -923,6 +991,10 @@ function updateUI() {
   const bc = document.getElementById('broadcast-count');
   if (bc) bc.textContent = 'سيصل لـ ' + (s.users - 1) + ' مستخدم';
 
+  // default limit label
+  const dll = document.getElementById('default-limit-label');
+  if (dll) dll.textContent = 'الحد الافتراضي: ' + (d.defaultLimit || 20) + ' رسالة/يوم';
+
   // QR
   const qrSec = document.getElementById('qr-section');
   if (d.connected) {
@@ -943,6 +1015,9 @@ function updateUI() {
 
   // Users
   renderUsers(d);
+
+  // Limits
+  renderLimits(d);
 
   // VIP
   renderVip(d);
@@ -978,12 +1053,14 @@ function filterUsers() {
     const addVipBtn    = \`<button class="btn btn-b" onclick="addVipNum(\${JSON.stringify(u.num)})">+ VIP</button>\`;
     const removeVipBtn = \`<button class="btn btn-y" onclick="removeVipNum(\${JSON.stringify(u.num)})">إزالة VIP</button>\`;
     const deleteBtn    = \`<button class="btn btn-r" onclick="deleteUser(\${JSON.stringify(u.num)})">حذف</button>\`;
+    const limitBtn     = \`<button class="btn btn-y" onclick="quickSetLimit(\${JSON.stringify(u.num)})">🔢 حد</button>\`;
     return \`<tr>
       <td dir="ltr">\${safeNum}</td>
       <td>\${safeName}</td>
       <td><span class="badge \${u.isVip ? 'badge-b' : 'badge-g'}">\${u.isVip ? '⭐ VIP' : 'عادي'}</span></td>
       <td style="display:flex;gap:6px">
         \${!u.isVip ? addVipBtn : removeVipBtn}
+        \${limitBtn}
         \${deleteBtn}
       </td>
     </tr>\`;
@@ -1018,11 +1095,67 @@ function renderReports(d) {
   }).join('');
 }
 
+function renderLimits(d) {
+  const tb = document.getElementById('limits-table');
+  const limits = d.userLimits || {};
+  const keys = Object.keys(limits);
+  if (!keys.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">لا يوجد حدود مخصصة — جميع المستخدمين على الحد الافتراضي (' + (d.defaultLimit||20) + ')</td></tr>'; return; }
+  tb.innerHTML = keys.map(num => {
+    const safeNum  = esc(num);
+    const safeName = esc(d.userNames[num] || '—');
+    const lim      = limits[num];
+    return \`<tr>
+      <td dir="ltr">\${safeNum}</td>
+      <td>\${safeName}</td>
+      <td><span class="badge badge-b">\${lim} رسالة/يوم</span></td>
+      <td><button class="btn btn-r" onclick="resetUserLimitNum(\${JSON.stringify(num)})">↩️ إعادة</button></td>
+    </tr>\`;
+  }).join('');
+}
+
+async function setUserLimit() {
+  const num   = document.getElementById('limit-num').value.replace(/\D/g,'');
+  const limit = parseInt(document.getElementById('limit-val').value, 10);
+  if (!num) { toast('أدخل رقم الهاتف', '#f59e0b'); return; }
+  if (isNaN(limit) || limit < 0) { toast('أدخل عدداً صحيحاً', '#f59e0b'); return; }
+  const r = await api('setUserLimit', { num, limit });
+  if (r.ok) {
+    toast('✅ تم تعيين الحد وإشعار المستخدم');
+    document.getElementById('limit-num').value = '';
+    document.getElementById('limit-val').value = '';
+    loadData();
+  } else {
+    toast(r.msg || 'فشل', '#dc2626');
+  }
+}
+
+async function resetUserLimit() {
+  const num = document.getElementById('limit-num').value.replace(/\D/g,'');
+  if (!num) { toast('أدخل رقم الهاتف', '#f59e0b'); return; }
+  const r = await api('resetUserLimit', { num });
+  if (r.ok) { toast('تم الإعادة للافتراضي'); loadData(); }
+}
+
+async function resetUserLimitNum(num) {
+  const r = await api('resetUserLimit', { num });
+  if (r.ok) { toast('تم الإعادة للافتراضي'); loadData(); }
+}
+
 async function addVip() {
   const num = document.getElementById('new-vip').value.replace(/\D/g,'');
   if (!num) { toast('أدخل رقماً صحيحاً', '#f59e0b'); return; }
   const r = await api('addVip', { num });
   if (r.ok) { toast('✅ تم إضافة VIP'); document.getElementById('new-vip').value = ''; loadData(); }
+}
+
+async function quickSetLimit(num) {
+  const val = prompt(\`عدد الرسائل اليومية للمستخدم \${num}:\`);
+  if (val === null) return;
+  const limit = parseInt(val, 10);
+  if (isNaN(limit) || limit < 0) { toast('رقم غير صحيح', '#f59e0b'); return; }
+  const r = await api('setUserLimit', { num, limit });
+  if (r.ok) { toast('✅ تم وتم إشعار المستخدم'); loadData(); }
+  else toast(r.msg || 'فشل', '#dc2626');
 }
 
 async function addVipNum(num) {
@@ -1190,12 +1323,12 @@ async function startBot() {
             const jid     = msg.key?.remoteJid;
             if (!jid) return;
 
-            // تجاهل الجروبات
-            if (jid.endsWith('@g.us')) return;
+            // تحديد نوع المحادثة
+            const isGroup = jid.endsWith('@g.us');
 
             // استخراج رقم المرسل بشكل موثوق
             const sender = cleanNumber(
-                msg.key?.participant || jid
+                msg.key?.participant || (isGroup ? msg.key?.participant : jid)
             );
             if (!sender) return;
 
@@ -1245,7 +1378,7 @@ async function startBot() {
             }
 
             // ============================================================
-            // رسالة الترحيب (للمستخدمين الجدد فقط)
+            // رسالة الترحيب (للمستخدمين الجدد فقط - في المحادثات الخاصة)
             // ============================================================
             if (!welcomedUsers[sender]) {
                 welcomedUsers[sender] = true;
@@ -1255,10 +1388,12 @@ async function startBot() {
                     userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
                 }
                 saveData();
-                await reply(buildWelcome(userName));
-                // نكمل معالجة الرسالة الأولى فقط إذا كانت نصية أو وسائط حقيقية
-                const isProcessable = body || ['imageMessage','documentMessage'].includes(msgType);
-                if (!isProcessable) return;
+                // رسالة الترحيب فقط في المحادثات الخاصة
+                if (!isGroup) {
+                    await reply(buildWelcome(userName));
+                    const isProcessable = body || ['imageMessage','documentMessage'].includes(msgType);
+                    if (!isProcessable) return;
+                }
             }
 
             // ============================================================
@@ -1505,16 +1640,10 @@ async function startBot() {
                 const quota = checkDailyMessages(sender);
                 if (!quota.allowed) {
                     await reply(
-                        `⚠️ *وصلت للحد اليومي*
-
-` +
-                        `استخدمت كل رسائلك المجانية الـ ${DAILY_MSG_LIMIT} لهذا اليوم.
-` +
-                        `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄
-
-` +
-                        `للاستمرار الآن، تواصل مع الأدمن:
-` +
+                        `⚠️ *وصلت للحد اليومي*\n\n` +
+                        `استخدمت كل رسائلك المجانية الـ ${quota.limit} لهذا اليوم.\n` +
+                        `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄\n\n` +
+                        `للاستمرار الآن، تواصل مع الأدمن:\n` +
                         `👤 wa.me/${ADMIN_NUMBER}`
                     );
                     return;
