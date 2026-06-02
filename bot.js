@@ -1551,7 +1551,7 @@ function renderBlacklist(d) {
 async function addBlacklist() {
   const num = document.getElementById('bl-num').value.replace(/\D/g,'');
   if (!num) { toast('أدخل رقماً صحيحاً', '#f59e0b'); return; }
-  if (!confirm('حظر المستخدم ${num}؟ سيصله إشعار فوري عبر واتساب.')) return;
+  if (!confirm('حظر المستخدم ' + num + '؟ سيصله إشعار فوري عبر واتساب.')) return;
   const r = await api('addBlacklist', { num });
   if (r.ok) {
     const m = r.notified ? '⛔ تم الحظر وأُرسل إشعار واتساب للمستخدم' : ('⛔ تم الحظر — ' + (r.notifyReason || 'البوت غير متصل'));
