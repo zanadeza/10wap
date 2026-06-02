@@ -502,65 +502,75 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
 }
 
 // ============================================================
-// WHISPER — تحويل الصوت إلى نص
+// VOXTRAL (Mistral) — تحويل الصوت إلى نص والرد عليه
 // ============================================================
-async function transcribeAudio(buffer, mimeType) {
-    // Whisper يقبل: mp3, mp4, mpeg, mpga, m4a, wav, webm, ogg
-    // واتساب يرسل الصوت بصيغة ogg/opus
-    const ext = (mimeType || 'audio/ogg').includes('mp4') ? 'mp4'
-               : (mimeType || '').includes('mpeg') ? 'mp3'
-               : 'ogg';
+async function transcribeAndReplyAudio(buffer, mimeType, userQuestion, userName, chatHistory) {
+    // نحوّل الصوت لـ base64
+    const audioBase64 = buffer.toString('base64');
 
-    // نكتب الملف المؤقت
-    const tmpPath = `/tmp/audio_${Date.now()}.${ext}`;
-    fs.writeFileSync(tmpPath, buffer);
-
-    try {
-        // نبني الـ multipart/form-data يدوياً
-        const boundary = `----WhisperBoundary${Date.now()}`;
-        const fileData = fs.readFileSync(tmpPath);
-
-        const bodyParts = [
-            `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1`,
-            `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nar`,
-            `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${mimeType || 'audio/ogg'}\r\n\r\n`
-        ];
-
-        const prefix = Buffer.from(bodyParts.join('\r\n') + '\r\n', 'utf8');
-
-        // لا نحتاج OpenAI هنا — نستخدم مباشرة
-        // OPENAI_API_KEY يُؤخذ من متغير البيئة أو نضيفه في CONFIG
-        const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-        if (!OPENAI_API_KEY) {
-            throw new Error('OPENAI_API_KEY غير موجود — أضفه كـ متغير بيئة');
+    // نبني محتوى الرسالة: صوت + سؤال (إن وُجد)
+    const userContent = [
+        {
+            type: 'input_audio',
+            input_audio: audioBase64   // base64 مباشرة بدون data URI
         }
+    ];
 
-        const suffix = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-        const body   = Buffer.concat([prefix, fileData, suffix]);
+    // إذا أرسل المستخدم نصاً مع الصوت نضيفه
+    if (userQuestion && userQuestion.trim()) {
+        userContent.push({ type: 'text', text: userQuestion.trim() });
+    } else {
+        userContent.push({
+            type: 'text',
+            text: userName
+                ? `اسم المستخدم: ${userName}\nاستمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.`
+                : 'استمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.'
+        });
+    }
 
-        const resp = await fetchWithTimeout(
-            'https://api.openai.com/v1/audio/transcriptions',
+    // نبني messages: system + سياق محدود + رسالة الصوت
+    const messages = [
+        { role: 'system', content: getSystemPrompt() },
+        // آخر 6 رسائل من السياق للتواصل الطبيعي
+        ...(chatHistory || []).slice(-6),
+        { role: 'user', content: userContent }
+    ];
+
+    const release = await aiSemaphore();
+    try {
+        const response = await fetchWithTimeout(
+            'https://api.mistral.ai/v1/chat/completions',
             {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
-                    'Content-Type': `multipart/form-data; boundary=${boundary}`
+                    'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                    'Content-Type': 'application/json'
                 },
-                body
+                body: JSON.stringify({
+                    model: 'voxtral-small-2507',   // النموذج الأقوى للصوت
+                    messages,
+                    max_tokens: 1000,
+                    temperature: 0.5
+                })
             },
-            30_000
+            60_000
         );
 
-        if (!resp.ok) {
-            const errText = await resp.text();
-            throw new Error(`Whisper API: ${resp.status} — ${errText.slice(0, 100)}`);
+        if (response.status === 429) throw new Error('RATE_LIMIT');
+        if (response.status === 401) throw new Error('AUTH_ERROR');
+        if (response.status === 402) throw new Error('QUOTA_ERROR');
+        if (!response.ok) {
+            const errBody = await response.text();
+            throw new Error(`Voxtral HTTP ${response.status}: ${errBody.slice(0, 120)}`);
         }
 
-        const data = await resp.json();
-        return (data.text || '').trim();
+        const data = await response.json();
+        const reply = data?.choices?.[0]?.message?.content;
+        if (!reply) throw new Error('استجابة فارغة من Voxtral');
+        return reply;
 
     } finally {
-        try { fs.unlinkSync(tmpPath); } catch (_) {}
+        release();
     }
 }
 
@@ -1892,7 +1902,7 @@ async function startBot() {
                 return;
             }
 
-            // --- صوت ---
+            // --- صوت (Voxtral by Mistral) ---
             if (msgType === 'audioMessage' || msgType === 'pttMessage') {
                 if (!checkSpam(sender)) {
                     await reply('⚠️ أرسلت رسائل بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
@@ -1900,7 +1910,7 @@ async function startBot() {
                 }
                 await react('🎙️');
                 try {
-                    const audioMsg = message.audioMessage || message.pttMessage;
+                    const audioMsg = message.audioMessage || message.pttMessage || {};
                     const mime = audioMsg?.mimetype || 'audio/ogg; codecs=opus';
                     const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
                         logger: { level: 'silent', child: () => ({ level: 'silent' }) }
@@ -1911,49 +1921,45 @@ async function startBot() {
                         return;
                     }
 
-                    // تحويل الصوت لنص عبر Whisper
-                    const transcript = await transcribeAudio(buffer, mime.split(';')[0]);
-                    if (!transcript) {
-                        await react('❌');
-                        await reply('لم أتمكن من فهم الرسالة الصوتية. تأكد أن الصوت واضح، أو اكتب رسالتك نصياً.');
-                        return;
-                    }
-
-                    console.log(`[Whisper] نص مستخرج: "${transcript.slice(0, 80)}"`);
-
-                    // الرد على النص المُستخرج
+                    // فحص الحد اليومي
                     const isVIPaudio = vipNumbers.includes(sender);
                     if (!isAdmin && !isVIPaudio) {
                         const quota = checkDailyMessages(sender);
                         if (!quota.allowed) {
+                            await react('⛔');
                             await reply(`⚠️ وصلت للحد اليومي. رصيدك يتجدد منتصف الليل.`);
                             return;
                         }
                     }
 
+                    // Voxtral يفهم الصوت ويرد مباشرة — بدون OpenAI
                     if (!userChats[sender]) userChats[sender] = [];
-                    userChats[sender].push({ role: 'user', content: `[رسالة صوتية]: ${transcript}` });
+                    const res = await transcribeAndReplyAudio(
+                        buffer, mime, body, userName, userChats[sender]
+                    );
 
-                    const res = await askAI([
-                        { role: 'system', content: getSystemPrompt() },
-                        ...userChats[sender]
-                    ]);
+                    // حفظ في السياق
+                    userChats[sender].push({ role: 'user',      content: body ? `[رسالة صوتية + نص: ${body}]` : '[رسالة صوتية]' });
                     userChats[sender].push({ role: 'assistant', content: res });
 
                     stats.totalMessages++;
                     saveData();
 
-                    // نرد بالنص المُستخرج + الرد
-                    await reply(`🎙️ *فهمت:* ${transcript}\n\n${res}`);
+                    await reply(`🎙️ ${res}`);
                     await react('✅');
+
                 } catch (audioErr) {
-                    console.error('[audio]', audioErr.message);
-                    if (audioErr.message.includes('OPENAI_API_KEY')) {
-                        await react('ℹ️');
-                        await reply('⚠️ ميزة الصوت تحتاج إعداد OPENAI_API_KEY.\nيمكنك كتابة رسالتك نصياً في الوقت الحالي. ✍️');
+                    console.error('[audio/voxtral]', audioErr.message);
+                    if (audioErr.message === 'AUTH_ERROR') {
+                        notifyAdmin('⚠️ خطأ 401 في Voxtral — تحقق من MISTRAL_API_KEY');
+                        await react('❌');
+                        await reply('عذراً، مشكلة في إعدادات الخدمة. تم إشعار الأدمن.');
+                    } else if (audioErr.message === 'QUOTA_ERROR') {
+                        await react('❌');
+                        await reply('عذراً، نفاد رصيد Mistral API مؤقتاً. تم إشعار الأدمن.');
                     } else {
                         await react('❌');
-                        await reply('عذراً، حدث خطأ في معالجة الرسالة الصوتية. حاول كتابة رسالتك نصياً.');
+                        await reply('عذراً، حدث خطأ في معالجة الرسالة الصوتية. حاول مجدداً أو اكتب رسالتك نصياً. ✍️');
                     }
                 }
                 return;
