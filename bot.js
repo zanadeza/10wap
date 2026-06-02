@@ -46,6 +46,7 @@ function loadData() {
         userLimits:     {},   // حدود مخصصة لكل مستخدم { sender: limit }
         blacklist:      [],   // أرقام محظورة
         userLanguages:  {},   // لغة كل مستخدم { sender: 'ar'|'en'|... }
+        userStats:      {},   // إحصائيات لكل مستخدم { sender: { totalSent, totalImages, totalDocs, firstSeen, lastSeen } }
         stats:          { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 }
     };
 }
@@ -58,7 +59,7 @@ function saveData() {
         try {
             const tmp = DATA_FILE + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(
-                { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats },
+                { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, userStats, stats },
                 null, 2
             ));
             fs.renameSync(tmp, DATA_FILE);
@@ -68,7 +69,7 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, userStats, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
@@ -80,6 +81,7 @@ if (!stats.totalMessages)      stats.totalMessages = 0;
 if (!stats.totalImages)        stats.totalImages   = 0;
 if (!stats.totalMedical)       stats.totalMedical  = 0;
 if (!stats.totalDocs)          stats.totalDocs     = 0;
+if (!userStats)                userStats = {};
 
 // إضافة الأدمن للمستخدمين المرحّب بهم تلقائياً حتى لا يستقبل رسالة ترحيب
 welcomedUsers[ADMIN_NUMBER] = true;
@@ -202,9 +204,18 @@ setInterval(() => {
     }
 }, 60 * 60_000);
 
-// ============================================================
-// SYSTEM PROMPTS
-// ============================================================
+// تحديث إحصائيات المستخدم الفردية
+function updateUserStats(sender, type = 'message') {
+    if (!userStats[sender]) {
+        userStats[sender] = { totalSent: 0, totalImages: 0, totalDocs: 0, firstSeen: Date.now(), lastSeen: Date.now() };
+    }
+    userStats[sender].lastSeen = Date.now();
+    if (type === 'message') userStats[sender].totalSent = (userStats[sender].totalSent || 0) + 1;
+    else if (type === 'image') userStats[sender].totalImages = (userStats[sender].totalImages || 0) + 1;
+    else if (type === 'doc')   userStats[sender].totalDocs   = (userStats[sender].totalDocs   || 0) + 1;
+}
+
+
 let _cachedSystemPrompt = null;
 let _cachedSystemPromptTime = 0;
 function getSystemPrompt() {
@@ -610,7 +621,14 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     // !رصيد — عرض الرصيد المتبقي
     if (command === '!رصيد' || command === '!balance') {
         if (isAdmin || isVIP) {
-            await reply('♾️ *رصيدك غير محدود* (VIP/أدمن)');
+            const uSt = userStats[sender] || {};
+            await reply(
+                `♾️ *رصيدك غير محدود (VIP/أدمن)*\n\n` +
+                `📊 *إحصائياتك الكلية:*\n` +
+                `• إجمالي الرسائل: ${uSt.totalSent || 0}\n` +
+                `• الصور المحللة: ${uSt.totalImages || 0}\n` +
+                `• الملفات المعالجة: ${uSt.totalDocs || 0}`
+            );
         } else {
             const limit = getUserDailyLimit(sender);
             const rec   = getDailyRecord(sender);
@@ -618,12 +636,17 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
             const remaining = Math.max(0, limit - used);
             const resetDate = new Date(rec.resetAt);
             const resetStr  = resetDate.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+            const uSt = userStats[sender] || {};
             await reply(
-                `📊 *رصيد رسائلك اليوم:*\n\n` +
-                `✅ المستخدم: ${used} رسالة\n` +
-                `🔄 المتبقي: ${remaining} رسالة\n` +
-                `📅 يتجدد عند: ${resetStr}\n\n` +
-                `_الحد اليومي: ${limit} رسالة_`
+                `📊 *رصيدك اليوم:*\n\n` +
+                `✅ استخدمت: ${used} رسالة\n` +
+                `🔄 متبقي: *${remaining}* رسالة\n` +
+                `📅 يتجدد عند: ${resetStr}\n` +
+                `📏 الحد اليومي: ${limit} رسالة\n\n` +
+                `📈 *إحصائياتك الكلية:*\n` +
+                `• إجمالي الرسائل المرسلة: ${uSt.totalSent || 0}\n` +
+                `• الصور المحللة: ${uSt.totalImages || 0}\n` +
+                `• الملفات المعالجة: ${uSt.totalDocs || 0}`
             );
         }
         return true;
@@ -916,6 +939,7 @@ function startQRServer() {
                 userNames,
                 blacklist: blacklist || [],
                 welcomedUsers: Object.keys(welcomedUsers),
+                userStats: userStats || {},
                 reports: reports.slice(-50).reverse()
             };
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -991,6 +1015,7 @@ textarea.inp{resize:vertical;min-height:80px}
     <div class="tab" onclick="showTab('qr')">📱 ربط واتساب</div>
     <div class="tab" onclick="showTab('broadcast')">📢 البث</div>
     <div class="tab" onclick="showTab('users')">👥 المستخدمون</div>
+    <div class="tab" onclick="showTab('userstats')">📈 إحصائيات المستخدمين</div>
     <div class="tab" onclick="showTab('limits')">🔢 حدود الرسائل</div>
     <div class="tab" onclick="showTab('vip')">⭐ VIP</div>
     <div class="tab" onclick="showTab('blacklist')">⛔ المحظورون</div>
@@ -1043,6 +1068,20 @@ textarea.inp{resize:vertical;min-height:80px}
           ⚠️ الرسالة ستُرسل لجميع المستخدمين. هناك تأخير 5 ثواني بين كل رسالة.
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- إحصائيات المستخدمين -->
+  <div class="panel" id="panel-userstats">
+    <div class="card">
+      <div class="ch">
+        <h3>📈 إحصائيات المستخدمين التفصيلية</h3>
+        <input class="inp" style="width:200px;padding:6px 10px" id="ustats-search" placeholder="بحث بالرقم أو الاسم..." oninput="filterUserStats()">
+      </div>
+      <table>
+        <thead><tr><th>الرقم</th><th>الاسم</th><th>💬 رسائل كلية</th><th>🖼️ صور</th><th>📄 ملفات</th><th>📅 آخر نشاط</th><th>الحد اليومي</th></tr></thead>
+        <tbody id="userstats-table"><tr><td colspan="7" class="empty">جاري التحميل...</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -1145,7 +1184,7 @@ let _data = null;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['overview','qr','broadcast','users','limits','vip','blacklist','reports'];
+    const names = ['overview','qr','broadcast','users','userstats','limits','vip','blacklist','reports'];
     t.classList.toggle('active', names[i] === name);
   });
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -1244,8 +1283,8 @@ function updateUI() {
   // Reports
   renderReports(d);
 
-  // Blacklist
-  renderBlacklist(d);
+  // Users stats
+  renderUserStats(d);
 }
 
 function setText(id, val) {
@@ -1253,7 +1292,48 @@ function setText(id, val) {
   if (el) el.textContent = val ?? '—';
 }
 
-let _allUsers = [];
+let _allUserStats = [];
+function renderUserStats(d) {
+  const uStats = d.userStats || {};
+  const limits = d.userLimits || {};
+  _allUserStats = d.welcomedUsers.map(num => ({
+    num,
+    name: d.userNames[num] || '—',
+    totalSent:   (uStats[num]?.totalSent   || 0),
+    totalImages: (uStats[num]?.totalImages || 0),
+    totalDocs:   (uStats[num]?.totalDocs   || 0),
+    lastSeen:    uStats[num]?.lastSeen || 0,
+    limit: limits[num] != null ? limits[num] : (d.defaultLimit || 20),
+    isVip: d.vipNumbers.includes(num)
+  })).sort((a,b) => b.totalSent - a.totalSent);
+  filterUserStats();
+}
+
+function filterUserStats() {
+  const q = (document.getElementById('ustats-search')?.value || '').toLowerCase();
+  const filtered = q ? _allUserStats.filter(u => u.num.includes(q) || u.name.toLowerCase().includes(q)) : _allUserStats;
+  const tb = document.getElementById('userstats-table');
+  if (!filtered.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">لا توجد بيانات</td></tr>'; return; }
+  tb.innerHTML = filtered.slice(0, 200).map(u => {
+    const safeNum  = esc(u.num);
+    const safeName = esc(u.name);
+    const lastDate = u.lastSeen ? new Date(u.lastSeen).toLocaleString('ar-SA') : '—';
+    const limitBadge = u.isVip
+      ? \`<span class="badge badge-b">♾️ VIP</span>\`
+      : \`<span class="badge badge-g">\${u.limit} رسالة/يوم</span>\`;
+    return \`<tr>
+      <td dir="ltr">\${safeNum}</td>
+      <td>\${safeName}</td>
+      <td style="text-align:center;font-weight:700;color:#38bdf8">\${u.totalSent}</td>
+      <td style="text-align:center">\${u.totalImages}</td>
+      <td style="text-align:center">\${u.totalDocs}</td>
+      <td style="font-size:11px;color:#94a3b8">\${lastDate}</td>
+      <td>\${limitBadge}</td>
+    \`;
+  }).join('');
+}
+
+
 function renderUsers(d) {
   _allUsers = d.welcomedUsers.map(num => ({
     num,
@@ -1670,11 +1750,25 @@ async function startBot() {
             if (!welcomedUsers[sender]) {
                 welcomedUsers[sender] = true;
                 userChats[sender] = [];
+                // تهيئة إحصائيات المستخدم الجديد
+                if (!userStats[sender]) {
+                    userStats[sender] = { totalSent: 0, totalImages: 0, totalDocs: 0, firstSeen: Date.now(), lastSeen: Date.now() };
+                }
                 if (userName) {
                     userChats[sender].push({ role: 'user',      content: `[اسم المستخدم: ${userName}]` });
                     userChats[sender].push({ role: 'assistant', content: `أهلاً ${userName}، كيف أستطيع مساعدتك؟` });
                 }
                 saveData();
+                // إشعار الأدمن بالمستخدم الجديد
+                if (!isGroup && !isAdmin) {
+                    const adminMsg =
+                        `🆕 *مستخدم جديد انضم للبوت*\n\n` +
+                        `👤 الاسم: ${userName || 'غير معروف'}\n` +
+                        `📱 الرقم: ${sender}\n` +
+                        `🕐 الوقت: ${nowJerusalem().toLocaleString('ar-SA')}\n\n` +
+                        `_تم حضره تلقائياً — تواصل معه إذا لزم_`;
+                    notifyAdmin(adminMsg);
+                }
                 // رسالة الترحيب فقط في المحادثات الخاصة
                 if (!isGroup) {
                     await reply(buildWelcome(userName));
@@ -1718,6 +1812,7 @@ async function startBot() {
                     const isMed = isMedicalImage(body);
                     stats.totalImages++;
                     if (isMed) stats.totalMedical++;
+                    updateUserStats(sender, 'image');
                     saveData();
                     const res = await askAIWithImage(buffer.toString('base64'), body, userName, mime);
                     // حفظ وصف الصورة في السياق
@@ -1789,14 +1884,27 @@ async function startBot() {
                         return;
                     }
 
-                    // استخراج النص
+                    // استخراج النص — محاولتان: pdf-parse ثم fallback بدون options
                     let docText = '';
                     try {
-                        const parsed = await pdfParse(buffer);
+                        // المحاولة الأولى: pdf-parse مع options مرنة
+                        const parsed = await pdfParse(buffer, {
+                            // تجاهل بعض metadata الخاصة التي تسبب خطأ "encrypted"
+                            max: 0
+                        });
                         docText = (parsed.text || '').trim();
                         console.log(`[PDF] استُخرج ${docText.length} حرف من "${fileName}"`);
                     } catch (pdfErr) {
-                        console.error('[pdf-parse]', pdfErr.message);
+                        console.warn('[pdf-parse attempt1]', pdfErr.message);
+                        // المحاولة الثانية: pdf-parse بدون options إضافية
+                        try {
+                            const parsed2 = await pdfParse(buffer);
+                            docText = (parsed2.text || '').trim();
+                            console.log(`[PDF fallback] استُخرج ${docText.length} حرف من "${fileName}"`);
+                        } catch (pdfErr2) {
+                            console.error('[pdf-parse attempt2]', pdfErr2.message);
+                            // لو فشل كل شيء، سيتم التعامل معه كـ PDF مصوّر
+                        }
                     }
 
                     // لو النص فارغ: الـ PDF مصوّر - نحوّل صفحاته لصور JPG
@@ -1851,6 +1959,7 @@ async function startBot() {
                             });
 
                             stats.totalDocs = (stats.totalDocs || 0) + 1;
+                            updateUserStats(sender, 'doc');
                             saveData();
                             if (!userChats[sender]) userChats[sender] = [];
                             userChats[sender].push({ role: 'user',      content: `[أرسل PDF مصوّر: "${fileName}" - ${pages.length} صفحة]` });
@@ -1870,6 +1979,7 @@ async function startBot() {
                     const pdfSummaryCtx = docText.slice(0, 2000);
 
                     stats.totalDocs = (stats.totalDocs || 0) + 1;
+                    updateUserStats(sender, 'doc');
                     saveData();
 
                     const userQ = caption || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه';
@@ -1943,9 +2053,8 @@ async function startBot() {
                     userChats[sender].push({ role: 'assistant', content: res });
 
                     stats.totalMessages++;
+                    updateUserStats(sender, 'message');
                     saveData();
-
-                    await reply(`🎙️ ${res}`);
                     await react('✅');
 
                 } catch (audioErr) {
@@ -1984,11 +2093,16 @@ async function startBot() {
             if (!isAdmin && !isVIP) {
                 const quota = checkDailyMessages(sender);
                 if (!quota.allowed) {
+                    const uStats = userStats[sender] || {};
                     await reply(
-                        `⚠️ *وصلت للحد اليومي*\n\n` +
-                        `استخدمت كل رسائلك المجانية الـ ${quota.limit} لهذا اليوم.\n` +
-                        `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄\n\n` +
-                        `للاستمرار الآن، تواصل مع الأدمن:\n` +
+                        `🔔 *انتهت رسائلك اليومية*\n\n` +
+                        `لقد استنفدت الـ *${quota.limit}* رسالة المجانية لهذا اليوم.\n\n` +
+                        `📊 *إحصائياتك الكلية:*\n` +
+                        `• إجمالي الرسائل المرسلة: ${uStats.totalSent || 0}\n` +
+                        `• الصور المحللة: ${uStats.totalImages || 0}\n` +
+                        `• الملفات المعالجة: ${uStats.totalDocs || 0}\n\n` +
+                        `🔄 يتجدد رصيدك تلقائياً في منتصف الليل\n\n` +
+                        `💬 *للاشتراك بباقة أكبر تواصل مع المطور:*\n` +
                         `👤 wa.me/${ADMIN_NUMBER}`
                     );
                     return;
@@ -2008,9 +2122,8 @@ async function startBot() {
             }
 
             stats.totalMessages++;
+            updateUserStats(sender, 'message');
             saveData();
-
-            // تقليم السياق قبل الإضافة
             if (userChats[sender].length >= maxHist)
                 userChats[sender] = userChats[sender].slice(-(maxHist - 1));
 
