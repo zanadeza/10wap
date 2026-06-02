@@ -44,6 +44,8 @@ function loadData() {
         vipNumbers:     [],
         reports:        [],
         userLimits:     {},   // حدود مخصصة لكل مستخدم { sender: limit }
+        blacklist:      [],   // أرقام محظورة
+        userLanguages:  {},   // لغة كل مستخدم { sender: 'ar'|'en'|... }
         stats:          { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 }
     };
 }
@@ -56,7 +58,7 @@ function saveData() {
         try {
             const tmp = DATA_FILE + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(
-                { userNames, welcomedUsers, vipNumbers, reports, userLimits, stats },
+                { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats },
                 null, 2
             ));
             fs.renameSync(tmp, DATA_FILE);
@@ -66,11 +68,13 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, reports, userLimits, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
 if (!userLimits)               userLimits = {};
+if (!Array.isArray(blacklist)) blacklist = [];
+if (!userLanguages)            userLanguages = {};
 if (!stats)                    stats   = { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 };
 if (!stats.totalMessages)      stats.totalMessages = 0;
 if (!stats.totalImages)        stats.totalImages   = 0;
@@ -121,6 +125,7 @@ function nowJerusalem() {
 // RATE LIMITING & DAILY MESSAGE QUOTA
 // ============================================================
 const DAILY_MSG_LIMIT = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
+const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع الإدارة.'; // رسالة للمحظورين
 const _userDailyLimit = {}; // { sender: { messages, images, docs, resetAt } }
 
 // الحد اليومي الفعلي: مخصص إن وُجد، وإلا الافتراضي
@@ -497,8 +502,175 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
 }
 
 // ============================================================
-// BROADCAST
+// WHISPER — تحويل الصوت إلى نص
 // ============================================================
+async function transcribeAudio(buffer, mimeType) {
+    // Whisper يقبل: mp3, mp4, mpeg, mpga, m4a, wav, webm, ogg
+    // واتساب يرسل الصوت بصيغة ogg/opus
+    const ext = (mimeType || 'audio/ogg').includes('mp4') ? 'mp4'
+               : (mimeType || '').includes('mpeg') ? 'mp3'
+               : 'ogg';
+
+    // نكتب الملف المؤقت
+    const tmpPath = `/tmp/audio_${Date.now()}.${ext}`;
+    fs.writeFileSync(tmpPath, buffer);
+
+    try {
+        // نبني الـ multipart/form-data يدوياً
+        const boundary = `----WhisperBoundary${Date.now()}`;
+        const fileData = fs.readFileSync(tmpPath);
+
+        const bodyParts = [
+            `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1`,
+            `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nar`,
+            `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${mimeType || 'audio/ogg'}\r\n\r\n`
+        ];
+
+        const prefix = Buffer.from(bodyParts.join('\r\n') + '\r\n', 'utf8');
+
+        // لا نحتاج OpenAI هنا — نستخدم مباشرة
+        // OPENAI_API_KEY يُؤخذ من متغير البيئة أو نضيفه في CONFIG
+        const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+        if (!OPENAI_API_KEY) {
+            throw new Error('OPENAI_API_KEY غير موجود — أضفه كـ متغير بيئة');
+        }
+
+        const suffix = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+        const body   = Buffer.concat([prefix, fileData, suffix]);
+
+        const resp = await fetchWithTimeout(
+            'https://api.openai.com/v1/audio/transcriptions',
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                    'Content-Type': `multipart/form-data; boundary=${boundary}`
+                },
+                body
+            },
+            30_000
+        );
+
+        if (!resp.ok) {
+            const errText = await resp.text();
+            throw new Error(`Whisper API: ${resp.status} — ${errText.slice(0, 100)}`);
+        }
+
+        const data = await resp.json();
+        return (data.text || '').trim();
+
+    } finally {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+}
+
+// ============================================================
+// USER COMMANDS — أوامر المستخدم
+// ============================================================
+// يُعيد true إذا تمت معالجة الأمر (ويجب التوقف عن المعالجة الاعتيادية)
+async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
+    const cmd = (body || '').trim();
+    if (!cmd.startsWith('!')) return false;
+
+    const parts = cmd.split(/\s+/);
+    const command = parts[0].toLowerCase();
+
+    // !مساعدة — قائمة الأوامر
+    if (command === '!مساعدة' || command === '!help') {
+        await reply(
+            `📋 *قائمة الأوامر المتاحة:*\n\n` +
+            `• *!مساعدة* — عرض هذه القائمة\n` +
+            `• *!مسح* — مسح سياق المحادثة والبدء من جديد\n` +
+            `• *!رصيد* — عرض عدد الرسائل المتبقية اليوم\n` +
+            `• *!لغة en* — تغيير لغة الردود (ar/en/fr/...)\n` +
+            `• *!ملخص* — تلخيص المحادثة الحالية\n\n` +
+            `_يمكنك أيضاً إرسال صور أو ملفات PDF للتحليل_`
+        );
+        return true;
+    }
+
+    // !مسح — مسح سياق المحادثة
+    if (command === '!مسح' || command === '!reset') {
+        userChats[sender] = [];
+        await react('✅');
+        await reply('🗑️ تم مسح سياق المحادثة. ابدأ محادثة جديدة!');
+        return true;
+    }
+
+    // !رصيد — عرض الرصيد المتبقي
+    if (command === '!رصيد' || command === '!balance') {
+        if (isAdmin || isVIP) {
+            await reply('♾️ *رصيدك غير محدود* (VIP/أدمن)');
+        } else {
+            const limit = getUserDailyLimit(sender);
+            const rec   = getDailyRecord(sender);
+            const used  = rec.messages;
+            const remaining = Math.max(0, limit - used);
+            const resetDate = new Date(rec.resetAt);
+            const resetStr  = resetDate.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+            await reply(
+                `📊 *رصيد رسائلك اليوم:*\n\n` +
+                `✅ المستخدم: ${used} رسالة\n` +
+                `🔄 المتبقي: ${remaining} رسالة\n` +
+                `📅 يتجدد عند: ${resetStr}\n\n` +
+                `_الحد اليومي: ${limit} رسالة_`
+            );
+        }
+        return true;
+    }
+
+    // !لغة — تغيير اللغة
+    if (command === '!لغة' || command === '!language' || command === '!lang') {
+        const lang = parts[1] || '';
+        if (!lang) {
+            const currentLang = userLanguages[sender] || 'ar (افتراضي)';
+            await reply(`🌐 لغتك الحالية: *${currentLang}*\n\nمثال لتغييرها:\n• !لغة en (إنجليزي)\n• !لغة ar (عربي)\n• !لغة fr (فرنسي)`);
+        } else {
+            userLanguages[sender] = lang.toLowerCase();
+            saveData();
+            const langNames = { ar: 'العربية', en: 'الإنجليزية', fr: 'الفرنسية', de: 'الألمانية', es: 'الإسبانية', tr: 'التركية' };
+            const langName = langNames[lang.toLowerCase()] || lang;
+            await react('✅');
+            await reply(`🌐 تم تغيير اللغة إلى: *${langName}*\nسأرد عليك بهذه اللغة من الآن.`);
+        }
+        return true;
+    }
+
+    // !ملخص — تلخيص المحادثة الحالية
+    if (command === '!ملخص' || command === '!summary') {
+        const history = userChats[sender] || [];
+        const convMsgs = history.filter(m => !m.content.startsWith('['));
+        if (convMsgs.length < 2) {
+            await reply('📝 لا يوجد محادثة كافية للتلخيص بعد. تحدث أكثر ثم جرب الأمر مجدداً!');
+            return true;
+        }
+        await react('⏳');
+        const convText = convMsgs.slice(-20).map(m =>
+            `${m.role === 'user' ? 'المستخدم' : 'البوت'}: ${m.content.slice(0, 300)}`
+        ).join('\n');
+        try {
+            const summary = await callMistral({
+                model: 'mistral-small-latest',
+                messages: [
+                    { role: 'system', content: 'لخّص هذه المحادثة بشكل مختصر ومنظم في 5-7 نقاط. ركّز على المحاور الرئيسية.' },
+                    { role: 'user', content: convText }
+                ],
+                max_tokens: 600,
+                temperature: 0.3
+            });
+            await reply(`📝 *ملخص المحادثة:*\n\n${summary}`);
+            await react('✅');
+        } catch (e) {
+            await reply('عذراً، حدث خطأ أثناء التلخيص. حاول مرة أخرى.');
+            await react('❌');
+        }
+        return true;
+    }
+
+    return false; // لم يُعرَّف الأمر
+}
+
+
 // كل مستخدم رسالة عشوائية مختلفة + rate limiting ذكي
 async function broadcastToAll(getTextFn) {
     const allUsers = Object.keys(welcomedUsers)
@@ -607,6 +779,25 @@ function startQRServer() {
                         reports = [];
                         saveData();
                     }
+                    else if (action === 'addBlacklist') {
+                        const num = (data.num || '').replace(/\D/g, '');
+                        if (num && !blacklist.includes(num)) {
+                            blacklist.push(num);
+                            saveData();
+                            // إشعار المحظور تلقائياً
+                            if (sock && isConnected) {
+                                try {
+                                    await sock.sendMessage(`${num}@s.whatsapp.net`, { text: BLACKLIST_MSG });
+                                } catch (_) {}
+                            }
+                        }
+                    }
+                    else if (action === 'removeBlacklist') {
+                        const num = (data.num || '').replace(/\D/g, '');
+                        blacklist = blacklist.filter(n => n !== num);
+                        saveData();
+                        result.msg = 'تم رفع الحظر';
+                    }
                     else if (action === 'clearSessions') {
                         userChats = {};
                         result.msg = 'تم مسح الجلسات';
@@ -713,6 +904,7 @@ function startQRServer() {
                 vipNumbers,
                 userLimits,
                 userNames,
+                blacklist: blacklist || [],
                 welcomedUsers: Object.keys(welcomedUsers),
                 reports: reports.slice(-50).reverse()
             };
@@ -791,6 +983,7 @@ textarea.inp{resize:vertical;min-height:80px}
     <div class="tab" onclick="showTab('users')">👥 المستخدمون</div>
     <div class="tab" onclick="showTab('limits')">🔢 حدود الرسائل</div>
     <div class="tab" onclick="showTab('vip')">⭐ VIP</div>
+    <div class="tab" onclick="showTab('blacklist')">⛔ المحظورون</div>
     <div class="tab" onclick="showTab('reports')">🚨 البلاغات</div>
   </div>
 
@@ -893,6 +1086,22 @@ textarea.inp{resize:vertical;min-height:80px}
     </div>
   </div>
 
+  <!-- المحظورون -->
+  <div class="panel" id="panel-blacklist">
+    <div class="card">
+      <div class="ch"><h3>⛔ قائمة المحظورين</h3></div>
+      <div style="padding:14px 18px;background:#0f172a;border-bottom:1px solid #334155;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <span style="font-size:13px;color:#94a3b8">حظر مستخدم:</span>
+        <input class="inp" id="bl-num" placeholder="رقم الهاتف مع كود الدولة" dir="ltr" style="width:200px">
+        <button class="btn btn-r" onclick="addBlacklist()">⛔ حظر وإشعار</button>
+      </div>
+      <table>
+        <thead><tr><th>الرقم</th><th>الاسم</th><th>إجراء</th></tr></thead>
+        <tbody id="blacklist-table"><tr><td colspan="3" class="empty">لا يوجد مستخدمون محظورون</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- البلاغات -->
   <div class="panel" id="panel-reports">
     <div class="card">
@@ -926,7 +1135,7 @@ let _data = null;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['overview','qr','broadcast','users','limits','vip','reports'];
+    const names = ['overview','qr','broadcast','users','limits','vip','blacklist','reports'];
     t.classList.toggle('active', names[i] === name);
   });
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -1024,6 +1233,9 @@ function updateUI() {
 
   // Reports
   renderReports(d);
+
+  // Blacklist
+  renderBlacklist(d);
 }
 
 function setText(id, val) {
@@ -1036,7 +1248,8 @@ function renderUsers(d) {
   _allUsers = d.welcomedUsers.map(num => ({
     num,
     name: d.userNames[num] || '—',
-    isVip: d.vipNumbers.includes(num)
+    isVip: d.vipNumbers.includes(num),
+    isBlocked: (d.blacklist || []).includes(num)
   }));
   filterUsers();
 }
@@ -1049,23 +1262,38 @@ function filterUsers() {
   tb.innerHTML = filtered.slice(0,100).map(u => {
     const safeNum  = esc(u.num);
     const safeName = esc(u.name);
-    // onclick values use JSON.stringify to safely embed the number as a JS string argument
     const addVipBtn    = \`<button class="btn btn-b" onclick="addVipNum(\${JSON.stringify(u.num)})">+ VIP</button>\`;
     const removeVipBtn = \`<button class="btn btn-y" onclick="removeVipNum(\${JSON.stringify(u.num)})">إزالة VIP</button>\`;
     const deleteBtn    = \`<button class="btn btn-r" onclick="deleteUser(\${JSON.stringify(u.num)})">حذف</button>\`;
     const limitBtn     = \`<button class="btn btn-y" onclick="quickSetLimit(\${JSON.stringify(u.num)})">🔢 حد</button>\`;
+    const blockBtn     = u.isBlocked
+      ? \`<button class="btn btn-g" onclick="removeBlacklistNum(\${JSON.stringify(u.num)})">✅ رفع حظر</button>\`
+      : \`<button class="btn" style="background:#7c3aed;color:#fff" onclick="blockUser(\${JSON.stringify(u.num)})">⛔ حظر</button>\`;
+    const badge = u.isBlocked
+      ? '<span class="badge badge-r">⛔ محظور</span>'
+      : u.isVip ? '<span class="badge badge-b">⭐ VIP</span>' : '<span class="badge badge-g">عادي</span>';
     return \`<tr>
       <td dir="ltr">\${safeNum}</td>
       <td>\${safeName}</td>
-      <td><span class="badge \${u.isVip ? 'badge-b' : 'badge-g'}">\${u.isVip ? '⭐ VIP' : 'عادي'}</span></td>
-      <td style="display:flex;gap:6px">
-        \${!u.isVip ? addVipBtn : removeVipBtn}
+      <td>\${badge}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap">
+        \${!u.isVip && !u.isBlocked ? addVipBtn : u.isVip ? removeVipBtn : ''}
         \${limitBtn}
+        \${blockBtn}
         \${deleteBtn}
       </td>
     </tr>\`;
   }).join('');
 }
+
+async function blockUser(num) {
+  if (!confirm(\`حظر المستخدم \${num}؟ سيصله إشعار تلقائي.\`)) return;
+  const r = await api('addBlacklist', { num });
+  if (r.ok) { toast('⛔ تم الحظر'); loadData(); }
+  else toast(r.msg || 'فشل', '#dc2626');
+}
+
+
 
 function renderVip(d) {
   const tb = document.getElementById('vip-table');
@@ -1181,6 +1409,41 @@ async function clearReports() {
   if (r.ok) { toast('تم مسح البلاغات'); loadData(); }
 }
 
+function renderBlacklist(d) {
+  const tb = document.getElementById('blacklist-table');
+  const bl = d.blacklist || [];
+  if (!bl.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">لا يوجد مستخدمون محظورون</td></tr>'; return; }
+  tb.innerHTML = bl.map(num => {
+    const safeNum  = esc(num);
+    const safeName = esc(d.userNames[num] || '—');
+    return \`<tr>
+      <td dir="ltr">\${safeNum}</td>
+      <td>\${safeName}</td>
+      <td>
+        <button class="btn btn-g" onclick="removeBlacklistNum(\${JSON.stringify(num)})">✅ رفع الحظر</button>
+      </td>
+    </tr>\`;
+  }).join('');
+}
+
+async function addBlacklist() {
+  const num = document.getElementById('bl-num').value.replace(/\D/g,'');
+  if (!num) { toast('أدخل رقماً صحيحاً', '#f59e0b'); return; }
+  if (!confirm(\`حظر المستخدم \${num}؟ سيصله إشعار تلقائي.\`)) return;
+  const r = await api('addBlacklist', { num });
+  if (r.ok) { toast('⛔ تم الحظر وإشعار المستخدم'); document.getElementById('bl-num').value = ''; loadData(); }
+  else toast(r.msg || 'فشل', '#dc2626');
+}
+
+async function removeBlacklistNum(num) {
+  if (!confirm(\`رفع الحظر عن \${num}؟\`)) return;
+  const r = await api('removeBlacklist', { num });
+  if (r.ok) { toast('✅ تم رفع الحظر'); loadData(); }
+  else toast(r.msg || 'فشل', '#dc2626');
+}
+
+// إضافة زر حظر في جدول المستخدمين — مُنجز أعلاه في renderUsers
+
 async function doAction(action) {
   if (action === 'clearSessions' && !confirm('مسح كل الجلسات النشطة؟')) return;
   const r = await api(action);
@@ -1240,7 +1503,7 @@ setInterval(loadData, 30000);
 function buildWelcome(name) {
     const first    = name ? name.split(' ')[0] : null;
     const greeting = first ? `أهلاً ${first}` : 'أهلاً';
-    return `${greeting} 👋\n\nأنا *${BOT_NAME}*، مساعد ذكاء اصطناعي على واتساب.\n\nأستطيع مساعدتك في:\n• الإجابة على أي سؤال\n• تحليل الصور والصور الطبية\n• قراءة وتلخيص ملفات PDF\n• معلومات طبية وعلمية دقيقة\n\nفقط كلمني بشكل طبيعي وسأرد عليك 🤝`;
+    return `${greeting} 👋\n\nأنا *${BOT_NAME}*، مساعد ذكاء اصطناعي على واتساب.\n\nأستطيع مساعدتك في:\n• الإجابة على أي سؤال\n• تحليل الصور والصور الطبية 🖼️\n• قراءة وتلخيص ملفات PDF 📄\n• فهم الرسائل الصوتية 🎙️\n• معلومات طبية وعلمية دقيقة\n\n📋 *أوامر متاحة:*\n• !مساعدة — قائمة الأوامر\n• !مسح — مسح المحادثة\n• !رصيد — عرض رصيدك\n• !ملخص — تلخيص المحادثة\n\nفقط كلمني بشكل طبيعي وسأرد عليك 🤝`;
 }
 
 // ============================================================
@@ -1334,6 +1597,20 @@ async function startBot() {
 
             const isAdmin = sender === ADMIN_NUMBER;
             userChatLastSeen[sender] = Date.now(); // تحديث آخر نشاط
+
+            // ============================================================
+            // فحص الحظر (Blacklist) — قبل أي معالجة
+            // ============================================================
+            if (blacklist.includes(sender)) {
+                // نرسل رسالة الحظر مرة واحدة كل ساعة فقط (anti-spam)
+                const now = Date.now();
+                const lastNotify = _lastAdminNotify[`bl_${sender}`] || 0;
+                if (now - lastNotify > 60 * 60_000) {
+                    _lastAdminNotify[`bl_${sender}`] = now;
+                    await reply(BLACKLIST_MSG);
+                }
+                return;
+            }
 
             // استخراج نص الرسالة
             const body = (
@@ -1476,11 +1753,11 @@ async function startBot() {
                         return;
                     }
 
-                    // فحص حجم الملف (أقصى 10MB)
+                    // فحص حجم الملف (أقصى 1MB)
                     const fileSize = docMsg?.fileLength || 0;
-                    if (fileSize > 10 * 1024 * 1024) {
+                    if (fileSize > 1 * 1024 * 1024) {
                         await react('❌');
-                        await reply(`حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 10MB.`);
+                        await reply(`حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 1MB فقط.\n\nيرجى ضغط الملف أو إرسال جزء منه. 📄`);
                         return;
                     }
 
@@ -1617,16 +1894,78 @@ async function startBot() {
 
             // --- صوت ---
             if (msgType === 'audioMessage' || msgType === 'pttMessage') {
-                await react('ℹ️');
-                await reply(
-                    `عذراً، الرسائل الصوتية غير مدعومة حالياً.\n` +
-                    `يمكنك كتابة سؤالك نصياً وسأجيبك بكل سرور. ✍️`
-                );
+                if (!checkSpam(sender)) {
+                    await reply('⚠️ أرسلت رسائل بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
+                    return;
+                }
+                await react('🎙️');
+                try {
+                    const audioMsg = message.audioMessage || message.pttMessage;
+                    const mime = audioMsg?.mimetype || 'audio/ogg; codecs=opus';
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                        logger: { level: 'silent', child: () => ({ level: 'silent' }) }
+                    });
+                    if (!buffer || buffer.length === 0) {
+                        await react('❌');
+                        await reply('لم أتمكن من تنزيل الرسالة الصوتية، حاول مرة أخرى.');
+                        return;
+                    }
+
+                    // تحويل الصوت لنص عبر Whisper
+                    const transcript = await transcribeAudio(buffer, mime.split(';')[0]);
+                    if (!transcript) {
+                        await react('❌');
+                        await reply('لم أتمكن من فهم الرسالة الصوتية. تأكد أن الصوت واضح، أو اكتب رسالتك نصياً.');
+                        return;
+                    }
+
+                    console.log(`[Whisper] نص مستخرج: "${transcript.slice(0, 80)}"`);
+
+                    // الرد على النص المُستخرج
+                    const isVIPaudio = vipNumbers.includes(sender);
+                    if (!isAdmin && !isVIPaudio) {
+                        const quota = checkDailyMessages(sender);
+                        if (!quota.allowed) {
+                            await reply(`⚠️ وصلت للحد اليومي. رصيدك يتجدد منتصف الليل.`);
+                            return;
+                        }
+                    }
+
+                    if (!userChats[sender]) userChats[sender] = [];
+                    userChats[sender].push({ role: 'user', content: `[رسالة صوتية]: ${transcript}` });
+
+                    const res = await askAI([
+                        { role: 'system', content: getSystemPrompt() },
+                        ...userChats[sender]
+                    ]);
+                    userChats[sender].push({ role: 'assistant', content: res });
+
+                    stats.totalMessages++;
+                    saveData();
+
+                    // نرد بالنص المُستخرج + الرد
+                    await reply(`🎙️ *فهمت:* ${transcript}\n\n${res}`);
+                    await react('✅');
+                } catch (audioErr) {
+                    console.error('[audio]', audioErr.message);
+                    if (audioErr.message.includes('OPENAI_API_KEY')) {
+                        await react('ℹ️');
+                        await reply('⚠️ ميزة الصوت تحتاج إعداد OPENAI_API_KEY.\nيمكنك كتابة رسالتك نصياً في الوقت الحالي. ✍️');
+                    } else {
+                        await react('❌');
+                        await reply('عذراً، حدث خطأ في معالجة الرسالة الصوتية. حاول كتابة رسالتك نصياً.');
+                    }
+                }
                 return;
             }
 
             // --- نص ---
             if (!body) return;
+
+            // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص)
+            const isVIPcmd = vipNumbers.includes(sender);
+            const handledCmd = await handleUserCommand(body, sender, reply, react, isAdmin, isVIPcmd);
+            if (handledCmd) return;
 
             // anti-spam: منع الإرسال المتسارع جداً
             if (!checkSpam(sender)) {
@@ -1672,7 +2011,7 @@ async function startBot() {
             userChats[sender].push({ role: 'user', content: body });
 
             const res = await askAI([
-                { role: 'system', content: getSystemPrompt() },
+                { role: 'system', content: getSystemPrompt() + (userLanguages[sender] && userLanguages[sender] !== 'ar' ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLanguages[sender]}" فقط، حتى لو كتب بالعربية.` : '') },
                 ...userChats[sender]
             ]);
 
