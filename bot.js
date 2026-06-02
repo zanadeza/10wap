@@ -783,7 +783,12 @@ function startQRServer() {
         }
 
         // ===== API =====
-        if (url === '/api' && req.method === 'POST') {
+        if (url === '/api') {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+            if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+            if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
             let body = '';
             req.on('data', d => body += d);
             req.on('end', async () => {
@@ -907,18 +912,9 @@ function startQRServer() {
             return;
         }
 
-        // ===== DATA API (dashboard-only — requires Origin check) =====
+        // ===== DATA API =====
         if (url === '/data') {
-            // Block cross-origin / external access: only allow requests from the
-            // same server (no Origin header = same-origin fetch/XHR).
-            const origin = req.headers['origin'];
-            if (origin) {
-                // Requests from a browser page on a different origin include Origin.
-                // Reject them to prevent drive-by data extraction.
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: false, msg: 'Forbidden' }));
-                return;
-            }
+            res.setHeader('Access-Control-Allow-Origin', '*');
             const d = {
                 connected: isConnected,
                 hasQR: !!currentQR,
