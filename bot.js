@@ -818,22 +818,42 @@ function startQRServer() {
                         saveData();
                     }
                     else if (action === 'addBlacklist') {
-                        const num = (data.num || '').replace(/\D/g, '');
-                        if (num && !blacklist.includes(num)) {
-                            blacklist.push(num);
+                        const num = (data.num || '').replace(/[^0-9]/g, '');
+                        if (!num) { result = { ok: false, msg: 'رقم غير صحيح' }; }
+                        else if (num === ADMIN_NUMBER) { result = { ok: false, msg: 'لا يمكن حظر الأدمن' }; }
+                        else {
+                            if (!blacklist.includes(num)) {
+                                blacklist.push(num);
+                            }
                             saveData();
-                            // إشعار المحظور تلقائياً
+                            // إشعار المحظور فوراً
                             if (sock && isConnected) {
                                 try {
                                     await sock.sendMessage(`${num}@s.whatsapp.net`, { text: BLACKLIST_MSG });
-                                } catch (_) {}
+                                    result.notified = true;
+                                } catch (e) {
+                                    console.error('[blacklist notify]', e.message);
+                                    result.notified = false;
+                                }
+                            } else {
+                                result.notified = false;
+                                result.notifyReason = 'البوت غير متصل';
                             }
+                            result.msg = `تم حظر ${num}`;
                         }
                     }
                     else if (action === 'removeBlacklist') {
-                        const num = (data.num || '').replace(/\D/g, '');
+                        const num = (data.num || '').replace(/[^0-9]/g, '');
                         blacklist = blacklist.filter(n => n !== num);
                         saveData();
+                        // إشعار المستخدم برفع الحظر
+                        if (sock && isConnected && num) {
+                            try {
+                                await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                    text: '✅ تم رفع الحظر عنك. يمكنك الآن استخدام البوت مجدداً.'
+                                });
+                            } catch (_) {}
+                        }
                         result.msg = 'تم رفع الحظر';
                     }
                     else if (action === 'clearSessions') {
@@ -841,40 +861,52 @@ function startQRServer() {
                         result.msg = 'تم مسح الجلسات';
                     }
                     else if (action === 'setUserLimit') {
-                        // تعيين حد مخصص لمستخدم: { num, limit }
                         const num   = (data.num || '').replace(/\D/g, '');
                         const limit = parseInt(data.limit, 10);
                         if (!num || isNaN(limit) || limit < 0) {
                             result = { ok: false, msg: 'بيانات غير صحيحة' };
                         } else {
                             userLimits[num] = limit;
-                            // إعادة ضبط عداد اليوم ليطبّق الحد الجديد فوراً
-                            if (_userDailyLimit[num]) {
-                                _userDailyLimit[num].messages = 0;
-                            }
+                            // حذف سجل اليوم كاملاً حتى يُعاد إنشاؤه بالحد الجديد فوراً
+                            delete _userDailyLimit[num];
                             saveData();
-                            // إشعار المستخدم تلقائياً
+                            // إشعار المستخدم عبر واتساب
                             if (sock && isConnected) {
                                 try {
-                                    const jid = `${num}@s.whatsapp.net`;
-                                    const name = userNames[num] ? `${userNames[num]}` : '';
-                                    await sock.sendMessage(jid, {
-                                        text: `🎉 ${name ? `أهلاً ${name}، ` : ''}تم رفع حد رسائلك اليومي إلى *${limit}* رسالة!\n\nيمكنك الآن الاستمرار في المحادثة. 🚀`
-                                    });
+                                    const jidTarget = `${num}@s.whatsapp.net`;
+                                    const name = userNames[num] || '';
+                                    const notifyText =
+                                        `🎉 ${name ? `أهلاً ${name}، ` : ''}تم تعديل حد رسائلك اليومي إلى *${limit}* رسالة!\n\n` +
+                                        `يمكنك الآن الاستمرار في المحادثة. 🚀\n` +
+                                        `اكتب *!رصيد* لمعرفة رصيدك الحالي.`;
+                                    await sock.sendMessage(jidTarget, { text: notifyText });
+                                    result.notified = true;
                                 } catch (e) {
                                     console.error('[setUserLimit notify]', e.message);
+                                    result.notified = false;
                                 }
+                            } else {
+                                result.notified = false;
+                                result.notifyReason = 'البوت غير متصل';
                             }
                             result.msg = `تم تعيين حد ${limit} رسالة للمستخدم ${num}`;
                         }
                     }
                     else if (action === 'resetUserLimit') {
-                        // إعادة المستخدم للحد الافتراضي
                         const num = (data.num || '').replace(/\D/g, '');
                         if (num) {
                             delete userLimits[num];
-                            if (_userDailyLimit[num]) _userDailyLimit[num].messages = 0;
+                            delete _userDailyLimit[num]; // حذف السجل كاملاً
                             saveData();
+                            // إشعار المستخدم
+                            if (sock && isConnected) {
+                                try {
+                                    const name = userNames[num] || '';
+                                    await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                        text: `🔄 ${name ? `أهلاً ${name}، ` : ''}تمت إعادة حد رسائلك للافتراضي (${DAILY_MSG_LIMIT} رسالة/يوم).`
+                                    });
+                                } catch (_) {}
+                            }
                         }
                         result.msg = 'تم إعادة الحد للافتراضي';
                     }
@@ -1434,7 +1466,8 @@ async function setUserLimit() {
   if (isNaN(limit) || limit < 0) { toast('أدخل عدداً صحيحاً', '#f59e0b'); return; }
   const r = await api('setUserLimit', { num, limit });
   if (r.ok) {
-    toast('✅ تم تعيين الحد وإشعار المستخدم');
+    const notifyMsg = r.notified ? '✅ تم تعيين الحد وأُرسل إشعار للمستخدم عبر واتساب' : ('✅ تم تعيين الحد — ' + (r.notifyReason || 'البوت غير متصل، لم يُرسل إشعار'));
+    toast(notifyMsg, r.notified ? '#22c55e' : '#f59e0b');
     document.getElementById('limit-num').value = '';
     document.getElementById('limit-val').value = '';
     loadData();
@@ -1468,8 +1501,11 @@ async function quickSetLimit(num) {
   const limit = parseInt(val, 10);
   if (isNaN(limit) || limit < 0) { toast('رقم غير صحيح', '#f59e0b'); return; }
   const r = await api('setUserLimit', { num, limit });
-  if (r.ok) { toast('✅ تم وتم إشعار المستخدم'); loadData(); }
-  else toast(r.msg || 'فشل', '#dc2626');
+  if (r.ok) {
+    const m = r.notified ? '✅ تم التعيين وأُرسل إشعار واتساب' : ('✅ تم التعيين — ' + (r.notifyReason || 'البوت غير متصل'));
+    toast(m, r.notified ? '#22c55e' : '#f59e0b');
+    loadData();
+  } else toast(r.msg || 'فشل', '#dc2626');
 }
 
 async function addVipNum(num) {
@@ -1515,10 +1551,14 @@ function renderBlacklist(d) {
 async function addBlacklist() {
   const num = document.getElementById('bl-num').value.replace(/\D/g,'');
   if (!num) { toast('أدخل رقماً صحيحاً', '#f59e0b'); return; }
-  if (!confirm(\`حظر المستخدم \${num}؟ سيصله إشعار تلقائي.\`)) return;
+  if (!confirm('حظر المستخدم ${num}؟ سيصله إشعار فوري عبر واتساب.')) return;
   const r = await api('addBlacklist', { num });
-  if (r.ok) { toast('⛔ تم الحظر وإشعار المستخدم'); document.getElementById('bl-num').value = ''; loadData(); }
-  else toast(r.msg || 'فشل', '#dc2626');
+  if (r.ok) {
+    const m = r.notified ? '⛔ تم الحظر وأُرسل إشعار واتساب للمستخدم' : ('⛔ تم الحظر — ' + (r.notifyReason || 'البوت غير متصل'));
+    toast(m, '#dc2626');
+    document.getElementById('bl-num').value = '';
+    loadData();
+  } else toast(r.msg || 'فشل', '#dc2626');
 }
 
 async function removeBlacklistNum(num) {
@@ -1682,21 +1722,7 @@ async function startBot() {
             if (!sender) return;
 
             const isAdmin = sender === ADMIN_NUMBER;
-            userChatLastSeen[sender] = Date.now(); // تحديث آخر نشاط
-
-            // ============================================================
-            // فحص الحظر (Blacklist) — قبل أي معالجة
-            // ============================================================
-            if (blacklist.includes(sender)) {
-                // نرسل رسالة الحظر مرة واحدة كل ساعة فقط (anti-spam)
-                const now = Date.now();
-                const lastNotify = _lastAdminNotify[`bl_${sender}`] || 0;
-                if (now - lastNotify > 60 * 60_000) {
-                    _lastAdminNotify[`bl_${sender}`] = now;
-                    await reply(BLACKLIST_MSG);
-                }
-                return;
-            }
+            userChatLastSeen[sender] = Date.now();
 
             // استخراج نص الرسالة
             const body = (
@@ -1710,6 +1736,7 @@ async function startBot() {
 
             console.log(`📨 [${isAdmin ? 'ADMIN' : 'USER'}] ${sender} | ${msgType} | "${body.slice(0, 50)}"`);
 
+            // reply و react معرّفتان أولاً حتى يمكن استخدامهما في كل مكان
             const reply = async (text) => {
                 try {
                     await sock.sendMessage(jid, { text }, { quoted: msg });
@@ -1723,6 +1750,19 @@ async function startBot() {
                     await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
                 } catch {}
             };
+
+            // ============================================================
+            // فحص الحظر (Blacklist) — بعد تعريف reply مباشرةً
+            // ============================================================
+            if (blacklist.includes(sender)) {
+                const blNow = Date.now();
+                const lastNotify = _lastAdminNotify[`bl_${sender}`] || 0;
+                if (blNow - lastNotify > 60 * 60_000) {
+                    _lastAdminNotify[`bl_${sender}`] = blNow;
+                    await reply(BLACKLIST_MSG);
+                }
+                return;
+            }
 
             // ============================================================
             // أوامر الأدمن — تُدار من لوحة التحكم فقط
