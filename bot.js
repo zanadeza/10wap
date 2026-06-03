@@ -1761,9 +1761,22 @@ function buildWelcome(name) {
 // ============================================================
 // MAIN BOT
 // ============================================================
+let _cachedBaileysVersion = null; // cache لتجنب network call عند كل إعادة اتصال
+
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('./session');
-    const { version }          = await fetchLatestBaileysVersion();
+
+    // جلب الإصدار مرة واحدة فقط — إذا فشل النت نستخدم النسخة المحفوظة
+    if (!_cachedBaileysVersion) {
+        try {
+            const result = await fetchLatestBaileysVersion();
+            _cachedBaileysVersion = result.version;
+        } catch (e) {
+            console.warn('[startBot] fetchLatestBaileysVersion فشل، سيُستخدم الإصدار الافتراضي:', e.message);
+            _cachedBaileysVersion = [2, 3000, 1015901307]; // fallback إصدار ثابت
+        }
+    }
+    const version = _cachedBaileysVersion;
 
     sock = makeWASocket({
         version,
@@ -1797,25 +1810,23 @@ async function startBot() {
             if (shouldReconnect) {
                 if (!isReconnecting) {
                     isReconnecting = true;
-                    // backoff مستمر حتى يعود الاتصال — الـ delay يتراكم عبر كل المحاولات
-                    // ولا يُعاد تصفيره إلا عند نجاح الاتصال (connection === 'open')
-                    let reconnectDelay = 5_000;
+                    let attempt = 0;
+                    // المحاولة الأولى بعد ثانية واحدة فقط، ثم backoff تدريجي أقصاه 30 ثانية
+                    const DELAYS = [1_000, 2_000, 5_000, 10_000, 15_000, 30_000];
                     const tryReconnect = () => {
-                        console.log(`🔄 محاولة إعادة الاتصال خلال ${reconnectDelay / 1000}ث...`);
+                        const delay = DELAYS[Math.min(attempt, DELAYS.length - 1)];
+                        attempt++;
+                        console.log(`🔄 محاولة إعادة الاتصال #${attempt} خلال ${delay / 1000}ث...`);
                         setTimeout(async () => {
                             try {
+                                isReconnecting = false;
                                 await startBot();
-                                // startBot ستُطلق connection=open عند النجاح
-                                // وستُطلق connection=close مجدداً عند الفشل
-                                // — لا نُعيد isReconnecting هنا لأن startBot تبدأ listener جديد
                             } catch (e) {
                                 console.error('[reconnect] فشلت المحاولة:', e.message);
-                                // المحاولة فشلت قبل أن يبدأ الـ socket — نعيد المحاولة يدوياً
-                                reconnectDelay = Math.min(reconnectDelay * 2, 120_000);
+                                isReconnecting = true;
                                 tryReconnect();
                             }
-                        }, reconnectDelay);
-                        reconnectDelay = Math.min(reconnectDelay * 2, 120_000); // أقصى دقيقتين
+                        }, delay);
                     };
                     tryReconnect();
                 }
@@ -1824,7 +1835,6 @@ async function startBot() {
                 isReconnecting = false;
             }
         }
-        // عند نجاح الاتصال: أعد تصفير حالة إعادة الاتصال
         if (connection === 'open') {
             isReconnecting = false;
         }
