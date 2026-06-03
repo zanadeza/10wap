@@ -1761,27 +1761,15 @@ function buildWelcome(name) {
 // ============================================================
 // MAIN BOT
 // ============================================================
-let _cachedBaileysVersion = null; // cache لتجنب network call عند كل إعادة اتصال
-
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('./session');
-
-    // جلب الإصدار مرة واحدة فقط — إذا فشل النت نستخدم النسخة المحفوظة
-    if (!_cachedBaileysVersion) {
-        try {
-            const result = await fetchLatestBaileysVersion();
-            _cachedBaileysVersion = result.version;
-        } catch (e) {
-            console.warn('[startBot] fetchLatestBaileysVersion فشل، سيُستخدم الإصدار الافتراضي:', e.message);
-            _cachedBaileysVersion = [2, 3000, 1015901307]; // fallback إصدار ثابت
-        }
-    }
-    const version = _cachedBaileysVersion;
+    const { version }          = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
         version,
         auth:    state,
-        browser: Browsers.macOS('Desktop')
+        browser: Browsers.macOS('Desktop'),
+        syncFullHistory: true   // جلب الرسائل الفائتة عند إعادة الاتصال
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -1841,10 +1829,17 @@ async function startBot() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+        // 'notify' = رسالة جديدة عادية
+        // 'append' = رسائل فائتة وصلت وقت البوت كان مقفّل
+        if (type !== 'notify' && type !== 'append') return;
 
-        const msg = messages?.[0];
-        if (!msg?.message || msg?.key?.fromMe) return;
+        const msgList = type === 'append' ? messages : [messages?.[0]];
+
+        for (const msg of msgList) {
+        if (!msg?.message || msg?.key?.fromMe) continue;
+        // تجاهل الرسائل القديمة أكثر من 10 دقائق (فقط في حالة append)
+        const msgTs = (msg.messageTimestamp || 0) * 1000;
+        if (type === 'append' && Date.now() - msgTs > 10 * 60 * 1000) continue;
 
         try {
             const message = msg.message || {};
@@ -1857,10 +1852,10 @@ async function startBot() {
             const msgType = Object.keys(message).find(
                 k => message[k] != null && !IGNORED_TYPES.has(k)
             );
-            if (!msgType) return;
+            if (!msgType) continue;
 
             const jid     = msg.key?.remoteJid;
-            if (!jid) return;
+            if (!jid) continue;
 
             // تحديد نوع المحادثة
             const isGroup = jid.endsWith('@g.us');
@@ -2313,6 +2308,7 @@ async function startBot() {
                 );
             } catch {}
         }
+        } // نهاية for loop (معالجة الرسائل الفائتة)
     });
 }
 
