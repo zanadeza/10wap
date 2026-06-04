@@ -92,6 +92,7 @@ saveData();
 
 let userChats       = {};   // سياق المحادثة (RAM فقط)
 let userChatLastSeen = {}; // آخر نشاط لكل مستخدم
+let userModes       = {};  // وضع كل مستخدم: 'terms' | 'pharma' | 'medai' | 'openai' | null
 let sock            = null;
 let isReconnecting  = false; // منع الاتصال المتعدد
 
@@ -224,6 +225,160 @@ function getSystemPrompt() {
     const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
     _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب.\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)\nاستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.\n\nشخصيتك:\n- مساعد شامل ومتعدد المعرفة: تجيب على أي سؤال في أي مجال بدون استثناء\n- جدي ومهني، ردودك دقيقة ومباشرة بدون حشو أو مقدمات زائدة\n- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها فوراً\n- أعطِ المعلومة الكاملة والصحيحة من أول رد\n- نظّم ردودك بشكل واضح: استخدم النقاط والعناوين والترقيم عند الحاجة لتسهيل القراءة\n- لا تستخدم مصطلحات أجنبية غير ضرورية\n- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد\n- إذا سُئلت عن اسمك قل: أنا MedTerm، مساعد ذكاء اصطناعي\n- تتعامل مع جميع المستخدمين باحترام بغض النظر عن جنسيتهم أو لغتهم\n\nمجالات خبرتك (غير محدودة):\n- الطب والصحة: معلومات دقيقة، أدوية، جرعات، أعراض، تشخيص أولي — مع التنبيه بمراجعة الطبيب للحالات الجدية\n- العلوم والتقنية: برمجة، ذكاء اصطناعي، رياضيات، فيزياء، كيمياء\n- القانون والأعمال: معلومات عامة، عقود، ريادة أعمال، تسويق\n- التاريخ والجغرافيا والثقافة العامة\n- الدين والفقه: إجابات موضوعية ومتوازنة\n- الأدب والكتابة والترجمة\n- الطبخ والسفر ونمط الحياة\n- أي موضوع آخر يسألك عنه المستخدم\n\nقاعدة ذهبية: لا تقل أبداً "هذا خارج نطاق تخصصي" — أجب على كل سؤال بأفضل ما لديك.\n\nاسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`
     return _cachedSystemPrompt;
+}
+
+// ============================================================
+// SYSTEM PROMPTS للأنظمة الأربعة
+// ============================================================
+const MODE_PROMPTS = {
+    terms: `أنت متخصص في المصطلحات الطبية فقط. مهمتك الوحيدة هي شرح المصطلحات الطبية.
+إذا أرسل المستخدم أي شيء ليس مصطلحاً طبياً، رد عليه بهذه الرسالة فقط:
+"⚠️ الرجاء كتابة مصطلح طبي صحيح.
+أمثلة على مصطلحات طبية:
+• عربي: التهاب السحايا، الذبحة الصدرية، السكتة الدماغية
+• إنجليزي: Meningitis, Angina, Stroke"
+
+إذا أرسل المستخدم مصطلحاً طبياً (بالعربية أو الإنجليزية)، اردّ عليه بهذا النموذج الثابت بالضبط:
+
+📌 المصطلح
+[المصطلح كما كتبه المستخدم]
+
+────────────
+
+📝 الصيغة العربية
+[الاسم بالعربية]
+
+🗣️ النطق
+[النطق الصوتي بالعربية]
+
+🔸 المعنى
+[شرح مختصر جداً في سطر واحد]
+
+📖 الشرح
+[شرح طبي كامل ومفهوم بالعربية]
+
+⚕️ التخصص الطبي
+[مثل: طب الأعصاب / أمراض القلب / ...]
+
+📚 مصطلحات مشابهة
+[3-4 مصطلحات طبية ذات صلة]
+
+────────────
+💡 لتغيير النظام اكتب: !قائمة`,
+
+    pharma: `أنت صيدلاني متخصص وخبير في علم الأدوية لجميع التخصصات الطبية. أجب على أي سؤال يتعلق بالأدوية.
+عندما يسأل المستخدم عن دواء أو مادة فعّالة، اردّ بهذا النموذج الثابت:
+
+⭐ [الاسم العلمي بالإنجليزية] — [الاسم بالعربية]
+
+---
+
+1) الاسم العلمي — Scientific Name
+العربية: [الاسم]
+English: [The name]
+
+---
+
+2) الأسماء التجارية — Trade Names
+[قائمة الأسماء التجارية المشهورة]
+
+---
+
+3) التصنيف الدوائي — Drug Class
+العربية: [التصنيف]
+English: [Classification]
+
+---
+
+4) آلية العمل — Mechanism of Action
+العربية: [الشرح]
+English: [Explanation]
+
+---
+
+5) الاستخدامات — Indications
+العربية: [القائمة]
+English: [List]
+
+---
+
+6) الجرعة — Dosage
+العربية: [الجرعة المعتادة]
+English: [Usual dose]
+
+---
+
+7) الآثار الجانبية — Side Effects
+العربية: [الشائعة والخطيرة]
+English: [Common & serious]
+
+---
+
+8) موانع الاستعمال — Contraindications
+العربية: [القائمة]
+English: [List]
+
+---
+
+9) التفاعلات الدوائية — Drug Interactions
+العربية: [أهم التفاعلات]
+English: [Key interactions]
+
+---
+
+⚠️ تنبيه: هذه المعلومات للتثقيف الصحي فقط. استشر طبيبك أو صيدلانيك قبل أخذ أي دواء.
+
+────────────
+💡 لتغيير النظام اكتب: !قائمة`,
+
+    medai: `أنت مساعد طبي ذكي ومتخصص في جميع التخصصات الطبية والعلوم الصحية. أجب على أي سؤال طبي بدقة ومهنية.
+تشمل تخصصاتك: الطب العام، الجراحة، الأمراض الباطنية، طب الأطفال، أمراض النساء والتوليد، الأمراض العصبية، أمراض القلب، الأمراض الجلدية، طب العيون، طب الأسنان، الطب النفسي، التغذية والصحة العامة، وجميع التخصصات الأخرى.
+إذا سأل المستخدم عن موضوع خارج المجال الطبي تماماً، رد بـ:
+"⚕️ هذا النظام مخصص للمجال الطبي فقط. يرجى طرح أسئلة طبية أو صحية.
+💡 للانتقال لنظام مفتوح اكتب: !قائمة"
+اختم ردودك الطبية دائماً بـ: "⚠️ للتشخيص والعلاج يجب مراجعة طبيب متخصص."
+────────────
+💡 لتغيير النظام اكتب: !قائمة`,
+
+    openai: null  // يستخدم getSystemPrompt() الأصلي
+};
+
+// رسالة القائمة الرئيسية
+function buildModeMenu(name) {
+    const first = name ? name.split(' ')[0] : null;
+    const greeting = first ? `أهلاً ${first}` : 'أهلاً';
+    return `${greeting} 👋\n\n*اختر النظام الذي تريده:*\n\n` +
+        `1️⃣ *المصطلحات الطبية*\nشرح المصطلحات الطبية بالعربي والإنجليزي\n\n` +
+        `2️⃣ *علم الأدوية*\nمعلومات شاملة عن الأدوية لجميع التخصصات\n\n` +
+        `3️⃣ *ذكاء صناعي طبي*\nإجابة على جميع الأسئلة الطبية\n\n` +
+        `4️⃣ *ذكاء صناعي عام*\nمساعد عام مفتوح بدون قيود\n\n` +
+        `─────────────────\n` +
+        `📩 *اكتب رقم خيارك (1-4) للبدء*`;
+}
+
+// اسم وأيقونة النظام الحالي
+function getModeName(mode) {
+    const names = {
+        terms:  '📌 المصطلحات الطبية',
+        pharma: '💊 علم الأدوية',
+        medai:  '⚕️ ذكاء صناعي طبي',
+        openai: '🤖 ذكاء صناعي عام'
+    };
+    return names[mode] || 'غير محدد';
+}
+
+// System prompt للنظام الحالي
+function getModeSystemPrompt(mode) {
+    if (!mode || mode === 'openai') return getSystemPrompt();
+    const base = MODE_PROMPTS[mode];
+    if (!base) return getSystemPrompt();
+    // نضيف معلومات التاريخ والوقت من getSystemPrompt
+    const now = nowJerusalem();
+    const days = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+    const months = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+    const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
+    const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+    return `${base}\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)`;
 }
 
 const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. حلّل الصورة الطبية بدقة عالية.
@@ -606,6 +761,8 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     if (command === '!مساعدة' || command === '!help') {
         await reply(
             `📋 *قائمة الأوامر المتاحة:*\n\n` +
+            `• *!قائمة* — عرض قائمة الأنظمة الأربعة\n` +
+            `• *!وضع* — عرض النظام الحالي\n` +
             `• *!مساعدة* — عرض هذه القائمة\n` +
             `• *!مسح* — مسح سياق المحادثة والبدء من جديد\n` +
             `• *!رصيد* — عرض عدد الرسائل المتبقية اليوم\n` +
@@ -619,8 +776,9 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     // !مسح — مسح سياق المحادثة
     if (command === '!مسح' || command === '!reset') {
         userChats[sender] = [];
+        delete userModes[sender];
         await react('✅');
-        await reply('🗑️ تم مسح سياق المحادثة. ابدأ محادثة جديدة!');
+        await reply(`🗑️ تم مسح سياق المحادثة.\n\n${buildModeMenu(userNames[sender] || '')}`);
         return true;
     }
 
@@ -690,6 +848,23 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
         } catch (e) {
             await reply('عذراً، حدث خطأ أثناء التلخيص. حاول مرة أخرى.');
             await react('❌');
+        }
+        return true;
+    }
+
+    // !قائمة — عرض قائمة الأنظمة
+    if (command === '!قائمة' || command === '!menu' || command === '!modes') {
+        await reply(buildModeMenu(userNames[sender] || ''));
+        return true;
+    }
+
+    // !وضع — عرض الوضع الحالي
+    if (command === '!وضع' || command === '!mode') {
+        const mode = userModes[sender] || null;
+        if (!mode) {
+            await reply(`ℹ️ لم تختر نظاماً بعد.\n\n${buildModeMenu(userNames[sender] || '')}`);
+        } else {
+            await reply(`📍 *نظامك الحالي:* ${getModeName(mode)}\n\nللتغيير اكتب: *!قائمة*`);
         }
         return true;
     }
@@ -1753,9 +1928,7 @@ setInterval(loadData,30000);
 // WELCOME MESSAGE
 // ============================================================
 function buildWelcome(name) {
-    const first    = name ? name.split(' ')[0] : null;
-    const greeting = first ? `أهلاً ${first}` : 'أهلاً';
-    return `${greeting} 👋\n\nأنا *${BOT_NAME}*، مساعد ذكاء اصطناعي على واتساب.\n\nأستطيع مساعدتك في:\n• الإجابة على أي سؤال\n• تحليل الصور والصور الطبية 🖼️\n• قراءة وتلخيص ملفات PDF 📄\n• فهم الرسائل الصوتية 🎙️\n• معلومات طبية وعلمية دقيقة\n\n📋 *أوامر متاحة:*\n• !مساعدة — قائمة الأوامر\n• !مسح — مسح المحادثة\n• !رصيد — عرض رصيدك\n• !ملخص — تلخيص المحادثة\n\nفقط كلمني بشكل طبيعي وسأرد عليك 🤝`;
+    return buildModeMenu(name);
 }
 
 // ============================================================
@@ -2240,10 +2413,78 @@ async function startBot() {
             // --- نص ---
             if (!body) return;
 
-            // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص)
+            // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص، !قائمة، !وضع) — تعمل دائماً بغض النظر عن النظام
             const isVIPcmd = vipNumbers.includes(sender);
             const handledCmd = await handleUserCommand(body, sender, reply, react, isAdmin, isVIPcmd);
             if (handledCmd) return;
+
+            // ============================================================
+            // اختيار النظام (إذا لم يكن المستخدم قد اختار بعد، أو عند الاختيار)
+            // ============================================================
+            const currentMode = userModes[sender] || null;
+
+            // إذا لم يختر المستخدم نظاماً بعد، انتظر اختياره
+            if (!currentMode) {
+                // فحص إذا أرسل رقم الاختيار
+                const choiceMap = { '1': 'terms', '2': 'pharma', '3': 'medai', '4': 'openai' };
+                const trimmed = body.trim();
+                const choice = choiceMap[trimmed];
+                if (choice) {
+                    userModes[sender] = choice;
+                    userChats[sender] = [];
+                    const modeNames = {
+                        terms:  'المصطلحات الطبية 📌',
+                        pharma: 'علم الأدوية 💊',
+                        medai:  'الذكاء الصناعي الطبي ⚕️',
+                        openai: 'الذكاء الصناعي العام 🤖'
+                    };
+                    const modeDescriptions = {
+                        terms:  'أرسل أي مصطلح طبي بالعربي أو الإنجليزي وسأشرحه لك بالتفصيل.',
+                        pharma: 'أرسل اسم أي دواء أو مادة فعّالة وسأعطيك معلومات كاملة عنه.',
+                        medai:  'اسألني أي سؤال طبي وسأجيبك بشكل مهني ودقيق.',
+                        openai: 'اسألني عن أي شيء! أنا مساعد عام بدون قيود.'
+                    };
+                    await react('✅');
+                    await reply(
+                        `✅ *تم تفعيل نظام: ${modeNames[choice]}*\n\n` +
+                        `${modeDescriptions[choice]}\n\n` +
+                        `💡 لتغيير النظام اكتب: *!قائمة*`
+                    );
+                    return;
+                }
+                // إذا أرسل شيئاً غير رقم، اطلب منه الاختيار
+                await reply(buildModeMenu(userName || ''));
+                return;
+            }
+
+            // المستخدم في نظام — هل يريد تغييره؟ (أرسل رقم 1-4)
+            if (/^[1-4]$/.test(body.trim())) {
+                const choiceMap2 = { '1': 'terms', '2': 'pharma', '3': 'medai', '4': 'openai' };
+                const newMode = choiceMap2[body.trim()];
+                if (newMode && newMode !== currentMode) {
+                    userModes[sender] = newMode;
+                    userChats[sender] = [];
+                    const modeNames = {
+                        terms:  'المصطلحات الطبية 📌',
+                        pharma: 'علم الأدوية 💊',
+                        medai:  'الذكاء الصناعي الطبي ⚕️',
+                        openai: 'الذكاء الصناعي العام 🤖'
+                    };
+                    const modeDescriptions = {
+                        terms:  'أرسل أي مصطلح طبي بالعربي أو الإنجليزي وسأشرحه لك بالتفصيل.',
+                        pharma: 'أرسل اسم أي دواء أو مادة فعّالة وسأعطيك معلومات كاملة عنه.',
+                        medai:  'اسألني أي سؤال طبي وسأجيبك بشكل مهني ودقيق.',
+                        openai: 'اسألني عن أي شيء! أنا مساعد عام بدون قيود.'
+                    };
+                    await react('✅');
+                    await reply(
+                        `🔄 *تم التبديل إلى نظام: ${modeNames[newMode]}*\n\n` +
+                        `${modeDescriptions[newMode]}\n\n` +
+                        `💡 لتغيير النظام اكتب: *!قائمة*`
+                    );
+                    return;
+                }
+            }
 
             // anti-spam: منع الإرسال المتسارع جداً
             if (!checkSpam(sender)) {
@@ -2269,7 +2510,7 @@ async function startBot() {
 
             await react('👍');
 
-            const maxHist = isVIP ? 60 : MAX_HISTORY; // VIP يحصل على سياق أطول
+            const maxHist = isVIP ? 60 : MAX_HISTORY;
 
             if (!userChats[sender]) userChats[sender] = [];
 
@@ -2288,8 +2529,14 @@ async function startBot() {
 
             userChats[sender].push({ role: 'user', content: body });
 
+            // اختيار system prompt بناءً على النظام الحالي
+            const modeSystemPrompt = getModeSystemPrompt(currentMode) +
+                (userLanguages[sender] && userLanguages[sender] !== 'ar'
+                    ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLanguages[sender]}" فقط، حتى لو كتب بالعربية.`
+                    : '');
+
             const res = await askAI([
-                { role: 'system', content: getSystemPrompt() + (userLanguages[sender] && userLanguages[sender] !== 'ar' ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLanguages[sender]}" فقط، حتى لو كتب بالعربية.` : '') },
+                { role: 'system', content: modeSystemPrompt },
                 ...userChats[sender]
             ]);
 
@@ -2297,6 +2544,7 @@ async function startBot() {
 
             await reply(res);
             await react('✅');
+
 
         } catch (error) {
             console.error('[messages.upsert]', error.message);
