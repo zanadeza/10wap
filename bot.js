@@ -2465,7 +2465,6 @@ async function startBot() {
                         }
                         return;
                     }
-                    }
 
                     // حفظ السياق: السؤال + الرد الحقيقي فقط (بدون تكرار)
                     if (!userChats[sender]) userChats[sender] = [];
