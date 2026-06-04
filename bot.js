@@ -766,23 +766,21 @@ function isMedicalImage(text) {
 
 async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
     try {
-        // إذا ما في نص: نفترض أنها قد تكون طبية ونستخدم MEDICAL_IMAGE_PROMPT احتياطاً
-        // لأن isMedicalImage('') تعيد false دائماً وتفوّت التحليل الطبي
-        const isMedical    = isMedicalImage(userQuestion) || !userQuestion?.trim();
-        const systemToUse  = isMedical ? MEDICAL_IMAGE_PROMPT : getSystemPrompt();
-        const mime         = mimeType || 'image/jpeg';
+        const mime = mimeType || 'image/jpeg';
+        const hasQuestion = userQuestion && userQuestion.trim().length > 0;
 
-        // إذا ما في سؤال: استخرج النص أولاً ثم اشرح
-        const hasQuestion  = userQuestion && userQuestion.trim().length > 0;
+        // السيستم برومت العام — يقبل أي صورة بدون قيود
+        const systemToUse = getSystemPrompt();
+
+        // إذا ما في سؤال: وصف عام شامل
         const questionText = hasQuestion
             ? userQuestion
-            : isMedical
-                ? 'حلل هذه الصورة الطبية بالتفصيل الكامل، واذكر كل ما تراه'
-                : `افحص هذه الصورة بدقة عالية:
-1. إذا فيها نص أو كلام أو أرقام: اقرأه كاملاً كما هو بالضبط دون أي تغيير
-2. إذا فيها جدول أو بيانات: اكتبها منظمة
-3. اشرح محتوى الصورة بالتفصيل
-كن دقيقاً جداً في قراءة النصوص ولا تخمّن`;
+            : `حلل هذه الصورة بالتفصيل الكامل:
+1. اشرح ما تراه في الصورة بدقة
+2. إذا فيها نصوص أو أرقام: اقرأها كاملاً كما هي
+3. إذا فيها جدول أو بيانات: اعرضها منظمة
+4. إذا كانت صورة طبية أو أشعة: حللها طبياً بالتفصيل
+5. أجب على أي سؤال يتعلق بمحتوى الصورة`;
 
         const prompt = userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText;
 
@@ -798,8 +796,8 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
                     ]
                 }
             ],
-            max_tokens: isMedical ? 2500 : 2000,
-            temperature: isMedical ? 0.2 : 0.3
+            max_tokens: 2500,
+            temperature: 0.3
         });
 
     } catch (e) {
@@ -2320,9 +2318,7 @@ async function startBot() {
                         await reply('لم أتمكن من تنزيل الصورة، يرجى المحاولة مرة أخرى.');
                         return;
                     }
-                    const isMed = isMedicalImage(body);
                     stats.totalImages++;
-                    if (isMed) stats.totalMedical++;
                     saveData();
                     const res = await askAIWithImage(buffer.toString('base64'), body, userName, mime);
                     // حفظ وصف الصورة في السياق
