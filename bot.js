@@ -491,51 +491,59 @@ function extractTermForTTS(botReply) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (Google Translate TTS — يعمل بدون تثبيت أي شيء)
+// TEXT-TO-SPEECH (Google Translate TTS → ffmpeg → OGG Opus)
 // ============================================================
+const { execFile } = require('child_process');
+const os           = require('os');
+
 async function generateTTS(text, lang = 'en') {
-    const ttsLang = lang === 'ar' ? 'ar' : 'en';
-    // نأخذ أول 100 حرف فقط لأن Google TTS له حد
+    const ttsLang   = lang === 'ar' ? 'ar' : 'en';
     const cleanText = text.slice(0, 100).replace(/[^\w\s\u0600-\u06FF]/g, '');
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=${ttsLang}&client=tw-ob&ttsspeed=0.9`;
 
-    try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (!buffer || buffer.length < 100) throw new Error(`الملف الصوتي فارغ أو تالف (${buffer?.length} bytes)`);
-        console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${buffer.length} bytes`);
-        return buffer;
-    } catch (err) {
-        console.error('[TTS] فشل:', err.message);
-        throw new Error('Google TTS فشل');
-    }
+    // الخطوة 1: جلب MP3 من Google TTS
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Google TTS HTTP ${response.status}`);
+    const mp3Buffer = Buffer.from(await response.arrayBuffer());
+    if (!mp3Buffer || mp3Buffer.length < 100) throw new Error(`MP3 فارغ (${mp3Buffer?.length} bytes)`);
+
+    // الخطوة 2: تحويل MP3 → OGG Opus عبر ffmpeg (WhatsApp يحتاج Opus)
+    const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const mp3File = require('path').join(os.tmpdir(), `tts_${tmpId}.mp3`);
+    const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}.ogg`);
+
+    await require('fs').promises.writeFile(mp3File, mp3Buffer);
+
+    await new Promise((resolve, reject) => {
+        execFile('ffmpeg', [
+            '-y', '-i', mp3File,
+            '-c:a', 'libopus',
+            '-b:a', '32k',
+            '-vn',
+            oggFile
+        ], { timeout: 15_000 }, (err) => {
+            require('fs').unlink(mp3File, () => {});
+            if (err) return reject(new Error(`ffmpeg فشل: ${err.message}`));
+            resolve();
+        });
+    });
+
+    const oggBuffer = await require('fs').promises.readFile(oggFile);
+    require('fs').unlink(oggFile, () => {});
+
+    if (!oggBuffer || oggBuffer.length < 100) throw new Error(`OGG فارغ (${oggBuffer?.length} bytes)`);
+    console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${oggBuffer.length} bytes`);
+    return oggBuffer;
 }
 
-// إرسال voice note لـ WhatsApp — يجرب صيغتين مختلفتين
+// إرسال voice note لـ WhatsApp
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
     const opts = quotedMsg ? { quoted: quotedMsg } : {};
-    try {
-        // الصيغة الأولى: MP3 (Google TTS يرجع MP3)
-        await sock.sendMessage(jid, {
-            audio:    audioBuffer,
-            mimetype: 'audio/mpeg',
-            ptt:      true
-        }, opts);
-    } catch (e1) {
-        console.warn('[sendVoiceNote] MP3 فشل، أحاول OGG...', e1.message);
-        try {
-            // الصيغة الثانية: OGG كـ fallback
-            await sock.sendMessage(jid, {
-                audio:    audioBuffer,
-                mimetype: 'audio/ogg; codecs=opus',
-                ptt:      true
-            }, opts);
-        } catch (e2) {
-            console.error('[sendVoiceNote] كلا الصيغتين فشلتا:', e2.message);
-            throw e2;
-        }
-    }
+    await sock.sendMessage(jid, {
+        audio:    audioBuffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt:      true
+    }, opts);
 }
 
 // تنظيف TTS pending المنتهية كل 10 دقائق
