@@ -2390,89 +2390,69 @@ async function startBot() {
                         return;
                     }
 
-                    // استخراج النص
-                    let docText = '';
+                    // تحويل PDF دائماً لصور بـ mutool (يقرأ النص والصور معاً)
+                    console.log(`[PDF] جاري تحويل "${fileName}" بـ mutool...`);
+                    const tmpDir = `${os.tmpdir()}/pdf_${sender}_${Date.now()}`;
+                    try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (_) {}
                     try {
-                        const parsed = await pdfParse(buffer);
-                        docText = (parsed.text || '').trim();
-                        console.log(`[PDF] استُخرج ${docText.length} حرف من "${fileName}"`);
-                    } catch (pdfErr) {
-                        console.error('[pdf-parse]', pdfErr.message);
-                    }
+                        const pdfPath = `${tmpDir}/input.pdf`;
+                        fs.writeFileSync(pdfPath, buffer);
 
-                    // لو النص فارغ: الـ PDF مصوّر - نحوّل صفحاته لصور JPG عبر mutool
-                    if (!docText || docText.length < 10) {
-                        console.log(`[PDF] "${fileName}" مصوّر، جاري تحويله بـ mutool...`);
-                        const tmpDir = `${os.tmpdir()}/pdf_${sender}_${Date.now()}`;
-                        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (_) {}
+                        await new Promise((resolve, reject) => {
+                            execFile('mutool', [
+                                'convert',
+                                '-o', `${tmpDir}/page-%d.jpg`,
+                                '-O', 'resolution=150',
+                                pdfPath
+                            ], { timeout: 30_000 }, (err, _so, se) => {
+                                if (err) return reject(new Error(`mutool: ${se || err.message}`));
+                                resolve();
+                            });
+                        });
+
+                        const pageFiles = fs.readdirSync(tmpDir)
+                            .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
+                            .sort();
+
+                        if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
+                        console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
+
+                        const pages = pageFiles.map(f =>
+                            fs.readFileSync(`${tmpDir}/${f}`).toString('base64')
+                        );
+
+                        // استخراج النص أيضاً كـ fallback للأسئلة النصية
+                        let docText = '';
                         try {
-                            const pdfPath = `${tmpDir}/input.pdf`;
-                            fs.writeFileSync(pdfPath, buffer);
+                            const parsed = await pdfParse(buffer);
+                            docText = (parsed.text || '').trim();
+                        } catch (_) {}
 
-                            await new Promise((resolve, reject) => {
-                                execFile('mutool', [
-                                    'convert',
-                                    '-o', `${tmpDir}/page-%d.jpg`,
-                                    '-O', 'resolution=150',
-                                    pdfPath, '1-4'
-                                ], { timeout: 30_000 }, (err, _so, se) => {
-                                    if (err) return reject(new Error(`mutool: ${se || err.message}`));
-                                    resolve();
-                                });
-                            });
+                        stats.totalDocs = (stats.totalDocs || 0) + 1;
+                        saveData();
 
-                            const pageFiles = fs.readdirSync(tmpDir)
-                                .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
-                                .sort();
-
-                            if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
-                            console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
-
-                            const pages = pageFiles.map(f =>
-                                fs.readFileSync(`${tmpDir}/${f}`).toString('base64')
-                            );
-
-                            const userQ2 = caption || 'اقرأ كل النصوص الموجودة في هذا الملف بدقة كاملة وقدمها منظمة، ثم لخص المحتوى';
-                            const prompt2 = userName ? `اسم المستخدم: ${userName}\n${userQ2}` : userQ2;
-
-                            const imageContents = pages.map(b64 => ({
-                                type: 'image_url',
-                                image_url: { url: `data:image/jpeg;base64,${b64}` }
-                            }));
-
-                            const res2 = await callMistral({
-                                model: 'pixtral-large-latest',
-                                messages: [
-                                    { role: 'system', content: getSystemPrompt() },
-                                    { role: 'user', content: [...imageContents, { type: 'text', text: prompt2 }] }
-                                ],
-                                max_tokens: 2500,
-                                temperature: 0.2
-                            });
-
-                            stats.totalDocs = (stats.totalDocs || 0) + 1;
-                            saveData();
-                            // طلب الإذن قبل الدخول لوضع PDF
-                            userPdfPending[sender] = { fileName, docText: pages.map((b,i) => `[صفحة ${i+1}]`).join(' '), pages, expiresAt: Date.now() + 5 * 60_000 };
-                            await react('📄');
-                            await reply(`📄 *تم قراءة الملف بنجاح: ${fileName}*\n(${pages.length} صفحة مصوّرة)\n\nهل تريد أن أجيبك من هذا الملف فقط؟\nأرسل *نعم* للدخول لوضع الملف 📑\nأو *لا* للمتابعة بشكل عادي`);
-                        } catch (imgErr) {
-                            console.error('[PDF scanned]', imgErr.message);
-                            await react('❌');
-                            await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور، أو أرسله كصورة JPG.`);
-                        } finally {
-                            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
-                        }
-                        return;
+                        // حفظ الصفحات والنص معاً في pending
+                        userPdfPending[sender] = {
+                            fileName,
+                            docText,
+                            pages,
+                            expiresAt: Date.now() + 5 * 60_000
+                        };
+                        await react('📄');
+                        await reply(
+                            `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
+                            `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
+                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
+                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
+                            `أو *لا* للمتابعة بشكل عادي`
+                        );
+                    } catch (imgErr) {
+                        console.error('[PDF]', imgErr.message);
+                        await react('❌');
+                        await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور.`);
+                    } finally {
+                        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
                     }
-
-                    stats.totalDocs = (stats.totalDocs || 0) + 1;
-                    saveData();
-
-                    // طلب الإذن قبل الدخول لوضع PDF
-                    userPdfPending[sender] = { fileName, docText, expiresAt: Date.now() + 5 * 60_000 };
-                    await react('📄');
-                    await reply(`📄 *تم قراءة الملف بنجاح: ${fileName}*\n(${docText.length} حرف نصي)\n\nهل تريد أن أجيبك من هذا الملف فقط؟\nأرسل *نعم* للدخول لوضع الملف 📑\nأو *لا* للمتابعة بشكل عادي`);
 
                 } catch (e) {
                     console.error('[document]', e.message);
@@ -2571,7 +2551,7 @@ async function startBot() {
                 const isYesPdf = /^(نعم|yes|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
                 const isNoPdf  = /^(لا|no|لأ)$/i.test(bodyTrimmed);
                 if (isYesPdf) {
-                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText };
+                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText, pages: userPdfPending[sender].pages || null };
                     delete userPdfPending[sender];
                     await react('📑');
                     await reply(
@@ -2594,7 +2574,7 @@ async function startBot() {
             // وضع PDF النشط — الإجابة من الملف فقط
             // ============================================================
             if (userPdfContext[sender]) {
-                const { fileName, docText } = userPdfContext[sender];
+                const { fileName, docText, pages } = userPdfContext[sender];
 
                 // خروج من وضع الملف
                 if (/^خروج$/i.test(bodyTrimmed)) {
@@ -2624,15 +2604,34 @@ async function startBot() {
                 try {
                     const pdfSystemPrompt =
                         `أنت مساعد ذكي يساعد المستخدم على فهم محتوى الملف: "${fileName}".\n` +
-                        `أسلوبك طبيعي ومرن — اشرح وحلّل وأجب كما يفهم الإنسان، لا تقتبس حرفياً من الملف.\n` +
+                        `أسلوبك طبيعي ومرن — اشرح وحلّل وأجب كما يفهم الإنسان، لا تقتبس حرفياً.\n` +
                         `اللغة: أجب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).\n` +
-                        `السياق: ردودك مبنية على محتوى الملف، يمكنك الشرح بأسلوبك الخاص وإضافة توضيحات تساعد الفهم.\n` +
-                        `إذا سأل عن شيء غير موجود في الملف نهائياً: أخبره بلطف أن الملف لا يتضمن هذا الموضوع.`;
+                        `السياق: ردودك مبنية على محتوى الملف — النصوص والصور معاً.\n` +
+                        `إذا سأل عن شيء غير موجود في الملف: أخبره بلطف.`;
 
-                    const res = await askAI([
-                        { role: 'system', content: pdfSystemPrompt },
-                        { role: 'user',   content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nسؤال المستخدم: ${body}` }
-                    ]);
+                    let res;
+                    if (pages && pages.length > 0) {
+                        // استخدام الصور للإجابة (يقرأ النص والصور معاً)
+                        const imageContents = pages.map(b64 => ({
+                            type: 'image_url',
+                            image_url: { url: `data:image/jpeg;base64,${b64}` }
+                        }));
+                        res = await callMistral({
+                            model: 'pixtral-large-latest',
+                            messages: [
+                                { role: 'system', content: pdfSystemPrompt },
+                                { role: 'user', content: [...imageContents, { type: 'text', text: body }] }
+                            ],
+                            max_tokens: 2500,
+                            temperature: 0.3
+                        });
+                    } else {
+                        // fallback: نص فقط
+                        res = await askAI([
+                            { role: 'system', content: pdfSystemPrompt },
+                            { role: 'user',   content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nسؤال المستخدم: ${body}` }
+                        ]);
+                    }
                     await reply(res);
                     await react('✅');
                 } catch (e) {
@@ -2642,6 +2641,7 @@ async function startBot() {
                 }
                 return;
             }
+
 
             const isYes = /^(نعم|yes|نعم\s*✅|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
             if (isYes && userTTSPending[sender] && Date.now() < userTTSPending[sender].expiresAt) {
