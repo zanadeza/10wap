@@ -14,7 +14,7 @@ const pdfParse = require('pdf-parse');
 const QRCodeImg = require('qrcode');
 const http = require('http');
 const fs   = require('fs');
-const { fromBuffer } = require('pdf2pic');
+
 
 // ============================================================
 // CONFIG
@@ -2399,41 +2399,41 @@ async function startBot() {
                         console.error('[pdf-parse]', pdfErr.message);
                     }
 
-                    // لو النص فارغ: الـ PDF مصوّر - نحوّل صفحاته لصور JPG
+                    // لو النص فارغ: الـ PDF مصوّر - نحوّل صفحاته لصور JPG عبر mutool
                     if (!docText || docText.length < 10) {
-                        console.log(`[PDF] "${fileName}" مصوّر، جاري تحويله لصور...`);
-                        // مسار مؤقت فريد لكل طلب لتجنب التعارض وضمان الحذف لاحقاً
-                        const tmpDir = `/tmp/pdf_${sender}_${Date.now()}`;
+                        console.log(`[PDF] "${fileName}" مصوّر، جاري تحويله بـ mutool...`);
+                        const tmpDir = `${os.tmpdir()}/pdf_${sender}_${Date.now()}`;
+                        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (_) {}
                         try {
-                            fs.mkdirSync(tmpDir, { recursive: true });
-                        } catch (_) {}
-                        try {
-                            // تحويل صفحات PDF لصور JPG باستخدام pdf2pic
-                            const converter = fromBuffer(buffer, {
-                                density: 150,        // جودة معقولة وسريعة
-                                format: 'jpeg',
-                                width: 1200,
-                                height: 1600,
-                                saveFilename: 'page',
-                                savePath: tmpDir
+                            const pdfPath = `${tmpDir}/input.pdf`;
+                            fs.writeFileSync(pdfPath, buffer);
+
+                            await new Promise((resolve, reject) => {
+                                execFile('mutool', [
+                                    'convert',
+                                    '-o', `${tmpDir}/page-%d.jpg`,
+                                    '-O', 'resolution=150',
+                                    pdfPath, '1-4'
+                                ], { timeout: 30_000 }, (err, _so, se) => {
+                                    if (err) return reject(new Error(`mutool: ${se || err.message}`));
+                                    resolve();
+                                });
                             });
 
-                            // نحوّل أول 4 صفحات كحد أقصى (لتجنب timeout)
-                            let pages = [];
-                            for (let p = 1; p <= 4; p++) {
-                                try {
-                                    const result = await converter(p, { responseType: 'base64' });
-                                    if (result?.base64) pages.push(result.base64);
-                                } catch (_) { break; } // توقفنا عند آخر صفحة
-                            }
+                            const pageFiles = fs.readdirSync(tmpDir)
+                                .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
+                                .sort();
 
-                            if (pages.length === 0) throw new Error('فشل تحويل الصفحات');
-                            console.log(`[PDF] تم تحويل ${pages.length} صفحة من "${fileName}"`);
+                            if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
+                            console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
+
+                            const pages = pageFiles.map(f =>
+                                fs.readFileSync(`${tmpDir}/${f}`).toString('base64')
+                            );
 
                             const userQ2 = caption || 'اقرأ كل النصوص الموجودة في هذا الملف بدقة كاملة وقدمها منظمة، ثم لخص المحتوى';
                             const prompt2 = userName ? `اسم المستخدم: ${userName}\n${userQ2}` : userQ2;
 
-                            // بناء محتوى الرسالة: كل صفحة كصورة JPG منفصلة
                             const imageContents = pages.map(b64 => ({
                                 type: 'image_url',
                                 image_url: { url: `data:image/jpeg;base64,${b64}` }
@@ -2443,13 +2443,7 @@ async function startBot() {
                                 model: 'pixtral-large-latest',
                                 messages: [
                                     { role: 'system', content: getSystemPrompt() },
-                                    {
-                                        role: 'user',
-                                        content: [
-                                            ...imageContents,
-                                            { type: 'text', text: prompt2 }
-                                        ]
-                                    }
+                                    { role: 'user', content: [...imageContents, { type: 'text', text: prompt2 }] }
                                 ],
                                 max_tokens: 2500,
                                 temperature: 0.2
@@ -2467,17 +2461,10 @@ async function startBot() {
                             await react('❌');
                             await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور، أو أرسله كصورة JPG.`);
                         } finally {
-                            // حذف المجلد المؤقت دائماً بعد الانتهاء لتجنب استنزاف المساحة
-                            try {
-                                // fs.rmSync متاح من Node 14.14+ — نستخدم rmdirSync كـ fallback للبيئات الأقدم
-                                if (fs.rmSync) {
-                                    fs.rmSync(tmpDir, { recursive: true, force: true });
-                                } else {
-                                    fs.rmdirSync(tmpDir, { recursive: true });
-                                }
-                            } catch (_) {}
+                            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
                         }
                         return;
+                    }
                     }
 
                     // حفظ السياق: السؤال + الرد الحقيقي فقط (بدون تكرار)
