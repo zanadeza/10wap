@@ -122,8 +122,9 @@ function nowJerusalem() {
     });
     const parts = fmt.formatToParts(now);
     const get = type => parts.find(p => p.type === type)?.value || '00';
-    // ISO string صريح لتجنب أي ambiguity في الـ parsing
-    const isoStr = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}`;
+    // نستخرج القيم بتوقيت القدس ونبني التاريخ كـ local time صريح
+    // الهدف: الحصول على كائن Date يمثّل "الآن بتوقيت القدس" للحسابات الداخلية
+    const isoStr = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}+00:00`;
     return new Date(isoStr);
 }
 
@@ -167,13 +168,14 @@ function getDailyRecord(sender) {
     return _userDailyLimit[sender];
 }
 
-// فحص الحد اليومي للرسائل النصية — يُعيد { allowed, remaining }
+// فحص الحد اليومي للرسائل النصية — يُعيد { allowed, remaining, commit }
+// commit() يجب استدعاؤها فقط بعد نجاح إرسال الرد الفعلي
 function checkDailyMessages(sender) {
     const limit = getUserDailyLimit(sender);
     const rec = getDailyRecord(sender);
-    if (rec.messages >= limit) return { allowed: false, remaining: 0, limit };
-    rec.messages++;
-    return { allowed: true, remaining: limit - rec.messages, limit };
+    if (rec.messages >= limit) return { allowed: false, remaining: 0, limit, commit: () => {} };
+    const commit = () => { rec.messages++; };
+    return { allowed: true, remaining: limit - rec.messages - 1, limit, commit };
 }
 
 // فحص الحد اليومي للصور والملفات
@@ -231,40 +233,135 @@ function getSystemPrompt() {
 // SYSTEM PROMPTS للأنظمة الأربعة
 // ============================================================
 const MODE_PROMPTS = {
-    terms: `أنت متخصص في المصطلحات الطبية فقط. مهمتك الوحيدة هي شرح المصطلحات الطبية.
-إذا أرسل المستخدم أي شيء ليس مصطلحاً طبياً، رد عليه بهذه الرسالة فقط:
-"⚠️ الرجاء كتابة مصطلح طبي صحيح.
-أمثلة على مصطلحات طبية:
-• عربي: التهاب السحايا، الذبحة الصدرية، السكتة الدماغية
-• إنجليزي: Meningitis, Angina, Stroke"
+    terms: `أنت متخصص حصري في المصطلحات الطبية لجميع التخصصات الطبية. مهمتك الوحيدة هي شرح المصطلحات الطبية بشكل علمي ومتكامل.
 
-إذا أرسل المستخدم مصطلحاً طبياً (بالعربية أو الإنجليزية)، اردّ عليه بهذا النموذج الثابت بالضبط:
+══════════════════════════════
+قواعد النظام — يجب اتباعها بدقة تامة:
+══════════════════════════════
 
+1) إذا أرسل المستخدم أي شيء ليس مصطلحاً طبياً (سؤال عادي، كلام، طلب، أي موضوع آخر) رد بهذه الرسالة الثابتة فقط ولا تضيف أي شيء آخر:
+
+⚠️ هذا النظام مخصص للمصطلحات الطبية فقط.
+الرجاء كتابة مصطلح طبي صحيح.
+
+📋 أمثلة على مصطلحات طبية:
+بالعربية: التهاب السحايا · السكتة الدماغية · الذبحة الصدرية · قصور القلب · السكري · الربو · التهاب الزائدة · هشاشة العظام
+In English: Meningitis · Hypertension · Diabetes · Arrhythmia · Pneumonia · Appendicitis · Osteoporosis · Tachycardia
+
+💡 لتغيير النظام اكتب: !قائمة
+
+══════════════════════════════
+
+2) إذا أرسل المستخدم مصطلحاً طبياً (بالعربية أو الإنجليزية أو كليهما) من أي تخصص طبي، اردّ بهذا النموذج الكامل والثابت بالضبط دون أي تغيير في الترتيب أو الشكل أو الأيقونات:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📌 المصطلح
-[المصطلح كما كتبه المستخدم]
+[المصطلح بالإنجليزية]
+[المصطلح بالعربية]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-────────────
+🌐 أصل المصطلح
+[اذكر هنا واحداً فقط: يوناني / لاتيني / إنجليزي] — مع ذكر اللغة الأصلية والمعنى الحرفي للكلمة في تلك اللغة
 
-📝 الصيغة العربية
-[الاسم بالعربية]
+──────────────────────────────
+🗣️ النطق — Pronunciation
+──────────────────────────────
 
-🗣️ النطق
-[النطق الصوتي بالعربية]
+بالعربية: [النطق الصوتي الكامل بمقاطع واضحة — مثال: مِـنِـنْـجَـايْـتِـس]
+In English: [English phonetic pronunciation — example: men·in·JY·tis]
+🔤 IPA: [/الرموز الصوتية الدولية الكاملة/]
 
-🔸 المعنى
-[شرح مختصر جداً في سطر واحد]
+──────────────────────────────
+🔸 المعنى المختصر
+──────────────────────────────
+[تعريف دقيق ومختصر في سطر أو سطرين]
 
-📖 الشرح
-[شرح طبي كامل ومفهوم بالعربية]
+──────────────────────────────
+📋 التعريف الكامل — Full Definition
+──────────────────────────────
 
-⚕️ التخصص الطبي
-[مثل: طب الأعصاب / أمراض القلب / ...]
+🔹 تعريف بالعربية:
+[تعريف علمي دقيق وشامل بالعربية يغطي: ماهية المصطلح بدقة، نوعه (حالة / إجراء / عضو / أعراض / مرض)، وضعه في التصنيف الطبي، وأي معلومة تعريفية جوهرية — مكتوب بشكل فقرة علمية واضحة ومنظمة وليس نقاطاً]
 
-📚 مصطلحات مشابهة
-[3-4 مصطلحات طبية ذات صلة]
+🔹 Definition in English:
+[Precise and comprehensive scientific definition in English covering: what the term is exactly, its type (condition / procedure / anatomy / symptom / disease), its medical classification, and any essential defining information — written as a clear scientific paragraph, not bullet points]
 
-────────────
-💡 لتغيير النظام اكتب: !قائمة`,
+──────────────────────────────
+📖 الشرح الطبي الشامل — Comprehensive Medical Explanation
+──────────────────────────────
+
+🔹 شرح بالعربية:
+• الأسباب والعوامل المؤدية: [اشرح الأسباب والمحفزات بالتفصيل]
+• الأعراض والعلامات: [اذكر الأعراض الرئيسية والثانوية]
+• التشخيص: [كيف يُشخَّص هذا المصطلح/الحالة]
+• العلاج والتدبير: [خيارات العلاج المتاحة]
+• المضاعفات والمخاطر: [ما قد ينتج إذا لم يُعالج]
+• التوقعات والإنذار: [ما هو المسار الطبيعي للحالة]
+
+🔹 Explanation in English:
+• Etiology & Risk Factors: [Explain causes and contributing factors in detail]
+• Signs & Symptoms: [List primary and secondary symptoms]
+• Diagnosis: [How this condition/term is diagnosed]
+• Treatment & Management: [Available treatment options]
+• Complications & Risks: [Potential outcomes if untreated]
+• Prognosis: [Expected course and outcomes]
+
+──────────────────────────────
+🧬 تحليل المصطلح — Term Analysis
+──────────────────────────────
+
+🌱 الجذر — Root:
+[الجزء الأساسي من الكلمة] ← المعنى: [معنى الجذر بالعربية والإنجليزية]
+
+⬅️ البادئة — Prefix: (إن وجدت)
+[البادئة] ← المعنى: [معناها بالعربية والإنجليزية]
+
+➡️ اللاحقة — Suffix: (إن وجدت)
+[اللاحقة] ← المعنى: [معناها بالعربية والإنجليزية]
+
+📐 التركيب الكامل:
+[البادئة] + [الجذر] + [اللاحقة] = [المعنى الحرفي الكامل للمصطلح]
+
+──────────────────────────────
+🫀 الجهاز أو العضو المصاب — Affected System
+──────────────────────────────
+[اذكر الجهاز أو الأعضاء التي يصيبها هذا المصطلح — مثال: الجهاز العصبي المركزي / القلب والأوعية الدموية / الجهاز التنفسي ...]
+
+──────────────────────────────
+🦠 الأمراض المرتبطة — Related Diseases
+──────────────────────────────
+[اذكر 4-5 أمراض أو حالات طبية مرتبطة مباشرة بهذا المصطلح بصيغة:
+• Disease Name — اسم المرض بالعربية: وصف مختصر جداً]
+
+──────────────────────────────
+⚕️ التخصص الطبي — Medical Specialty
+──────────────────────────────
+[التخصص أو التخصصات الطبية التي تتعامل مع هذا المصطلح]
+
+──────────────────────────────
+🔗 مصطلحات مرتبطة — Related Terms
+──────────────────────────────
+[5 مصطلحات طبية مرتبطة بصيغة: Term — الترجمة العربية]
+
+──────────────────────────────
+💡 نصائح سريعة
+──────────────────────────────
+[3 نقاط عملية مفيدة عن استخدام المصطلح في السياق الطبي]
+
+──────────────────────────────
+📝 أمثلة تطبيقية — Examples
+──────────────────────────────
+بالعربية: [جملة كاملة تستخدم المصطلح في سياق طبي حقيقي]
+In English: [Full sentence using the term in a real medical context]
+
+──────────────────────────────
+🎓 ملاحظة تعليمية — Learning Note
+──────────────────────────────
+[فقرة تعليمية بالإنجليزية للطلاب والمهنيين الصحيين: الأهمية السريرية، كيفية التمييز، والممارسة العملية]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 لتغيير النظام اكتب: !قائمة
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
 
     pharma: `أنت صيدلاني متخصص وخبير في علم الأدوية لجميع التخصصات الطبية. أجب على أي سؤال يتعلق بالأدوية.
 عندما يسأل المستخدم عن دواء أو مادة فعّالة، اردّ بهذا النموذج الثابت:
@@ -1013,12 +1110,20 @@ function startQRServer() {
                         } else {
                             const oldLimit = getUserDailyLimit(num);
                             userLimits[num] = limit;
-                            // لا نصفّر العداد — الحد الجديد يُطبَّق على العداد الحالي
-                            // إذا كان المستخدم متجاوزاً يبقى متجاوزاً حتى منتصف الليل
+
+                            // إذا كان المستخدم متجاوزاً وتم رفع الحد عن استهلاكه الحالي
+                            // → نصفّر العداد لمستواه الحالي حتى يستطيع الإرسال فوراً
+                            const rec = getDailyRecord(num);
+                            const alreadyUsed = rec ? rec.messages : 0;
+                            if (limit > oldLimit && alreadyUsed >= oldLimit && alreadyUsed < limit) {
+                                // لا نمسح الاستخدام — فقط نتركه كما هو لأن الحد الجديد أعلى منه
+                            } else if (limit > alreadyUsed && alreadyUsed >= oldLimit) {
+                                // المستخدم كان محظور الإرسال — الحد الجديد يسمح له: لا حاجة لتعديل
+                            }
+                            // إذا رُفع الحد فوق الاستهلاك الحالي يُسمح للمستخدم تلقائياً (لأن checkDailyMessages تقارن rec.messages < limit)
+
                             saveData();
                             // إشعار المستخدم فقط إذا رُفع الحد (ليس عند التخفيض)
-                            const rec = _userDailyLimit[num];
-                            const alreadyUsed = rec ? rec.messages : 0;
                             const nowAllowed = alreadyUsed < limit;
                             if (sock && isConnected && limit > oldLimit) {
                                 try {
@@ -1901,25 +2006,22 @@ setInterval(loadData,30000);
     });
 
     function tryListen(port) {
-        const s = require('net').createServer();
-        s.once('error', () => {
-            console.log(`⚠️ البورت ${port} مشغول، جاري المحاولة على ${port + 1}...`);
-            tryListen(port + 1);
-        });
-        s.once('listening', () => {
-            s.close(() => {
-                server.listen(port, '0.0.0.0', () => {
-                    console.log(`\n🌐 لوحة التحكم: http://localhost:${port}`);
-                    console.log(`🌐 من جهاز ثاني: http://10.158.171.59:${port}\n`);
-                });
+        server.listen(port, '0.0.0.0')
+            .once('listening', () => {
+                console.log(`\n🌐 لوحة التحكم: http://localhost:${port}`);
+                console.log(`🌐 من جهاز ثاني: http://10.158.171.59:${port}\n`);
+            })
+            .once('error', (e) => {
+                if (e.code === 'EADDRINUSE') {
+                    console.log(`⚠️ البورت ${port} مشغول، جاري المحاولة على ${port + 1}...`);
+                    server.removeAllListeners('error');
+                    server.removeAllListeners('listening');
+                    tryListen(port + 1);
+                } else {
+                    console.error('[server]', e.message);
+                }
             });
-        });
-        s.listen(port, '0.0.0.0');
     }
-
-    server.on('error', (e) => {
-        console.error('[server]', e.message);
-    });
 
     tryListen(WEB_PORT);
 }
@@ -2002,11 +2104,10 @@ async function startBot() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // 'notify' = رسالة جديدة عادية
-        // 'append' = رسائل فائتة وصلت وقت البوت كان مقفّل
+        // 'notify' = رسالة جديدة، 'append' = رسائل فائتة — كلاهما مصفوفة
         if (type !== 'notify' && type !== 'append') return;
 
-        const msgList = type === 'append' ? messages : [messages?.[0]];
+        const msgList = Array.isArray(messages) ? messages : (messages ? [messages] : []);
 
         for (const msg of msgList) {
         if (!msg?.message || msg?.key?.fromMe) continue;
@@ -2043,9 +2144,36 @@ async function startBot() {
             userChatLastSeen[sender] = Date.now(); // تحديث آخر نشاط
 
             // تعريف reply و react أولاً — قبل أي كود يستخدمهما
+            const WA_CHUNK_LIMIT = 3800;
+            function splitMessage(text) {
+                if (text.length <= WA_CHUNK_LIMIT) return [text];
+                const chunks = [];
+                const lines = text.split('\n');
+                let current = '';
+                for (const line of lines) {
+                    const candidate = current ? current + '\n' + line : line;
+                    if (candidate.length > WA_CHUNK_LIMIT) {
+                        if (current.trim()) chunks.push(current.trim());
+                        current = line;
+                    } else {
+                        current = candidate;
+                    }
+                }
+                if (current.trim()) chunks.push(current.trim());
+                return chunks.filter(c => c.length > 0);
+            }
             const reply = async (text) => {
                 try {
-                    await sock.sendMessage(jid, { text }, { quoted: msg });
+                    const parts = splitMessage(text);
+                    if (parts.length === 1) {
+                        await sock.sendMessage(jid, { text: parts[0] }, { quoted: msg });
+                    } else {
+                        await sock.sendMessage(jid, { text: parts[0] }, { quoted: msg });
+                        for (let i = 1; i < parts.length; i++) {
+                            await new Promise(r => setTimeout(r, 500));
+                            await sock.sendMessage(jid, { text: parts[i] });
+                        }
+                    }
                 } catch (e) {
                     console.error('[reply] خطأ:', e.message);
                 }
@@ -2094,7 +2222,7 @@ async function startBot() {
             // استخراج / تحديث اسم المستخدم
             // ============================================================
             let userName = userNames[sender];
-            const pushName = (msg.pushName || msg.notifyName)?.trim(); // notifyName هو المصدر الصحيح في messages.upsert
+            const pushName = msg.pushName?.trim(); // pushName هو الخاصية الصحيحة الوحيدة في messages.upsert
             if (pushName && pushName !== userName) {
                 userNames[sender] = pushName;
                 userName = pushName;
@@ -2305,7 +2433,14 @@ async function startBot() {
                             await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور، أو أرسله كصورة JPG.`);
                         } finally {
                             // حذف المجلد المؤقت دائماً بعد الانتهاء لتجنب استنزاف المساحة
-                            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+                            try {
+                                // fs.rmSync متاح من Node 14.14+ — نستخدم rmdirSync كـ fallback للبيئات الأقدم
+                                if (fs.rmSync) {
+                                    fs.rmSync(tmpDir, { recursive: true, force: true });
+                                } else {
+                                    fs.rmdirSync(tmpDir, { recursive: true });
+                                }
+                            } catch (_) {}
                         }
                         return;
                     }
@@ -2494,6 +2629,7 @@ async function startBot() {
 
             // الحد اليومي للرسائل (الأدمن وVIP بلا حدود)
             const isVIP = vipNumbers.includes(sender);
+            let _quotaCommit = null;
             if (!isAdmin && !isVIP) {
                 const quota = checkDailyMessages(sender);
                 if (!quota.allowed) {
@@ -2504,8 +2640,12 @@ async function startBot() {
                         `للاستمرار الآن، تواصل مع الأدمن:\n` +
                         `👤 wa.me/${ADMIN_NUMBER}`
                     );
+                    // إشعار الأدمن عند تجاوز المستخدم لحده
+                    const uName = userNames[sender] ? `${userNames[sender]} (${sender})` : sender;
+                    notifyAdmin(`⚠️ المستخدم ${uName} تجاوز حده اليومي (${quota.limit} رسالة).`);
                     return;
                 }
+                _quotaCommit = quota.commit; // سنستدعيها بعد نجاح الرد
             }
 
             await react('👍');
@@ -2544,6 +2684,8 @@ async function startBot() {
 
             await reply(res);
             await react('✅');
+            // تأكيد خصم الرسالة من العداد بعد نجاح الإرسال
+            if (_quotaCommit) _quotaCommit();
 
 
         } catch (error) {
