@@ -497,14 +497,12 @@ function extractTermForTTS(botReply) {
 // lang: 'en' أو 'ar'
 function generateTTS(text, lang = 'en') {
     return new Promise((resolve, reject) => {
-        const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const tmpId   = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
         const wavFile = path.join(os.tmpdir(), `tts_${tmpId}.wav`);
         const oggFile = path.join(os.tmpdir(), `tts_${tmpId}.ogg`);
 
-        // خريطة لغات espeak-ng
         const espeakLang = lang === 'ar' ? 'ar' : 'en';
-        // سرعة النطق: 130 للإنجليزي، 110 للعربي (أبطأ قليلاً للوضوح)
-        const speed = lang === 'ar' ? '110' : '130';
+        const speed      = lang === 'ar' ? '110' : '130';
 
         // الخطوة 1: espeak-ng → WAV
         execFile('espeak-ng', [
@@ -512,25 +510,41 @@ function generateTTS(text, lang = 'en') {
             '-s', speed,
             '-w', wavFile,
             text.slice(0, 200)
-        ], (err) => {
-            if (err) return reject(new Error(`espeak-ng: ${err.message}`));
+        ], { timeout: 10_000 }, (err, _so, se) => {
+            if (err) {
+                fs.unlink(wavFile, () => {});
+                return reject(new Error(`espeak-ng فشل: ${err.message} | ${se}`));
+            }
+            if (!fs.existsSync(wavFile)) {
+                return reject(new Error('espeak-ng: WAV لم يُنشأ'));
+            }
 
-            // الخطوة 2: ffmpeg WAV → OGG Opus (مضغوط ومناسب لـ WhatsApp)
+            // الخطوة 2: ffmpeg WAV → OGG Opus
+            // ملاحظة: ffmpeg يكتب تقريراً في stderr دائماً — هذا طبيعي وليس خطأ
             execFile('ffmpeg', [
+                '-y',           // overwrite بدون سؤال
                 '-i', wavFile,
                 '-c:a', 'libopus',
                 '-b:a', '32k',
-                '-y', oggFile
-            ], (err2) => {
-                // نمسح WAV المؤقت دائماً
+                '-vn',          // بدون فيديو
+                oggFile
+            ], { timeout: 15_000 }, (err2, _so2, _se2) => {
+                // نمسح WAV دائماً
                 fs.unlink(wavFile, () => {});
 
-                if (err2) return reject(new Error(`ffmpeg: ${err2.message}`));
+                if (err2) {
+                    fs.unlink(oggFile, () => {});
+                    return reject(new Error(`ffmpeg فشل: ${err2.message}`));
+                }
+                if (!fs.existsSync(oggFile)) {
+                    return reject(new Error('ffmpeg: OGG لم يُنشأ'));
+                }
 
                 fs.readFile(oggFile, (err3, buf) => {
-                    // نمسح OGG المؤقت
                     fs.unlink(oggFile, () => {});
-                    if (err3) return reject(new Error(`readFile: ${err3.message}`));
+                    if (err3) return reject(new Error(`قراءة الملف فشلت: ${err3.message}`));
+                    if (!buf || buf.length < 100) return reject(new Error(`الملف الصوتي فارغ أو تالف (${buf?.length} bytes)`));
+                    console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${buf.length} bytes`);
                     resolve(buf);
                 });
             });
@@ -538,13 +552,30 @@ function generateTTS(text, lang = 'en') {
     });
 }
 
-// إرسال voice note لـ WhatsApp
+// إرسال voice note لـ WhatsApp — يجرب صيغتين مختلفتين
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
-    await sock.sendMessage(jid, {
-        audio: audioBuffer,
-        mimetype: 'audio/ogg; codecs=opus',
-        ptt: true   // ptt = push-to-talk → يظهر كرسالة صوتية وليس ملف صوتي
-    }, quotedMsg ? { quoted: quotedMsg } : {});
+    const opts = quotedMsg ? { quoted: quotedMsg } : {};
+    try {
+        // الصيغة الأولى: OGG Opus (مفضّل لـ WhatsApp)
+        await sock.sendMessage(jid, {
+            audio:    audioBuffer,
+            mimetype: 'audio/ogg; codecs=opus',
+            ptt:      true
+        }, opts);
+    } catch (e1) {
+        console.warn('[sendVoiceNote] OGG فشل، أحاول MP3...', e1.message);
+        try {
+            // الصيغة الثانية: MP3 كـ fallback
+            await sock.sendMessage(jid, {
+                audio:    audioBuffer,
+                mimetype: 'audio/mp4',
+                ptt:      true
+            }, opts);
+        } catch (e2) {
+            console.error('[sendVoiceNote] كلا الصيغتين فشلتا:', e2.message);
+            throw e2;
+        }
+    }
 }
 
 // تنظيف TTS pending المنتهية كل 10 دقائق
@@ -2608,7 +2639,7 @@ async function startBot() {
                     }
                     await react('✅');
                 } catch (ttsErr) {
-                    console.error('[TTS]', ttsErr.message);
+                    console.error('[TTS] ❌ خطأ كامل:', ttsErr);
                     await react('❌');
                     await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
                 }
