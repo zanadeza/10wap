@@ -93,6 +93,7 @@ saveData();
 let userChats       = {};   // سياق المحادثة (RAM فقط)
 let userChatLastSeen = {}; // آخر نشاط لكل مستخدم
 let userModes       = {};  // وضع كل مستخدم: 'terms' | 'pharma' | 'medai' | 'openai' | null
+let userTTSPending  = {};  // { sender: { term, lang, expiresAt } } — انتظار "نعم" لإرسال النطق
 let sock            = null;
 let isReconnecting  = false; // منع الاتصال المتعدد
 
@@ -518,6 +519,61 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
         clearTimeout(timer);
     }
 }
+
+// ============================================================
+// TEXT-TO-SPEECH (Google TTS — مجاني بدون API Key)
+// ============================================================
+
+// استخراج المصطلح أو الدواء من نص الرد لنطقه
+// يبحث عن أول سطر يحتوي على اسم المصطلح الإنجليزي (عادةً يكون في أول سطرين)
+function extractTermForTTS(botReply) {
+    const lines = botReply.split('\n').map(l => l.trim()).filter(Boolean);
+    // نبحث عن كلمة إنجليزية واضحة في أوائل الرد (المصطلح الطبي أو اسم الدواء)
+    for (const line of lines.slice(0, 8)) {
+        // أزل الأيقونات والرموز والنقاط
+        const clean = line.replace(/[📌⭐━─\-\*_#►•]/g, '').trim();
+        // إذا السطر يحتوي على كلمات إنجليزية بشكل رئيسي (مصطلح أو دواء)
+        const englishWords = clean.match(/[A-Za-z][A-Za-z\s\-]+/g);
+        if (englishWords) {
+            const term = englishWords[0].trim();
+            if (term.length >= 3 && term.length <= 60) return term;
+        }
+    }
+    return null;
+}
+
+// توليد صوت Google TTS وإعادة Buffer
+async function generateGoogleTTS(text, lang = 'en') {
+    // Google Translate TTS API (غير رسمي لكن مجاني)
+    const encoded = encodeURIComponent(text.slice(0, 200));
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${lang}&client=tw-ob`;
+    const response = await fetchWithTimeout(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; MediaBot/1.0)',
+            'Referer': 'https://translate.google.com/'
+        }
+    }, 15_000);
+    if (!response.ok) throw new Error(`Google TTS HTTP ${response.status}`);
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+}
+
+// إرسال voice note لـ WhatsApp
+async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
+    await sock.sendMessage(jid, {
+        audio: audioBuffer,
+        mimetype: 'audio/mpeg',
+        ptt: true   // ptt = push-to-talk → يظهر كرسالة صوتية وليس ملف صوتي
+    }, quotedMsg ? { quoted: quotedMsg } : {});
+}
+
+// تنظيف TTS pending المنتهية كل 10 دقائق
+setInterval(() => {
+    const now = Date.now();
+    for (const k of Object.keys(userTTSPending)) {
+        if (now > (userTTSPending[k].expiresAt || 0)) delete userTTSPending[k];
+    }
+}, 10 * 60_000);
 
 // ============================================================
 // AI FUNCTIONS
@@ -2548,6 +2604,39 @@ async function startBot() {
             // --- نص ---
             if (!body) return;
 
+            // ============================================================
+            // كشف "نعم" لإرسال النطق الصوتي (TTS)
+            // إذا كان المستخدم في انتظار نطق مصطلح أو دواء وأرسل "نعم"
+            // ============================================================
+            const bodyTrimmed = body.trim();
+            const isYes = /^(نعم|yes|نعم\s*✅|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
+            if (isYes && userTTSPending[sender] && Date.now() < userTTSPending[sender].expiresAt) {
+                const { term, termAr } = userTTSPending[sender];
+                delete userTTSPending[sender];
+                await react('🔊');
+                try {
+                    // إرسال النطق الإنجليزي
+                    if (term) {
+                        const audioEn = await generateGoogleTTS(term, 'en');
+                        await sendVoiceNote(jid, audioEn, msg);
+                    }
+                    // إرسال النطق العربي إذا وُجد (اسم الدواء أو المصطلح بالعربية)
+                    if (termAr) {
+                        await new Promise(r => setTimeout(r, 600));
+                        const audioAr = await generateGoogleTTS(termAr, 'ar');
+                        await sendVoiceNote(jid, audioAr);
+                    }
+                    await react('✅');
+                } catch (ttsErr) {
+                    console.error('[TTS]', ttsErr.message);
+                    await react('❌');
+                    await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
+                }
+                return;
+            }
+            // إذا أرسل "لا" أو أي شيء آخر بعد عرض النطق → نمسح الانتظار ونكمل طبيعي
+            if (userTTSPending[sender]) delete userTTSPending[sender];
+
             // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص، !قائمة، !وضع) — تعمل دائماً بغض النظر عن النظام
             const isVIPcmd = vipNumbers.includes(sender);
             const handledCmd = await handleUserCommand(body, sender, reply, react, isAdmin, isVIPcmd);
@@ -2686,6 +2775,26 @@ async function startBot() {
             await react('✅');
             // تأكيد خصم الرسالة من العداد بعد نجاح الإرسال
             if (_quotaCommit) _quotaCommit();
+
+            // ── عرض النطق الصوتي لأنظمة المصطلحات والأدوية فقط ──
+            if (currentMode === 'terms' || currentMode === 'pharma') {
+                const termEn = extractTermForTTS(res);
+                // استخراج الاسم العربي: أول كلمة عربية واضحة بعد كلمة "العربية:" أو "بالعربية:"
+                let termAr = null;
+                const arMatch = res.match(/(?:العربية|بالعربية)\s*[:\-–]\s*([^\n]{2,40})/i);
+                if (arMatch) termAr = arMatch[1].replace(/[*_📌⭐]/g, '').trim().split(/[،,\n]/)[0].trim();
+
+                if (termEn) {
+                    // احفظ المصطلح لمدة 3 دقائق بانتظار "نعم"
+                    userTTSPending[sender] = {
+                        term:   termEn,
+                        termAr: termAr || null,
+                        expiresAt: Date.now() + 3 * 60_000
+                    };
+                    await new Promise(r => setTimeout(r, 400));
+                    await reply(`🔊 *هل تريد سماع النطق الصحيح؟*\nأرسل *نعم* وسأرسل لك الصوت فوراً 🎙️`);
+                }
+            }
 
 
         } catch (error) {
