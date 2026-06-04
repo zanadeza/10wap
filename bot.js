@@ -472,12 +472,9 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (espeak-ng محلي — يعمل بدون إنترنت على كل المستخدمين)
-// المتطلبات: apt install espeak-ng ffmpeg
+// TEXT-TO-SPEECH HELPERS
 // ============================================================
-const { execFile } = require('child_process');
-const os           = require('os');
-const path         = require('path');
+const path = require('path');
 
 // استخراج المصطلح الإنجليزي من نص الرد
 function extractTermForTTS(botReply) {
@@ -493,82 +490,45 @@ function extractTermForTTS(botReply) {
     return null;
 }
 
-// توليد صوت بـ espeak-ng ثم تحويله لـ OGG/Opus عبر ffmpeg
-// lang: 'en' أو 'ar'
-function generateTTS(text, lang = 'en') {
-    return new Promise((resolve, reject) => {
-        const tmpId   = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        const wavFile = path.join(os.tmpdir(), `tts_${tmpId}.wav`);
-        const oggFile = path.join(os.tmpdir(), `tts_${tmpId}.ogg`);
+// ============================================================
+// TEXT-TO-SPEECH (Google Translate TTS — يعمل بدون تثبيت أي شيء)
+// ============================================================
+async function generateTTS(text, lang = 'en') {
+    const ttsLang = lang === 'ar' ? 'ar' : 'en';
+    // نأخذ أول 100 حرف فقط لأن Google TTS له حد
+    const cleanText = text.slice(0, 100).replace(/[^\w\s\u0600-\u06FF]/g, '');
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=${ttsLang}&client=tw-ob&ttsspeed=0.9`;
 
-        const espeakLang = lang === 'ar' ? 'ar' : 'en';
-        const speed      = lang === 'ar' ? '110' : '130';
-
-        // الخطوة 1: espeak-ng → WAV
-        execFile('espeak-ng', [
-            '-v', espeakLang,
-            '-s', speed,
-            '-w', wavFile,
-            text.slice(0, 200)
-        ], { timeout: 10_000 }, (err, _so, se) => {
-            if (err) {
-                fs.unlink(wavFile, () => {});
-                return reject(new Error(`espeak-ng فشل: ${err.message} | ${se}`));
-            }
-            if (!fs.existsSync(wavFile)) {
-                return reject(new Error('espeak-ng: WAV لم يُنشأ'));
-            }
-
-            // الخطوة 2: ffmpeg WAV → OGG Opus
-            // ملاحظة: ffmpeg يكتب تقريراً في stderr دائماً — هذا طبيعي وليس خطأ
-            execFile('ffmpeg', [
-                '-y',           // overwrite بدون سؤال
-                '-i', wavFile,
-                '-c:a', 'libopus',
-                '-b:a', '32k',
-                '-vn',          // بدون فيديو
-                oggFile
-            ], { timeout: 15_000 }, (err2, _so2, _se2) => {
-                // نمسح WAV دائماً
-                fs.unlink(wavFile, () => {});
-
-                if (err2) {
-                    fs.unlink(oggFile, () => {});
-                    return reject(new Error(`ffmpeg فشل: ${err2.message}`));
-                }
-                if (!fs.existsSync(oggFile)) {
-                    return reject(new Error('ffmpeg: OGG لم يُنشأ'));
-                }
-
-                fs.readFile(oggFile, (err3, buf) => {
-                    fs.unlink(oggFile, () => {});
-                    if (err3) return reject(new Error(`قراءة الملف فشلت: ${err3.message}`));
-                    if (!buf || buf.length < 100) return reject(new Error(`الملف الصوتي فارغ أو تالف (${buf?.length} bytes)`));
-                    console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${buf.length} bytes`);
-                    resolve(buf);
-                });
-            });
-        });
-    });
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const buffer = await response.buffer();
+        if (!buffer || buffer.length < 100) throw new Error(`الملف الصوتي فارغ أو تالف (${buffer?.length} bytes)`);
+        console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${buffer.length} bytes`);
+        return buffer;
+    } catch (err) {
+        console.error('[TTS] فشل:', err.message);
+        throw new Error('Google TTS فشل');
+    }
 }
 
 // إرسال voice note لـ WhatsApp — يجرب صيغتين مختلفتين
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
     const opts = quotedMsg ? { quoted: quotedMsg } : {};
     try {
-        // الصيغة الأولى: OGG Opus (مفضّل لـ WhatsApp)
+        // الصيغة الأولى: MP3 (Google TTS يرجع MP3)
         await sock.sendMessage(jid, {
             audio:    audioBuffer,
-            mimetype: 'audio/ogg; codecs=opus',
+            mimetype: 'audio/mpeg',
             ptt:      true
         }, opts);
     } catch (e1) {
-        console.warn('[sendVoiceNote] OGG فشل، أحاول MP3...', e1.message);
+        console.warn('[sendVoiceNote] MP3 فشل، أحاول OGG...', e1.message);
         try {
-            // الصيغة الثانية: MP3 كـ fallback
+            // الصيغة الثانية: OGG كـ fallback
             await sock.sendMessage(jid, {
                 audio:    audioBuffer,
-                mimetype: 'audio/mp4',
+                mimetype: 'audio/ogg; codecs=opus',
                 ptt:      true
             }, opts);
         } catch (e2) {
