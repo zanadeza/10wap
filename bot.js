@@ -94,6 +94,8 @@ let userChats       = {};   // سياق المحادثة (RAM فقط)
 let userChatLastSeen = {}; // آخر نشاط لكل مستخدم
 let userModes       = {};  // وضع كل مستخدم: 'terms' | 'pharma' | 'medai' | 'openai' | null
 let userTTSPending  = {};  // { sender: { term, lang, expiresAt } } — انتظار "نعم" لإرسال النطق
+let userPdfContext  = {};  // { sender: { fileName, docText } } — محتوى PDF النشط
+let userPdfPending  = {};  // { sender: { fileName, docText, expiresAt } } — انتظار إذن المستخدم
 let sock            = null;
 let isReconnecting  = false; // منع الاتصال المتعدد
 
@@ -546,11 +548,14 @@ async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
     }, opts);
 }
 
-// تنظيف TTS pending المنتهية كل 10 دقائق
+// تنظيف TTS pending و PDF pending المنتهية كل 10 دقائق
 setInterval(() => {
     const now = Date.now();
     for (const k of Object.keys(userTTSPending)) {
         if (now > (userTTSPending[k].expiresAt || 0)) delete userTTSPending[k];
+    }
+    for (const k of Object.keys(userPdfPending)) {
+        if (now > (userPdfPending[k].expiresAt || 0)) delete userPdfPending[k];
     }
 }, 10 * 60_000);
 
@@ -2451,11 +2456,10 @@ async function startBot() {
 
                             stats.totalDocs = (stats.totalDocs || 0) + 1;
                             saveData();
-                            if (!userChats[sender]) userChats[sender] = [];
-                            userChats[sender].push({ role: 'user',      content: `[أرسل PDF مصوّر: "${fileName}" - ${pages.length} صفحة]` });
-                            userChats[sender].push({ role: 'assistant', content: res2 });
-                            await reply(res2);
-                            await react('✅');
+                            // طلب الإذن قبل الدخول لوضع PDF
+                            userPdfPending[sender] = { fileName, docText: pages.map((b,i) => `[صفحة ${i+1}]`).join(' '), pages, expiresAt: Date.now() + 5 * 60_000 };
+                            await react('📄');
+                            await reply(`📄 *تم قراءة الملف بنجاح: ${fileName}*\n(${pages.length} صفحة مصوّرة)\n\nهل تريد أن أجيبك من هذا الملف فقط؟\nأرسل *نعم* للدخول لوضع الملف 📑\nأو *لا* للمتابعة بشكل عادي`);
                         } catch (imgErr) {
                             console.error('[PDF scanned]', imgErr.message);
                             await react('❌');
@@ -2466,24 +2470,13 @@ async function startBot() {
                         return;
                     }
 
-                    // حفظ السياق: السؤال + الرد الحقيقي فقط (بدون تكرار)
-                    if (!userChats[sender]) userChats[sender] = [];
-                    const pdfSummaryCtx = docText.slice(0, 2000);
-
                     stats.totalDocs = (stats.totalDocs || 0) + 1;
                     saveData();
 
-                    const userQ = caption || 'لخّص هذا الملف بشكل شامل واذكر أهم نقاطه';
-                    const res = await askAIWithDoc(docText, userQ, userName);
-
-                    // نضيف للسياق: السؤال + الرد الفعلي فقط
-                    userChats[sender].push({
-                        role: 'user',
-                        content: `[أرسل PDF: "${fileName}" - مقتطف: ${pdfSummaryCtx}...]`
-                    });
-                    userChats[sender].push({ role: 'assistant', content: res });
-                    await reply(res);
-                    await react('✅');
+                    // طلب الإذن قبل الدخول لوضع PDF
+                    userPdfPending[sender] = { fileName, docText, expiresAt: Date.now() + 5 * 60_000 };
+                    await react('📄');
+                    await reply(`📄 *تم قراءة الملف بنجاح: ${fileName}*\n(${docText.length} حرف نصي)\n\nهل تريد أن أجيبك من هذا الملف فقط؟\nأرسل *نعم* للدخول لوضع الملف 📑\nأو *لا* للمتابعة بشكل عادي`);
 
                 } catch (e) {
                     console.error('[document]', e.message);
@@ -2574,6 +2567,87 @@ async function startBot() {
             // إذا كان المستخدم في انتظار نطق مصطلح أو دواء وأرسل "نعم"
             // ============================================================
             const bodyTrimmed = body.trim();
+
+            // ============================================================
+            // وضع PDF — إذا كان المستخدم في انتظار إذن PDF
+            // ============================================================
+            if (userPdfPending[sender] && Date.now() < userPdfPending[sender].expiresAt) {
+                const isYesPdf = /^(نعم|yes|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
+                const isNoPdf  = /^(لا|no|لأ)$/i.test(bodyTrimmed);
+                if (isYesPdf) {
+                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText };
+                    delete userPdfPending[sender];
+                    await react('📑');
+                    await reply(
+                        `📑 *تم تفعيل وضع الملف*\n"${userPdfContext[sender].fileName}"\n\n` +
+                        `الآن سأجيب على أسئلتك من هذا الملف فقط.\n` +
+                        `اكتب *خروج* للخروج من وضع الملف\n` +
+                        `اكتب *قائمة* للرجوع للقائمة الرئيسية`
+                    );
+                    return;
+                }
+                if (isNoPdf) {
+                    delete userPdfPending[sender];
+                    await react('✅');
+                    await reply('حسناً، سأتابع معك بشكل عادي. 👍');
+                    return;
+                }
+            }
+
+            // ============================================================
+            // وضع PDF النشط — الإجابة من الملف فقط
+            // ============================================================
+            if (userPdfContext[sender]) {
+                const { fileName, docText } = userPdfContext[sender];
+
+                // خروج من وضع الملف
+                if (/^خروج$/i.test(bodyTrimmed)) {
+                    delete userPdfContext[sender];
+                    await react('✅');
+                    await reply('تم الخروج من وضع الملف. يمكنك الآن إرسال أي سؤال بشكل عادي. 👋');
+                    return;
+                }
+
+                // رجوع للقائمة الرئيسية
+                if (/^قائمة$/i.test(bodyTrimmed)) {
+                    delete userPdfContext[sender];
+                    delete userModes[sender];
+                    userChats[sender] = [];
+                    await react('🔄');
+                    await reply(buildModeMenu(userName || ''));
+                    return;
+                }
+
+                // anti-spam
+                if (!checkSpam(sender)) {
+                    await reply('⚠️ أرسلت رسائل بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
+                    return;
+                }
+
+                await react('⏳');
+                try {
+                    const pdfSystemPrompt =
+                        `أنت مساعد متخصص في تحليل هذا الملف فقط: "${fileName}".\n` +
+                        `قواعد صارمة:\n` +
+                        `- أجب فقط من محتوى الملف المرفق\n` +
+                        `- إذا لم يكن الجواب في الملف قل: "هذه المعلومة غير موجودة في الملف"\n` +
+                        `- لا تضف معلومات خارجية أبداً\n` +
+                        `- اذكر رقم الصفحة أو الفقرة إن أمكن`;
+
+                    const res = await askAI([
+                        { role: 'system', content: pdfSystemPrompt },
+                        { role: 'user',   content: `--- محتوى الملف ---\n${docText.slice(0, 14000)}\n\n--- سؤال المستخدم ---\n${body}` }
+                    ]);
+                    await reply(res);
+                    await react('✅');
+                } catch (e) {
+                    console.error('[PDF mode]', e.message);
+                    await react('❌');
+                    await reply('حدث خطأ، يرجى المحاولة مرة أخرى.');
+                }
+                return;
+            }
+
             const isYes = /^(نعم|yes|نعم\s*✅|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
             if (isYes && userTTSPending[sender] && Date.now() < userTTSPending[sender].expiresAt) {
                 const { term, termAr } = userTTSPending[sender];
