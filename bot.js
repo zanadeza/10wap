@@ -240,129 +240,80 @@ const MODE_PROMPTS = {
 قواعد النظام — يجب اتباعها بدقة تامة:
 ══════════════════════════════
 
-1) إذا أرسل المستخدم أي شيء ليس مصطلحاً طبياً (سؤال عادي، كلام، طلب، أي موضوع آخر) رد بهذه الرسالة الثابتة فقط ولا تضيف أي شيء آخر:
+1) اقبل أي إدخال له صلة بالمجال الطبي والصحي بأي شكل كان:
+— مصطلح طبي رسمي: Meningitis · التهاب السحايا · Tachycardia
+— كلمة طبية بسيطة: قلب · كبد · دم · عظم · heart · liver
+— اسم مرض أو حالة: سكري · ضغط · ربو · سرطان · diabetes
+— اسم عضو أو جهاز: بنكرياس · الغدة الدرقية · pancreas
+— اسم دواء أو علاج: بنسيلين · أسبرين · penicillin
+— إجراء أو فحص: تحليل دم · رنين · MRI · خزعة
+— أعراض: صداع · ألم صدر · headache
+— أي كلمة أو مفهوم أو تعريف في المجال الطبي والصحي
 
-⚠️ هذا النظام مخصص للمصطلحات الطبية فقط.
-الرجاء كتابة مصطلح طبي صحيح.
+إذا أرسل المستخدم شيئاً لا علاقة له بالطب أو الصحة نهائياً (مثل: أسعار، طبخ، رياضة، سياسة، برمجة) رد بهذه الرسالة الثابتة فقط:
 
-📋 أمثلة على مصطلحات طبية:
-بالعربية: التهاب السحايا · السكتة الدماغية · الذبحة الصدرية · قصور القلب · السكري · الربو · التهاب الزائدة · هشاشة العظام
-In English: Meningitis · Hypertension · Diabetes · Arrhythmia · Pneumonia · Appendicitis · Osteoporosis · Tachycardia
+⚠️ هذا النظام مخصص للمجال الطبي والصحي فقط.
+الرجاء إرسال أي كلمة أو مصطلح أو مفهوم طبي.
+
+📋 أمثلة:
+بالعربية: قلب · سكري · التهاب · ضغط · كبد · سرطان · أسبرين · رنين مغناطيسي
+In English: heart · diabetes · inflammation · MRI · cancer · aspirin · fever
 
 💡 لتغيير النظام اكتب: !قائمة
 
 ══════════════════════════════
 
-2) إذا أرسل المستخدم مصطلحاً طبياً (بالعربية أو الإنجليزية أو كليهما) من أي تخصص طبي، اردّ بهذا النموذج الكامل والثابت بالضبط دون أي تغيير في الترتيب أو الشكل أو الأيقونات:
+2) إذا أرسل المستخدم أي كلمة أو مصطلح أو مفهوم له علاقة بالطب والصحة (بالعربية أو الإنجليزية أو كليهما)، اردّ بهذا النموذج الكامل والثابت بالضبط دون أي تغيير في الترتيب أو الشكل أو الأيقونات:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📌 المصطلح
 [المصطلح بالإنجليزية]
 [المصطلح بالعربية]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌐 أصل المصطلح
-[اذكر هنا واحداً فقط: يوناني / لاتيني / إنجليزي] — مع ذكر اللغة الأصلية والمعنى الحرفي للكلمة في تلك اللغة
+[اذكر هنا: يوناني / لاتيني / إنجليزي] من "[الكلمة الأصلية]" = [المعنى الحرفي] · "[الجزء الثاني إن وجد]" = [المعنى]
 
-──────────────────────────────
 🗣️ النطق — Pronunciation
-──────────────────────────────
+بالعربية: [النطق الصوتي الكامل بمقاطع واضحة مثال: مِـنِـنْـجَـايْـتِـس]
+In English: [English phonetic pronunciation مثال: men·in·JY·tis]
+🔤 IPA: [/الرموز الصوتية الدولية/]
 
-بالعربية: [النطق الصوتي الكامل بمقاطع واضحة — مثال: مِـنِـنْـجَـايْـتِـس]
-In English: [English phonetic pronunciation — example: men·in·JY·tis]
-🔤 IPA: [/الرموز الصوتية الدولية الكاملة/]
-
-──────────────────────────────
 🔸 المعنى المختصر
-──────────────────────────────
 [تعريف دقيق ومختصر في سطر أو سطرين]
 
-──────────────────────────────
-📋 التعريف الكامل — Full Definition
-──────────────────────────────
+📖 الشرح الطبي
+🔹 بالعربية: [فقرة علمية واضحة تشمل: ما هو المصطلح، أسبابه الرئيسية، أعراضه، وأهميته السريرية — بشكل مدمج ومتدفق وليس نقاطاً]
+🔹 In English: [Clear scientific paragraph covering: what it is, main causes, symptoms, and clinical significance — flowing text not bullet points]
 
-🔹 تعريف بالعربية:
-[تعريف علمي دقيق وشامل بالعربية يغطي: ماهية المصطلح بدقة، نوعه (حالة / إجراء / عضو / أعراض / مرض)، وضعه في التصنيف الطبي، وأي معلومة تعريفية جوهرية — مكتوب بشكل فقرة علمية واضحة ومنظمة وليس نقاطاً]
+━━ 🧬 تحليل المصطلح ━━
+🌱 الجذر: [الجذر]←[معنى الجذر بالعربية / meaning in English]
+⬅️ البادئة: [البادئة إن وجدت، وإلا اكتب: لا يوجد]
+➡️ اللاحقة: [اللاحقة]←[معناها بالعربية / meaning]
+📐 [البادئة +] [الجذر] + [اللاحقة] = [المعنى الحرفي الكامل]
 
-🔹 Definition in English:
-[Precise and comprehensive scientific definition in English covering: what the term is exactly, its type (condition / procedure / anatomy / symptom / disease), its medical classification, and any essential defining information — written as a clear scientific paragraph, not bullet points]
+🫀 الجهاز المصاب
+[الجهاز أو الأعضاء المصابة]
 
-──────────────────────────────
-📖 الشرح الطبي الشامل — Comprehensive Medical Explanation
-──────────────────────────────
+🦠 الأمراض المرتبطة
+[اذكر 4-5 أمراض مرتبطة بصيغة:
+Disease Name — الاسم بالعربية: وصف مختصر جداً]
 
-🔹 شرح بالعربية:
-• الأسباب والعوامل المؤدية: [اشرح الأسباب والمحفزات بالتفصيل]
-• الأعراض والعلامات: [اذكر الأعراض الرئيسية والثانوية]
-• التشخيص: [كيف يُشخَّص هذا المصطلح/الحالة]
-• العلاج والتدبير: [خيارات العلاج المتاحة]
-• المضاعفات والمخاطر: [ما قد ينتج إذا لم يُعالج]
-• التوقعات والإنذار: [ما هو المسار الطبيعي للحالة]
+⚕️ التخصص الطبي
+[التخصصات الطبية المعنية]
 
-🔹 Explanation in English:
-• Etiology & Risk Factors: [Explain causes and contributing factors in detail]
-• Signs & Symptoms: [List primary and secondary symptoms]
-• Diagnosis: [How this condition/term is diagnosed]
-• Treatment & Management: [Available treatment options]
-• Complications & Risks: [Potential outcomes if untreated]
-• Prognosis: [Expected course and outcomes]
+🔗 مصطلحات مرتبطة
+[5 مصطلحات بصيغة: Term — الترجمة العربية]
 
-──────────────────────────────
-🧬 تحليل المصطلح — Term Analysis
-──────────────────────────────
-
-🌱 الجذر — Root:
-[الجزء الأساسي من الكلمة] ← المعنى: [معنى الجذر بالعربية والإنجليزية]
-
-⬅️ البادئة — Prefix: (إن وجدت)
-[البادئة] ← المعنى: [معناها بالعربية والإنجليزية]
-
-➡️ اللاحقة — Suffix: (إن وجدت)
-[اللاحقة] ← المعنى: [معناها بالعربية والإنجليزية]
-
-📐 التركيب الكامل:
-[البادئة] + [الجذر] + [اللاحقة] = [المعنى الحرفي الكامل للمصطلح]
-
-──────────────────────────────
-🫀 الجهاز أو العضو المصاب — Affected System
-──────────────────────────────
-[اذكر الجهاز أو الأعضاء التي يصيبها هذا المصطلح — مثال: الجهاز العصبي المركزي / القلب والأوعية الدموية / الجهاز التنفسي ...]
-
-──────────────────────────────
-🦠 الأمراض المرتبطة — Related Diseases
-──────────────────────────────
-[اذكر 4-5 أمراض أو حالات طبية مرتبطة مباشرة بهذا المصطلح بصيغة:
-• Disease Name — اسم المرض بالعربية: وصف مختصر جداً]
-
-──────────────────────────────
-⚕️ التخصص الطبي — Medical Specialty
-──────────────────────────────
-[التخصص أو التخصصات الطبية التي تتعامل مع هذا المصطلح]
-
-──────────────────────────────
-🔗 مصطلحات مرتبطة — Related Terms
-──────────────────────────────
-[5 مصطلحات طبية مرتبطة بصيغة: Term — الترجمة العربية]
-
-──────────────────────────────
 💡 نصائح سريعة
-──────────────────────────────
-[3 نقاط عملية مفيدة عن استخدام المصطلح في السياق الطبي]
+• [نصيحة 1]
+• [نصيحة 2]
+• [نصيحة 3]
 
-──────────────────────────────
-📝 أمثلة تطبيقية — Examples
-──────────────────────────────
-بالعربية: [جملة كاملة تستخدم المصطلح في سياق طبي حقيقي]
-In English: [Full sentence using the term in a real medical context]
+📝 أمثلة تطبيقية
+بالعربية: [جملة كاملة في سياق طبي حقيقي]
+In English: [Full sentence in a real medical context]
 
-──────────────────────────────
-🎓 ملاحظة تعليمية — Learning Note
-──────────────────────────────
-[فقرة تعليمية بالإنجليزية للطلاب والمهنيين الصحيين: الأهمية السريرية، كيفية التمييز، والممارسة العملية]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 لتغيير النظام اكتب: !قائمة
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+🎓 Learning Note
+[فقرة تعليمية بالإنجليزية للطلاب والمهنيين الصحيين: الأهمية السريرية وكيفية التمييز والممارسة العملية]`,
 
     pharma: `أنت صيدلاني متخصص وخبير في علم الأدوية لجميع التخصصات الطبية. أجب على أي سؤال يتعلق بالأدوية.
 عندما يسأل المستخدم عن دواء أو مادة فعّالة، اردّ بهذا النموذج الثابت:
@@ -521,48 +472,77 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (Google TTS — مجاني بدون API Key)
+// TEXT-TO-SPEECH (espeak-ng محلي — يعمل بدون إنترنت على كل المستخدمين)
+// المتطلبات: apt install espeak-ng ffmpeg
 // ============================================================
+const { execFile } = require('child_process');
+const os           = require('os');
+const path         = require('path');
 
-// استخراج المصطلح أو الدواء من نص الرد لنطقه
-// يبحث عن أول سطر يحتوي على اسم المصطلح الإنجليزي (عادةً يكون في أول سطرين)
+// استخراج المصطلح الإنجليزي من نص الرد
 function extractTermForTTS(botReply) {
     const lines = botReply.split('\n').map(l => l.trim()).filter(Boolean);
-    // نبحث عن كلمة إنجليزية واضحة في أوائل الرد (المصطلح الطبي أو اسم الدواء)
     for (const line of lines.slice(0, 8)) {
-        // أزل الأيقونات والرموز والنقاط
         const clean = line.replace(/[📌⭐━─\-\*_#►•]/g, '').trim();
-        // إذا السطر يحتوي على كلمات إنجليزية بشكل رئيسي (مصطلح أو دواء)
         const englishWords = clean.match(/[A-Za-z][A-Za-z\s\-]+/g);
         if (englishWords) {
             const term = englishWords[0].trim();
-            if (term.length >= 3 && term.length <= 60) return term;
+            if (term.length >= 3 && term.length <= 80) return term;
         }
     }
     return null;
 }
 
-// توليد صوت Google TTS وإعادة Buffer
-async function generateGoogleTTS(text, lang = 'en') {
-    // Google Translate TTS API (غير رسمي لكن مجاني)
-    const encoded = encodeURIComponent(text.slice(0, 200));
-    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${lang}&client=tw-ob`;
-    const response = await fetchWithTimeout(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; MediaBot/1.0)',
-            'Referer': 'https://translate.google.com/'
-        }
-    }, 15_000);
-    if (!response.ok) throw new Error(`Google TTS HTTP ${response.status}`);
-    const arrayBuffer = await response.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+// توليد صوت بـ espeak-ng ثم تحويله لـ OGG/Opus عبر ffmpeg
+// lang: 'en' أو 'ar'
+function generateTTS(text, lang = 'en') {
+    return new Promise((resolve, reject) => {
+        const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const wavFile = path.join(os.tmpdir(), `tts_${tmpId}.wav`);
+        const oggFile = path.join(os.tmpdir(), `tts_${tmpId}.ogg`);
+
+        // خريطة لغات espeak-ng
+        const espeakLang = lang === 'ar' ? 'ar' : 'en';
+        // سرعة النطق: 130 للإنجليزي، 110 للعربي (أبطأ قليلاً للوضوح)
+        const speed = lang === 'ar' ? '110' : '130';
+
+        // الخطوة 1: espeak-ng → WAV
+        execFile('espeak-ng', [
+            '-v', espeakLang,
+            '-s', speed,
+            '-w', wavFile,
+            text.slice(0, 200)
+        ], (err) => {
+            if (err) return reject(new Error(`espeak-ng: ${err.message}`));
+
+            // الخطوة 2: ffmpeg WAV → OGG Opus (مضغوط ومناسب لـ WhatsApp)
+            execFile('ffmpeg', [
+                '-i', wavFile,
+                '-c:a', 'libopus',
+                '-b:a', '32k',
+                '-y', oggFile
+            ], (err2) => {
+                // نمسح WAV المؤقت دائماً
+                fs.unlink(wavFile, () => {});
+
+                if (err2) return reject(new Error(`ffmpeg: ${err2.message}`));
+
+                fs.readFile(oggFile, (err3, buf) => {
+                    // نمسح OGG المؤقت
+                    fs.unlink(oggFile, () => {});
+                    if (err3) return reject(new Error(`readFile: ${err3.message}`));
+                    resolve(buf);
+                });
+            });
+        });
+    });
 }
 
 // إرسال voice note لـ WhatsApp
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
     await sock.sendMessage(jid, {
         audio: audioBuffer,
-        mimetype: 'audio/mpeg',
+        mimetype: 'audio/ogg; codecs=opus',
         ptt: true   // ptt = push-to-talk → يظهر كرسالة صوتية وليس ملف صوتي
     }, quotedMsg ? { quoted: quotedMsg } : {});
 }
@@ -2617,13 +2597,13 @@ async function startBot() {
                 try {
                     // إرسال النطق الإنجليزي
                     if (term) {
-                        const audioEn = await generateGoogleTTS(term, 'en');
+                        const audioEn = await generateTTS(term, 'en');
                         await sendVoiceNote(jid, audioEn, msg);
                     }
                     // إرسال النطق العربي إذا وُجد (اسم الدواء أو المصطلح بالعربية)
                     if (termAr) {
                         await new Promise(r => setTimeout(r, 600));
-                        const audioAr = await generateGoogleTTS(termAr, 'ar');
+                        const audioAr = await generateTTS(termAr, 'ar');
                         await sendVoiceNote(jid, audioAr);
                     }
                     await react('✅');
