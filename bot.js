@@ -502,7 +502,7 @@ async function generateTTS(text, lang = 'en') {
     try {
         const response = await fetch(url);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const buffer = await response.buffer();
+        const buffer = Buffer.from(await response.arrayBuffer());
         if (!buffer || buffer.length < 100) throw new Error(`الملف الصوتي فارغ أو تالف (${buffer?.length} bytes)`);
         console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${buffer.length} bytes`);
         return buffer;
