@@ -1473,14 +1473,13 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     let result = { ok: true };
 
                     if (action === 'addVip') {
-                        const num = (data.num || '').replace(/\D/g, '');
-                        if (num && !vipNumbers.includes(num)) {
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else if (!vipNumbers.includes(num)) {
                             vipNumbers.push(num);
-                            // تاريخ الانتهاء: شهر من الآن
                             const expiry = Date.now() + 30 * 24 * 60 * 60_000;
                             vipExpiry[num] = expiry;
                             saveData();
-                            // إشعار المستخدم
                             if (sock && isConnected) {
                                 try {
                                     const expDate = new Date(expiry).toLocaleDateString('ar-SA');
@@ -1497,29 +1496,40 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                                     });
                                 } catch (_) {}
                             }
-                            result.msg = `تم تفعيل VIP للمستخدم ${num} لمدة شهر`;
-                        } else if (vipNumbers.includes(num)) {
-                            // تجديد الاشتراك — إضافة شهر من الآن
+                            result.msg = `✅ تم تفعيل VIP للمستخدم ${num} لمدة شهر`;
+                        } else {
+                            // تجديد — إضافة شهر من الآن أو من تاريخ الانتهاء الحالي أيهما أبعد
                             const current = vipExpiry[num] || Date.now();
                             vipExpiry[num] = Math.max(current, Date.now()) + 30 * 24 * 60 * 60_000;
                             saveData();
-                            result.msg = `تم تجديد VIP للمستخدم ${num} لشهر إضافي`;
+                            if (sock && isConnected) {
+                                try {
+                                    const expDate = new Date(vipExpiry[num]).toLocaleDateString('ar-SA');
+                                    await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                        text: `🔄 *تم تجديد اشتراكك المميز (VIP)*\n📅 الانتهاء الجديد: ${expDate}\nشكراً لثقتك بنا! 🌟`
+                                    });
+                                } catch (_) {}
+                            }
+                            result.msg = `✅ تم تجديد VIP للمستخدم ${num} لشهر إضافي`;
                         }
                     }
                     else if (action === 'removeVip') {
-                        const num = (data.num || '').replace(/\D/g, '');
-                        vipNumbers = vipNumbers.filter(n => n !== num);
-                        delete vipExpiry[num];
-                        saveData();
-                        // إشعار المستخدم
-                        if (num && sock && isConnected) {
-                            try {
-                                await sock.sendMessage(`${num}@s.whatsapp.net`, {
-                                    text: `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nيمكنك التجديد عبر التواصل مع المهندس نادر:\n👤 wa.me/972593850520`
-                                });
-                            } catch (_) {}
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else {
+                            const wasVip = vipNumbers.includes(num);
+                            vipNumbers = vipNumbers.filter(n => n !== num);
+                            delete vipExpiry[num];
+                            saveData();
+                            if (wasVip && sock && isConnected) {
+                                try {
+                                    await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                        text: `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nيمكنك التجديد عبر التواصل معنا:\n👤 wa.me/972593850520`
+                                    });
+                                } catch (_) {}
+                            }
+                            result.msg = wasVip ? `✅ تم إزالة VIP عن ${num}` : `المستخدم ${num} لم يكن VIP`;
                         }
-                        result.msg = 'تم إزالة VIP';
                     }
                     else if (action === 'deleteUser') {
                         const num = data.num;
@@ -1535,23 +1545,30 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                         saveData();
                     }
                     else if (action === 'addBlacklist') {
-                        const num = (data.num || '').replace(/\D/g, '');
-                        if (num && !blacklist.includes(num)) {
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else if (blacklist.includes(num)) {
+                            result.msg = `المستخدم ${num} محظور مسبقاً`;
+                        } else {
                             blacklist.push(num);
                             saveData();
-                            // إشعار المحظور تلقائياً
                             if (sock && isConnected) {
                                 try {
                                     await sock.sendMessage(`${num}@s.whatsapp.net`, { text: BLACKLIST_MSG });
                                 } catch (_) {}
                             }
+                            result.msg = `✅ تم حظر ${num} وإرسال إشعار`;
                         }
                     }
                     else if (action === 'removeBlacklist') {
-                        const num = (data.num || '').replace(/\D/g, '');
-                        blacklist = blacklist.filter(n => n !== num);
-                        saveData();
-                        result.msg = 'تم رفع الحظر';
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else {
+                            const wasBlocked = blacklist.includes(num);
+                            blacklist = blacklist.filter(n => n !== num);
+                            saveData();
+                            result.msg = wasBlocked ? `✅ تم رفع الحظر عن ${num}` : `المستخدم ${num} لم يكن محظوراً`;
+                        }
                     }
                     else if (action === 'clearSessions') {
                         userChats = {};
@@ -2394,40 +2411,50 @@ async function sendBroadcast(){
 }
 async function blockUser(num){
   if(!confirm('حظر المستخدم '+num+'؟ سيصله إشعار تلقائي.'))return;
-  const r=await api('addBlacklist',{num});
-  if(r.ok){toast('⛔ تم الحظر وإشعار المستخدم');loadData();}
-  else toast(r.msg||'فشل','#dc2626');
+  const r=await api('addBlacklist',{num:String(num)});
+  if(r.ok){toast('⛔ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل الحظر'),'#dc2626');
 }
 async function addBlacklist(){
-  const num=document.getElementById('bl-num').value.replace(/\D/g,'');
-  if(!num){toast('أدخل رقماً صحيحاً','#f59e0b');return;}
-  if(!confirm('حظر المستخدم '+num+'؟'))return;
+  const raw=document.getElementById('bl-num').value.trim();
+  const num=raw.replace(/\D/g,'');
+  if(!num){toast('❌ أدخل رقم هاتف صحيح','#dc2626');return;}
+  if(!confirm('حظر المستخدم '+num+'؟ سيصله إشعار تلقائي.'))return;
   const r=await api('addBlacklist',{num});
-  if(r.ok){toast('⛔ تم الحظر وإشعار المستخدم');document.getElementById('bl-num').value='';loadData();}
-  else toast(r.msg||'فشل','#dc2626');
+  if(r.ok){toast('⛔ '+r.msg);document.getElementById('bl-num').value='';loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 async function removeBlacklistNum(num){
   if(!confirm('رفع الحظر عن '+num+'؟'))return;
-  const r=await api('removeBlacklist',{num});
-  if(r.ok){toast('✅ تم رفع الحظر');loadData();}
-  else toast(r.msg||'فشل','#dc2626');
+  const r=await api('removeBlacklist',{num:String(num)});
+  if(r.ok){toast('✅ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 async function addVip(){
-  const num=document.getElementById('new-vip').value.replace(/\D/g,'');
-  if(!num){toast('أدخل رقماً صحيحاً','#f59e0b');return;}
+  const raw=document.getElementById('new-vip').value.trim();
+  const num=raw.replace(/\D/g,'');
+  if(!num){toast('❌ أدخل رقم هاتف صحيح','#dc2626');return;}
   const r=await api('addVip',{num});
-  if(r.ok){toast('✅ تم إضافة VIP');document.getElementById('new-vip').value='';loadData();}
+  if(r.ok){toast('⭐ '+r.msg);document.getElementById('new-vip').value='';loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
-async function addVipNum(num){const r=await api('addVip',{num});if(r.ok){toast('✅ تم إضافة VIP');loadData();}}
+async function addVipNum(num){
+  if(!confirm('تفعيل VIP للمستخدم '+num+'؟'))return;
+  const r=await api('addVip',{num:String(num)});
+  if(r.ok){toast('⭐ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
 async function removeVipNum(num){
-  if(!confirm('إزالة '+num+' من VIP؟'))return;
-  const r=await api('removeVip',{num});
-  if(r.ok){toast('تم الإزالة من VIP');loadData();}
+  if(!confirm('إزالة '+num+' من VIP؟ سيصله إشعار.'))return;
+  const r=await api('removeVip',{num:String(num)});
+  if(r.ok){toast('✅ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 async function deleteUser(num){
   if(!confirm('حذف هذا المستخدم نهائياً؟ لا يمكن التراجع.'))return;
-  const r=await api('deleteUser',{num});
-  if(r.ok){toast('تم الحذف');loadData();}
+  const r=await api('deleteUser',{num:String(num)});
+  if(r.ok){toast('✅ تم الحذف');loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 async function clearReports(){
   if(!confirm('مسح كل البلاغات؟'))return;
@@ -2451,9 +2478,9 @@ async function resetUserLimit(){
 }
 async function renewVip(num){
   if(!confirm('تجديد VIP للمستخدم '+num+' لشهر إضافي؟'))return;
-  const r=await api('addVip',{num});
-  if(r.ok){toast('✅ تم تجديد VIP لشهر إضافي');loadData();}
-  else toast(r.msg||'فشل','#dc2626');
+  const r=await api('addVip',{num:String(num)});
+  if(r.ok){toast('✅ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 
 async function quickSetLimit(num){
