@@ -29,6 +29,7 @@ const ADMIN_NUMBER    = '972593850520';   // بدون + أو @
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
 const WEB_PORT        = 8080;
+const PDF_CACHE_DIR   = './pdf_cache';  // مجلد حفظ كاش ملفات PDF
 
 // ============================================================
 // DASHBOARD AUTH
@@ -150,7 +151,86 @@ function cleanMemory() {
         toDelete.forEach(k => { delete userChats[k]; delete userChatLastSeen[k]; });
         console.log(`[cleanMemory] حُذف ${toDelete.length} جلسة قديمة (LRU)`);
     }
+    // تنظيف userPdfContext و userExamMode القديمة (أكثر من 6 ساعات)
+    const SIX_HOURS = 6 * 60 * 60_000;
+    const now = Date.now();
+    for (const k of Object.keys(userPdfContext)) {
+        if ((userPdfContext[k]?.loadedAt || 0) && now - userPdfContext[k].loadedAt > SIX_HOURS)
+            delete userPdfContext[k];
+    }
+    for (const k of Object.keys(userExamMode)) {
+        if ((userExamMode[k]?.loadedAt || 0) && now - userExamMode[k].loadedAt > SIX_HOURS)
+            delete userExamMode[k];
+    }
 }
+
+
+// ============================================================
+// PDF CACHE — حفظ واسترجاع نص PDF لتجنب إعادة الاستخراج
+// ============================================================
+function pdfCacheKey(fileName, buffer) {
+    // مفتاح مزدوج: اسم الملف + هاش MD5 للمحتوى (أدق)
+    const hash = crypto.createHash('md5').update(buffer).digest('hex').slice(0, 16);
+    const safeName = fileName.replace(/[^a-zA-Z0-9\u0600-\u06FF._-]/g, '_').slice(0, 60);
+    return `${safeName}__${hash}`;
+}
+
+function pdfCachePath(key) {
+    return require('path').join(PDF_CACHE_DIR, `${key}.json`);
+}
+
+function pdfCacheGet(key) {
+    try {
+        const p = pdfCachePath(key);
+        if (!fs.existsSync(p)) return null;
+        const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        // تحقق من صحة البيانات
+        if (!data || !data.docText) return null;
+        return data; // { fileName, docText, pageCount, savedAt }
+    } catch (_) { return null; }
+}
+
+function pdfCacheSet(key, fileName, docText, pageCount) {
+    try {
+        if (!fs.existsSync(PDF_CACHE_DIR))
+            fs.mkdirSync(PDF_CACHE_DIR, { recursive: true });
+        const p = pdfCachePath(key);
+        fs.writeFileSync(p, JSON.stringify({
+            fileName,
+            docText,
+            pageCount,
+            savedAt: Date.now()
+        }, null, 2));
+        console.log(`[pdfCache] حُفظ: ${key} (${Math.round(docText.length/1024)}KB نص)`);
+    } catch (e) {
+        console.error('[pdfCache] خطأ في الحفظ:', e.message);
+    }
+}
+
+// تنظيف كاش PDF القديمة (أكثر من 30 يوم) — يُستدعى عند بدء التشغيل وكل 24 ساعة
+function cleanPdfCache() {
+    try {
+        if (!fs.existsSync(PDF_CACHE_DIR)) return;
+        const THIRTY_DAYS = 30 * 24 * 60 * 60_000;
+        const now = Date.now();
+        let deleted = 0;
+        for (const f of fs.readdirSync(PDF_CACHE_DIR)) {
+            if (!f.endsWith('.json')) continue;
+            try {
+                const p = require('path').join(PDF_CACHE_DIR, f);
+                const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (now - (data.savedAt || 0) > THIRTY_DAYS) {
+                    fs.unlinkSync(p);
+                    deleted++;
+                }
+            } catch (_) {}
+        }
+        if (deleted > 0) console.log(`[pdfCache] تنظيف: حُذف ${deleted} ملف قديم`);
+    } catch (e) {
+        console.error('[pdfCache] خطأ في التنظيف:', e.message);
+    }
+}
+setInterval(cleanPdfCache, 24 * 60 * 60_000);
 
 // فحص دوري لانتهاء اشتراكات VIP
 function checkVIPExpiry() {
@@ -607,10 +687,17 @@ function extractTermForTTS(botReply) {
     const lines = botReply.split('\n').map(l => l.trim()).filter(Boolean);
     for (const line of lines.slice(0, 8)) {
         const clean = line.replace(/[📌⭐━─\-\*_#►•]/g, '').trim();
+        // أولاً: ابحث عن كلمة إنجليزية
         const englishWords = clean.match(/[A-Za-z][A-Za-z\s\-]+/g);
         if (englishWords) {
             const term = englishWords[0].trim();
             if (term.length >= 3 && term.length <= 80) return term;
+        }
+        // ثانياً: ابحث عن كلمة عربية إذا لم توجد إنجليزية
+        const arabicWords = clean.match(/[\u0600-\u06FF][\u0600-\u06FF\s]+/g);
+        if (arabicWords) {
+            const term = arabicWords[0].trim();
+            if (term.length >= 2 && term.length <= 80) return term;
         }
     }
     return null;
@@ -1159,97 +1246,43 @@ async function handleExamMode(sender, body, pages, docText, fileName, reply, rea
 
     await react('⏳');
 
-    // System prompt محكم للدقة العالية
+    // System prompt ذكي يفهم السؤال ويجيب من الملف
     const examSystemPrompt =
-        'أنت مساعد تعليمي خبير ودقيق للغاية. مهمتك الوحيدة: الإجابة على أسئلة المستخدم من الملف المرفق.\n\n' +
-        '══ قواعد صارمة لا تُخالَف أبداً ══\n\n' +
-        '1. اقرأ كل محتوى الملف بعناية شديدة:\n' +
-        '   - كل الفقرات والجمل والكلمات\n' +
-        '   - كل الجداول والأرقام والبيانات\n' +
-        '   - كل الصور والمخططات والرسوم البيانية\n' +
-        '   - كل العناوين والترويسات والهوامش\n\n' +
-        '2. إذا كان السؤال موجوداً في الملف:\n' +
-        '   ✅ أجب بدقة تامة ومفصلة من محتوى الملف\n' +
-        '   ✅ اذكر من أي جزء أخذت الإجابة\n' +
-        '   ✅ إذا كانت الإجابة رقماً أو تاريخاً أو اسماً — اذكره بالضبط\n\n' +
-        '3. إذا كان السؤال خارج الملف تماماً:\n' +
-        '   ❌ رد بهذه الجملة فقط:\n' +
-        '   "⚠️ هذا السؤال غير موجود في محتوى الملف المرفق."\n' +
-        '   لا تضيف معلومات من خارج الملف أبداً\n\n' +
-        '4. لا تخمّن ولا تتقوّل — إذا لم تجد الإجابة في الملف قل ذلك صراحةً\n' +
-        '5. الدقة قبل كل شيء — لا أخطاء إطلاقاً\n' +
-        '6. أجب بنفس لغة السؤال (عربي أو إنجليزي)\n\n' +
+        'أنت مساعد تعليمي ذكي ومتفهّم. مهمتك: الإجابة على أسئلة المستخدم اعتماداً على محتوى الملف المرفق.\n\n' +
+        '══ تعليمات الإجابة ══\n\n' +
+        '1. افهم السؤال جيداً — قد يكون السؤال مباشراً أو غير مباشر أو بصياغة مختلفة عما في الملف، ابحث عن المعنى لا عن النص الحرفي.\n' +
+        '2. إذا وجدت الإجابة في الملف (كاملةً أو جزئياً):\n' +
+        '   ✅ أجب بشكل واضح ومفصّل\n' +
+        '   ✅ اذكر الأرقام والتواريخ والأسماء بدقة\n' +
+        '   ✅ إذا كانت الإجابة موزعة على أجزاء عدة اجمعها معاً\n' +
+        '3. إذا لم يكن السؤال في الملف إطلاقاً:\n' +
+        '   ❌ أجب فقط: "⚠️ هذا السؤال غير موجود في محتوى الملف المرفق."\n' +
+        '4. لا تخترع معلومات ولا تضف شيئاً من خارج الملف\n' +
+        '5. أجب بنفس لغة السؤال (عربي أو إنجليزي)\n\n' +
         `الملف الحالي: "${fileName}"`;
 
     try {
-        let res;
+        // نستخدم النص دائماً — أسرع بكثير من إرسال الصور
+        const rawText = hasDocText ? docText : '';
+        const fullText = rawText.length > 60000
+            ? rawText.slice(0, 60000) + '\n\n[... باقي الملف محذوف بسبب الطول ...]'
+            : rawText;
 
-        if (hasPages) {
-            // ── وضع الصور: pixtral-large يقرأ كل شيء (نصوص + جداول + صور) ──
-            // نرسل الصفحات على دفعات إن كانت كثيرة لتجنب تجاوز حد الرموز
-            const MAX_PAGES_PER_CALL = 20;
-            let allPages = pages;
-
-            // إذا كانت الصفحات أكثر من MAX_PAGES_PER_CALL نستخدم النص كـ fallback إضافي
-            let extraContext = '';
-            if (pages.length > MAX_PAGES_PER_CALL) {
-                allPages = pages.slice(0, MAX_PAGES_PER_CALL);
-                if (hasDocText) {
-                    extraContext = '\n\n[ملاحظة: الملف يحتوي على صفحات إضافية. النص الكامل:\n' +
-                        docText.slice(0, 8000) + '\n]';
+        const res = await callMistral({
+            model: 'mistral-large-latest',
+            messages: [
+                { role: 'system', content: examSystemPrompt },
+                {
+                    role: 'user',
+                    content:
+                        '══ محتوى الملف ══\n' + fullText +
+                        '\n\n══ سؤال المستخدم ══\n' + bodyTrimmed +
+                        '\n\nأجب بدقة من محتوى الملف.'
                 }
-            }
-
-            const imageContents = allPages.map(b64 => ({
-                type: 'image_url',
-                image_url: { url: 'data:image/jpeg;base64,' + b64 }
-            }));
-
-            const userTextContent =
-                'اقرأ كل محتوى هذه الصفحات بعناية شديدة (النصوص والجداول والصور والأرقام).' +
-                extraContext +
-                '\n\n═══════════════\nسؤال المستخدم:\n' + bodyTrimmed +
-                '\n═══════════════\n\n' +
-                'أجب بدقة تامة وكاملة من محتوى الملف فقط. لا تضف أي معلومات خارجية.';
-
-            res = await callMistral({
-                model: 'pixtral-large-latest',
-                messages: [
-                    { role: 'system', content: examSystemPrompt },
-                    {
-                        role: 'user',
-                        content: [
-                            ...imageContents,
-                            { type: 'text', text: userTextContent }
-                        ]
-                    }
-                ],
-                max_tokens: 3000,
-                temperature: 0.1
-            });
-
-        } else {
-            // ── وضع النص فقط (fallback) ──
-            const fullText = docText.length > 20000
-                ? docText.slice(0, 20000) + '\n\n[... باقي الملف محذوف بسبب الطول ...]'
-                : docText;
-
-            res = await callMistral({
-                model: 'mistral-large-latest',
-                messages: [
-                    { role: 'system', content: examSystemPrompt },
-                    {
-                        role: 'user',
-                        content:
-                            '══ محتوى الملف الكامل ══\n' + fullText +
-                            '\n\n══ سؤال المستخدم ══\n' + bodyTrimmed +
-                            '\n\nأجب بدقة تامة وكاملة من محتوى الملف فقط.'
-                    }
-                ],
-                max_tokens: 3000,
-                temperature: 0.1
-            });
-        }
+            ],
+            max_tokens: 2048,  // حد آمن لجميع نماذج Mistral
+            temperature: 0.3
+        }, 4);   // 4 محاولات بدل 3
 
         // إرسال الجواب مع header واضح
         await reply(
@@ -2827,7 +2860,8 @@ async function startBot() {
                     await reply('⚠️ أرسلت ملفات بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
                 }
-                if (!checkDailyLimit(sender, 'pdf')) {
+                // لا نخصم حد PDF إذا كان المستخدم في وضع نظام الاختبارات
+                if (!userExamPending[sender] && !checkDailyLimit(sender, 'pdf')) {
                     await reply('⚠️ وصلت للحد اليومي للملفات (10 ملفات/يوم).');
                     return;
                 }
@@ -2887,7 +2921,50 @@ async function startBot() {
                         return;
                     }
 
-                    // تحويل PDF دائماً لصور بـ mutool (يقرأ النص والصور معاً)
+                    // ── فحص الكاش أولاً (اسم + هاش المحتوى) ──
+                    const cacheKey  = pdfCacheKey(fileName, buffer);
+                    const cacheHit  = pdfCacheGet(cacheKey);
+
+                    if (cacheHit) {
+                        // ✅ الملف موجود في الكاش — تحميل فوري بدون استخراج
+                        console.log(`[PDF] كاش موجود: ${cacheKey}`);
+                        const { docText, pageCount } = cacheHit;
+                        const pages = []; // الصور غير محفوظة في الكاش، نستخدم النص
+
+                        stats.totalDocs = (stats.totalDocs || 0) + 1;
+                        saveData();
+
+                        if (userExamPending[sender]) {
+                            delete userExamPending[sender];
+                            userExamMode[sender] = { fileName, pages, docText, loadedAt: Date.now() };
+                            await react('📚');
+                            await reply(
+                                `✅ *تم تحميل الملف من الذاكرة المؤقتة!*\n` +
+                                `📄 الملف: "${fileName}" (${pageCount} صفحة)\n` +
+                                `⚡ *تم تحميله بشكل فوري — موجود مسبقاً في النظام*\n\n` +
+                                `🤖 جاهز للإجابة على أسئلتك!\n\n` +
+                                `_اكتب *خروج* للخروج من نظام الاختبارات_`
+                            );
+                        } else {
+                            userPdfPending[sender] = {
+                                fileName,
+                                docText,
+                                pages,
+                                expiresAt: Date.now() + 5 * 60_000
+                            };
+                            await react('📄');
+                            await reply(
+                                `📄 *"${fileName}"*\n` +
+                                `⚡ هذا الملف موجود مسبقاً في النظام (${pageCount} صفحة) — تم تحميله فوراً!\n\n` +
+                                `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
+                                `أرسل *نعم* للدخول لوضع الملف 📑\n` +
+                                `أو *لا* للمتابعة بشكل عادي`
+                            );
+                        }
+                        return;
+                    }
+
+                    // ── الملف جديد — استخراج كامل ──
                     console.log(`[PDF] جاري تحويل "${fileName}" بـ mutool...`);
                     const tmpDir = `${os.tmpdir()}/pdf_${sender}_${Date.now()}`;
                     try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (_) {}
@@ -2924,6 +3001,9 @@ async function startBot() {
                             const parsed = await pdfParse(buffer);
                             docText = (parsed.text || '').trim();
                         } catch (_) {}
+
+                        // ── حفظ في الكاش بعد نجاح الاستخراج ──
+                        if (docText) pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
 
                         // خصم الحد بعد نجاح التحويل فقط (لا نظلم المستخدم عند الفشل)
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
@@ -3016,7 +3096,6 @@ async function startBot() {
                             await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`);
                             return;
                         }
-                        ttsQuota.commit?.(); // خصم بعد التحقق من الإذن
                     }
 
                     // Voxtral يفهم الصوت ويرد مباشرة — بدون OpenAI
@@ -3042,6 +3121,7 @@ async function startBot() {
                         audioFinalRes += `\n\n─────────────\n_🔊 صوت: ${ttsLeft3} | 💬 رسائل: ${msgLeft3} | 🖼️ صور: ${imgLeft3}_`;
                     }
                     await reply(audioFinalRes);
+                    if (!isVIPaudio) ttsQuota.commit?.(); // خصم بعد نجاح الرد فعلياً
                     await react('✅');
 
                 } catch (audioErr) {
@@ -3077,7 +3157,7 @@ async function startBot() {
                 const isYesPdf = /^(نعم|yes|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
                 const isNoPdf  = /^(لا|no|لأ)$/i.test(bodyTrimmed);
                 if (isYesPdf) {
-                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText, pages: userPdfPending[sender].pages || null };
+                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText, pages: userPdfPending[sender].pages || null, loadedAt: Date.now() };
                     delete userPdfPending[sender];
                     await react('📑');
                     await reply(
@@ -3267,7 +3347,6 @@ async function startBot() {
                         );
                         return;
                     }
-                    ttsCheck.commit?.(); // خصم بعد التحقق من الإذن
                 }
                 const ttsText = ttsMatch[1].trim();
                 await react('🔊');
@@ -3275,6 +3354,7 @@ async function startBot() {
                     const lang = /[\u0600-\u06FF]/.test(ttsText) ? 'ar' : 'en';
                     const audio = await generateTTS(ttsText, lang);
                     await sendVoiceNote(jid, audio, msg);
+                    if (!isAdmin && !isVIPnow) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
                     await react('✅');
                 } catch (e) {
                     await react('❌');
@@ -3319,11 +3399,11 @@ async function startBot() {
                             await react('✅');
                             return;
                         }
-                        ttsCheck.commit?.(); // خصم بعد التحقق من الإذن
                     }
                     await new Promise(r => setTimeout(r, 300));
                     const audio = await generateTTS(translationResult, targetLangCode);
                     await sendVoiceNote(jid, audio);
+                    if (!isAdmin && !isVIPnow) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
                     await react('✅');
                 } catch (e) {
                     console.error('[translate]', e.message);
@@ -3472,13 +3552,13 @@ setInterval(checkVIPExpiry, 60 * 60_000);
 
     // دالة مرنة: تبحث عن الأداة في كل المسارات المحتملة
     function findTool(name) {
-        // 1) which / where (Linux/Mac/Termux)
+        // 1) which / where (Linux/Mac/Termux) — timeout قصير لمنع التعليق
         try {
-            const r = spawnSync('which', [name], { encoding: 'utf8' });
-            if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
+            const r = spawnSync('which', [name], { encoding: 'utf8', timeout: 3000 });
+            if (!r.error && r.status === 0 && r.stdout.trim()) return r.stdout.trim();
         } catch (_) {}
 
-        // 2) مسارات Termux الشائعة
+        // 2) مسارات Termux الشائعة (بدون spawnSync — فحص وجود الملف فقط)
         const termuxPaths = [
             `/data/data/com.termux/files/usr/bin/${name}`,
             `/data/data/com.termux/files/usr/local/bin/${name}`,
@@ -3492,17 +3572,17 @@ setInterval(checkVIPExpiry, 60 * 60_000);
             } catch (_) {}
         }
 
-        // 3) محاولة تشغيل مباشرة (قد يكون في PATH لكن which لا تجده)
+        // 3) محاولة تشغيل مباشرة — timeout صارم لمنع التعليق
         try {
-            const r = spawnSync(name, ['--version'], { encoding: 'utf8', timeout: 3000 });
-            if (r.status === 0 || r.stderr) return name; // موجود
+            const r = spawnSync(name, ['--version'], { encoding: 'utf8', timeout: 2000 });
+            if (!r.error && (r.status === 0 || (r.stderr && r.stderr.length > 0))) return name;
         } catch (_) {}
 
         // 4) للـ mutool تحديداً — تجربة اسم بديل
         if (name === 'mutool') {
             try {
-                const r = spawnSync('mupdf', ['--version'], { encoding: 'utf8', timeout: 3000 });
-                if (r.status === 0 || r.stderr) return 'mupdf';
+                const r = spawnSync('mupdf', ['--version'], { encoding: 'utf8', timeout: 2000 });
+                if (!r.error && (r.status === 0 || (r.stderr && r.stderr.length > 0))) return 'mupdf';
             } catch (_) {}
         }
 
@@ -3531,6 +3611,7 @@ setInterval(checkVIPExpiry, 60 * 60_000);
     console.log('✅ جميع التبعيات موجودة وجاهزة.');
 })();
 
+cleanPdfCache(); // تنظيف كاش PDF القديمة عند البدء
 console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
 startQRServer();
 startBot();
