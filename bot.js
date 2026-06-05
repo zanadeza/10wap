@@ -52,6 +52,7 @@ function isValidSession(req) {
         return false;
     }
     s.createdAt = Date.now(); // تجديد تلقائي عند كل طلب
+    // ملاحظة: لا نفحص IP لأن Ngrok يغير الـ IP
     return true;
 }
 function parseCookie(str) {
@@ -70,7 +71,7 @@ setInterval(() => {
 let currentQR = null;
 let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
-const API_TIMEOUT_MS  = 60_000;         // 60 ثانية timeout للـ API (pixtral-large يحتاج وقت أكثر)
+const API_TIMEOUT_MS  = 120_000;        // 120 ثانية timeout للـ API (pixtral-large يحتاج وقت أكثر)
 
 // ============================================================
 // PERSISTENCE
@@ -135,6 +136,8 @@ let userModes       = {};  // وضع كل مستخدم: 'terms' | 'pharma' | 'me
 let userTTSPending  = {};  // { sender: { term, lang, expiresAt } } — انتظار "نعم" لإرسال النطق
 let userPdfContext  = {};  // { sender: { fileName, docText } } — محتوى PDF النشط
 let userPdfPending  = {};  // { sender: { fileName, docText, expiresAt } } — انتظار إذن المستخدم
+let userExamMode    = {};  // { sender: { fileName, pages, docText, loadedAt } } — نظام الاختبارات (VIP فقط)
+let userExamPending = {};  // { sender: true } — ينتظر PDF لنظام الاختبارات
 let sock            = null;
 let isReconnecting  = false; // منع الاتصال المتعدد
 
@@ -177,18 +180,16 @@ function checkVIPExpiry() {
 // توقيت القدس — طريقة موثوقة على جميع البيئات (Linux/Windows/Mac)
 function nowJerusalem() {
     const now = new Date();
-    const fmt = new Intl.DateTimeFormat('en-CA', {
+    const formatter = new Intl.DateTimeFormat('en-US', {
         timeZone: 'Asia/Jerusalem',
         year: 'numeric', month: '2-digit', day: '2-digit',
         hour: '2-digit', minute: '2-digit', second: '2-digit',
         hour12: false
     });
-    const parts = fmt.formatToParts(now);
+    const parts = formatter.formatToParts(now);
     const get = type => parts.find(p => p.type === type)?.value || '00';
-    // نستخرج القيم بتوقيت القدس ونبني التاريخ كـ local time صريح
-    // الهدف: الحصول على كائن Date يمثّل "الآن بتوقيت القدس" للحسابات الداخلية
-    const isoStr = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}+00:00`;
-    return new Date(isoStr);
+    // نبني التاريخ بدون timezone offset حتى يُعامَل كـ local time
+    return new Date(`${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}`);
 }
 
 // ============================================================
@@ -250,8 +251,8 @@ function checkDailyTTS(sender) {
     const d = getDailyRecord(sender);
     if (d.tts >= DAILY_TTS_LIMIT) return { allowed: false, remaining: 0 };
     const remaining = DAILY_TTS_LIMIT - d.tts - 1;
-    d.tts++;
-    return { allowed: true, remaining };
+    // لا نخصم هنا — نترك الخصم للمستدعي بعد النجاح الفعلي
+    return { allowed: true, remaining, commit: () => { d.tts++; } };
 }
 
 // فحص الحد اليومي للصور والملفات
@@ -531,7 +532,14 @@ function getModeSystemPrompt(mode) {
 
 // كشف إذا كانت الرسالة تتعلق بالمجال الطبي
 function isMedicalQuery(text) {
-    return /دواء|دوا|حبة|علاج|مرض|أعراض|جرعة|وصفة|صيدلي|طبيب|مستشفى|عملية|سكري|ضغط|قلب|كبد|كلى|دم|تحليل|أشعة|رنين|سرطان|التهاب|ألم|حرارة|انفلونزا|covid|corona|كورونا|فيروس|بكتيريا|مضاد حيوي|بنسيلين|ابتوفين|باراسيتامول|اسبرين|ميزوبروستول|فيتامين|هرمون|انسولين|قرحة|ربو|صداع|دوخة|غثيان|اقياء|اسهال|امساك|جلد|عظم|مفصل|عصب|نفسي|اكتئاب|قلق|ضغط دم|كوليسترول|triglyceride|glucose|hemoglobin|wbc|rbc|platelet|creatinine|uric acid|bilirubin|الت|الغدة|بنكرياس|زائدة|حوصلة|الكوليرا|ملاريا|هيباتيتس|hepatitis|diabetes|hypertension|infection|antibiotic|surgery|physician|hospital|diagnosis|prescription|symptom|medication|dosage|overdose|allergy|immune|vaccine|cholesterol|مصطلح طبي|anatomy|physiology|pathology|pharmacology|medical|medicine|health|صحة|طب|صيدلة/i.test(text || '');
+    const t = text || '';
+    // كلمات طبية واضحة
+    if (/دواء|دوا|حبة|علاج|مرض|أعراض|جرعة|وصفة|صيدلي|طبيب|مستشفى|عملية|سكري|قلب|كبد|كلى|تحليل|أشعة|رنين|سرطان|التهاب|ألم|حرارة|انفلونزا|covid|corona|كورونا|فيروس|بكتيريا|مضاد حيوي|بنسيلين|ابتوفين|باراسيتامول|اسبرين|ميزوبروستول|فيتامين|هرمون|انسولين|قرحة|ربو|صداع|دوخة|غثيان|اقياء|اسهال|امساك|عظم|مفصل|عصب|نفسي|اكتئاب|قلق|كوليسترول|triglyceride|glucose|hemoglobin|wbc|rbc|platelet|creatinine|uric acid|bilirubin|الغدة|بنكرياس|زائدة|حوصلة|الكوليرا|ملاريا|هيباتيتس|hepatitis|diabetes|hypertension|infection|antibiotic|surgery|physician|hospital|diagnosis|prescription|symptom|medication|dosage|overdose|allergy|immune|vaccine|cholesterol|مصطلح طبي|anatomy|physiology|pathology|pharmacology|medical|medicine|health|صحة|طب|صيدلة/i.test(t)) return true;
+    // "ضغط" فقط إذا كانت مع كلمات طبية (ضغط دم، ارتفاع ضغط)
+    if (/ضغط\s*دم|ارتفاع\s*ضغط|انخفاض\s*ضغط|ضغط\s*الدم/i.test(t)) return true;
+    // "دم" مع سياق طبي فقط (نتجنب: دمار، دمج)
+    if (/تحليل دم|فصيلة دم|ضغط دم|نقل دم|كريات دم|دم في|نزيف/i.test(t)) return true;
+    return false;
 }
 
 // اختيار System Prompt الذكي بناءً على محتوى الرسالة
@@ -1035,23 +1043,29 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     // !رصيد — عرض الرصيد المتبقي
     if (command === '!رصيد' || command === '!balance') {
         if (isAdmin || isVIP) {
-            await reply('♾️ *رصيدك غير محدود* (VIP/أدمن)');
+            await reply('♾️ *رصيدك غير محدود* (VIP/أدمن)\n\n💬 رسائل: ♾️\n🖼️ صور: ♾️\n🔊 صوت/ترجمة: ♾️\n📄 PDF: ♾️ بلا حد للحجم');
         } else {
-            const limit = getUserDailyLimit(sender);
-            const rec   = getDailyRecord(sender);
-            const used  = rec.messages;
-            const remaining = Math.max(0, limit - used);
-            const ttsUsed = rec.tts || 0;
-            const imgUsed = rec.images || 0;
+            const limit    = getUserDailyLimit(sender);
+            const rec      = getDailyRecord(sender);
+            const msgUsed  = rec.messages || 0;
+            const imgUsed  = rec.images   || 0;
+            const ttsUsed  = rec.tts      || 0;
+            const msgLeft  = Math.max(0, limit - msgUsed);
+            const imgLeft  = Math.max(0, DAILY_IMG_LIMIT - imgUsed);
+            const ttsLeft  = Math.max(0, DAILY_TTS_LIMIT - ttsUsed);
             const resetDate = new Date(rec.resetAt);
             const resetStr  = resetDate.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
             await reply(
-                `📊 *رصيدك اليومي:*\n\n` +
-                `💬 الرسائل: ${used}/${limit} (متبقي: ${remaining})\n` +
-                `🖼️ الصور: ${imgUsed}/${DAILY_IMG_LIMIT} (متبقي: ${Math.max(0, DAILY_IMG_LIMIT - imgUsed)})\n` +
-                `🔊 الصوت/الترجمة: ${ttsUsed}/${DAILY_TTS_LIMIT} (متبقي: ${Math.max(0, DAILY_TTS_LIMIT - ttsUsed)})\n` +
-                `🔄 يتجدد عند: ${resetStr}\n\n` +
-                `_للاشتراك المميز (غير محدود) تواصل مع المهندس نادر_\n` +
+                `📊 *رصيدك اليومي — النسخة المجانية:*\n\n` +
+                `💬 الرسائل النصية:    ${msgUsed}/${limit} — متبقي: *${msgLeft}*\n` +
+                `🖼️ الصور المحللة:     ${imgUsed}/${DAILY_IMG_LIMIT} — متبقي: *${imgLeft}*\n` +
+                `🔊 الرسائل الصوتية:  ${ttsUsed}/${DAILY_TTS_LIMIT} — متبقي: *${ttsLeft}*\n` +
+                `📄 PDF:              حد الحجم 1MB فقط\n\n` +
+                `🔄 يتجدد تلقائياً عند: *${resetStr}*\n\n` +
+                `─────────────\n` +
+                `💎 *النسخة المميزة (VIP):*\n` +
+                `✅ رسائل + صور + صوت: ♾️ غير محدود\n` +
+                `✅ PDF: بدون حد للحجم\n` +
                 `👤 wa.me/972593850520`
             );
         }
@@ -1109,9 +1123,164 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     return false; // لم يُعرَّف الأمر
 }
 
+// ============================================================
+// EXAM MODE — نظام الاختبارات (VIP فقط)
+// ============================================================
+// ============================================================
+// نظام الاختبارات — معالجة الأسئلة (VIP فقط)
+// ============================================================
+async function handleExamMode(sender, body, pages, docText, fileName, reply, react) {
+    const bodyTrimmed = (body || '').trim();
+
+    // خروج من نظام الاختبارات
+    if (/^(خروج|exit|إلغاء|الغاء|cancel)$/i.test(bodyTrimmed)) {
+        delete userExamMode[sender];
+        await react('✅');
+        await reply(
+            '👋 تم الخروج من *نظام الاختبارات*.\n\n' +
+            'يمكنك استخدام البوت بشكل طبيعي الآن.\n' +
+            '_أرسل *111* في أي وقت لتفعيل نظام الاختبارات مجدداً._'
+        );
+        return;
+    }
+
+    // تحقق من وجود محتوى الملف
+    const hasPages   = Array.isArray(pages)  && pages.length  > 0;
+    const hasDocText = typeof docText === 'string' && docText.trim().length > 0;
+
+    if (!hasPages && !hasDocText) {
+        await react('❌');
+        await reply(
+            '⚠️ لم يتم تحميل محتوى الملف بشكل صحيح.\n\n' +
+            'أرسل *111* وأعد رفع ملف PDF من جديد.'
+        );
+        return;
+    }
+
+    await react('⏳');
+
+    // System prompt محكم للدقة العالية
+    const examSystemPrompt =
+        'أنت مساعد تعليمي خبير ودقيق للغاية. مهمتك الوحيدة: الإجابة على أسئلة المستخدم من الملف المرفق.\n\n' +
+        '══ قواعد صارمة لا تُخالَف أبداً ══\n\n' +
+        '1. اقرأ كل محتوى الملف بعناية شديدة:\n' +
+        '   - كل الفقرات والجمل والكلمات\n' +
+        '   - كل الجداول والأرقام والبيانات\n' +
+        '   - كل الصور والمخططات والرسوم البيانية\n' +
+        '   - كل العناوين والترويسات والهوامش\n\n' +
+        '2. إذا كان السؤال موجوداً في الملف:\n' +
+        '   ✅ أجب بدقة تامة ومفصلة من محتوى الملف\n' +
+        '   ✅ اذكر من أي جزء أخذت الإجابة\n' +
+        '   ✅ إذا كانت الإجابة رقماً أو تاريخاً أو اسماً — اذكره بالضبط\n\n' +
+        '3. إذا كان السؤال خارج الملف تماماً:\n' +
+        '   ❌ رد بهذه الجملة فقط:\n' +
+        '   "⚠️ هذا السؤال غير موجود في محتوى الملف المرفق."\n' +
+        '   لا تضيف معلومات من خارج الملف أبداً\n\n' +
+        '4. لا تخمّن ولا تتقوّل — إذا لم تجد الإجابة في الملف قل ذلك صراحةً\n' +
+        '5. الدقة قبل كل شيء — لا أخطاء إطلاقاً\n' +
+        '6. أجب بنفس لغة السؤال (عربي أو إنجليزي)\n\n' +
+        `الملف الحالي: "${fileName}"`;
+
+    try {
+        let res;
+
+        if (hasPages) {
+            // ── وضع الصور: pixtral-large يقرأ كل شيء (نصوص + جداول + صور) ──
+            // نرسل الصفحات على دفعات إن كانت كثيرة لتجنب تجاوز حد الرموز
+            const MAX_PAGES_PER_CALL = 20;
+            let allPages = pages;
+
+            // إذا كانت الصفحات أكثر من MAX_PAGES_PER_CALL نستخدم النص كـ fallback إضافي
+            let extraContext = '';
+            if (pages.length > MAX_PAGES_PER_CALL) {
+                allPages = pages.slice(0, MAX_PAGES_PER_CALL);
+                if (hasDocText) {
+                    extraContext = '\n\n[ملاحظة: الملف يحتوي على صفحات إضافية. النص الكامل:\n' +
+                        docText.slice(0, 8000) + '\n]';
+                }
+            }
+
+            const imageContents = allPages.map(b64 => ({
+                type: 'image_url',
+                image_url: { url: 'data:image/jpeg;base64,' + b64 }
+            }));
+
+            const userTextContent =
+                'اقرأ كل محتوى هذه الصفحات بعناية شديدة (النصوص والجداول والصور والأرقام).' +
+                extraContext +
+                '\n\n═══════════════\nسؤال المستخدم:\n' + bodyTrimmed +
+                '\n═══════════════\n\n' +
+                'أجب بدقة تامة وكاملة من محتوى الملف فقط. لا تضف أي معلومات خارجية.';
+
+            res = await callMistral({
+                model: 'pixtral-large-latest',
+                messages: [
+                    { role: 'system', content: examSystemPrompt },
+                    {
+                        role: 'user',
+                        content: [
+                            ...imageContents,
+                            { type: 'text', text: userTextContent }
+                        ]
+                    }
+                ],
+                max_tokens: 3000,
+                temperature: 0.1
+            });
+
+        } else {
+            // ── وضع النص فقط (fallback) ──
+            const fullText = docText.length > 20000
+                ? docText.slice(0, 20000) + '\n\n[... باقي الملف محذوف بسبب الطول ...]'
+                : docText;
+
+            res = await callMistral({
+                model: 'mistral-large-latest',
+                messages: [
+                    { role: 'system', content: examSystemPrompt },
+                    {
+                        role: 'user',
+                        content:
+                            '══ محتوى الملف الكامل ══\n' + fullText +
+                            '\n\n══ سؤال المستخدم ══\n' + bodyTrimmed +
+                            '\n\nأجب بدقة تامة وكاملة من محتوى الملف فقط.'
+                    }
+                ],
+                max_tokens: 3000,
+                temperature: 0.1
+            });
+        }
+
+        // إرسال الجواب مع header واضح
+        await reply(
+            '📚 *نظام الاختبارات*\n' +
+            '📄 ' + fileName + '\n' +
+            '─────────────\n\n' +
+            res +
+            '\n\n─────────────\n' +
+            '_💡 اكتب سؤالاً آخر أو اكتب *خروج* للخروج_'
+        );
+        await react('✅');
+
+    } catch (e) {
+        console.error('[examMode]', e.message);
+        await react('❌');
+        if (e.message === 'AUTH_ERROR') {
+            await reply('عذراً، مشكلة في إعدادات الخدمة. تم إشعار الأدمن.');
+        } else if (e.message === 'QUOTA_ERROR') {
+            await reply('عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.');
+        } else if (e.name === 'AbortError') {
+            await reply('⏱️ الملف كبير واستغرق وقتاً طويلاً. يرجى المحاولة مرة أخرى أو إرسال ملف أصغر.');
+        } else {
+            await reply('حدث خطأ أثناء معالجة سؤالك. يرجى المحاولة مرة أخرى.');
+        }
+    }
+}
+
 
 // كل مستخدم رسالة عشوائية مختلفة + rate limiting ذكي
 async function broadcastToAll(getTextFn) {
+    if (!isConnected) { console.log("[broadcast] البوت غير متصل"); return { sent: 0, failed: 0, total: 0 }; }
     const allUsers = Object.keys(welcomedUsers)
         .map(n => cleanNumber(n))
         .filter(n => n && n !== ADMIN_NUMBER && /^\d+$/.test(n));
@@ -1244,7 +1413,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                         const token = generateToken();
                         _sessions[token] = { ip, createdAt: Date.now() };
                         res.writeHead(302, {
-                            'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Strict`,
+                            'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Lax`,
                             'Location': '/'
                         });
                         res.end();
@@ -1316,7 +1485,15 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                                 try {
                                     const expDate = new Date(expiry).toLocaleDateString('ar-SA');
                                     await sock.sendMessage(`${num}@s.whatsapp.net`, {
-                                        text: `🎉 *تهانينا! تم تفعيل اشتراكك المميز (VIP)*\n\n✅ صلاحياتك الآن:\n• رسائل غير محدودة\n• صور غير محدودة\n• صوت وترجمة غير محدودة\n\n📅 تاريخ الانتهاء: ${expDate}\n\nشكراً لاشتراكك! 🌟`
+                                        text:
+                                            `🌟 *تهانينا! تم تفعيل اشتراكك المميز (VIP)*\n\n` +
+                                            `✅ *صلاحياتك الآن غير محدودة:*\n` +
+                                            `💬 رسائل: ♾️ غير محدودة\n` +
+                                            `🖼️ صور: ♾️ غير محدودة\n` +
+                                            `🔊 صوت وترجمة: ♾️ غير محدودة\n` +
+                                            `📄 ملفات PDF: ♾️ بدون حد للحجم\n\n` +
+                                            `📅 تاريخ الانتهاء: ${expDate}\n\n` +
+                                            `شكراً لثقتك بنا! 🎉`
                                     });
                                 } catch (_) {}
                             }
@@ -1953,7 +2130,7 @@ function toast(msg,color){
 
 async function api(action,data={}){
   try{
-    const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,data})});
+    const r=await fetch('/api',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,data})});
     if(r.status===401){window.location.href='/login';return{ok:false};}
     return await r.json();
   }catch(e){toast('خطأ في الاتصال','#dc2626');return{ok:false};}
@@ -1961,7 +2138,7 @@ async function api(action,data={}){
 
 async function loadData(){
   try{
-    const r=await fetch('/data');
+    const r=await fetch('/data',{credentials:'include'});
     if(r.status===401){window.location.href='/login';return;}
     _data=await r.json();
     updateUI();
@@ -2279,9 +2456,6 @@ async function renewVip(num){
   else toast(r.msg||'فشل','#dc2626');
 }
 
-  const r=await api('resetUserLimit',{num});
-  if(r.ok){toast('تم الإعادة للافتراضي');loadData();}
-}
 async function quickSetLimit(num){
   const val=prompt('عدد الرسائل اليومية للمستخدم '+num+':');
   if(val===null)return;
@@ -2289,6 +2463,12 @@ async function quickSetLimit(num){
   if(isNaN(limit)||limit<0){toast('رقم غير صحيح','#f59e0b');return;}
   const r=await api('setUserLimit',{num,limit});
   if(r.ok){toast('✅ تم وتم إشعار المستخدم');loadData();}
+  else toast(r.msg||'فشل','#dc2626');
+}
+async function resetUserLimitNum(num){
+  if(!confirm('إعادة حد '+num+' للافتراضي؟'))return;
+  const r=await api('resetUserLimit',{num});
+  if(r.ok){toast('تم الإعادة للافتراضي');loadData();}
   else toast(r.msg||'فشل','#dc2626');
 }
 
@@ -2546,6 +2726,16 @@ async function startBot() {
             // معالجة أنواع الرسائل
             // ============================================================
 
+            // ── تذكير: إذا كان ينتظر PDF لنظام الاختبارات وأرسل نصاً ──
+            if (userExamPending[sender] && msgType !== 'documentMessage') {
+                await reply(
+                    '📎 *أنت في وضع تفعيل نظام الاختبارات.*\n\n' +
+                    'يرجى إرسال ملف *PDF* الآن للبدء.\n' +
+                    '_أرسل "خروج" للإلغاء._'
+                );
+                return;
+            }
+
             // --- صور ---
             if (msgType === 'imageMessage') {
                 if (!checkSpam(sender)) {
@@ -2585,7 +2775,16 @@ async function startBot() {
                     if (!userChats[sender]) userChats[sender] = [];
                     userChats[sender].push({ role: 'user',      content: body ? `[أرسل صورة مع رسالة: ${body}]` : '[أرسل صورة]' });
                     userChats[sender].push({ role: 'assistant', content: res });
-                    await reply(res);
+                    // إضافة رصيد متبقي للمستخدم العادي
+                    let imgFinalRes = res;
+                    if (!isVIPimg) {
+                        const rec2 = getDailyRecord(sender);
+                        const imgLeft2  = Math.max(0, DAILY_IMG_LIMIT - (rec2.images || 0));
+                        const msgLeft2  = Math.max(0, getUserDailyLimit(sender) - (rec2.messages || 0));
+                        const ttsLeft2  = Math.max(0, DAILY_TTS_LIMIT - (rec2.tts || 0));
+                        imgFinalRes += `\n\n─────────────\n_🖼️ صور: ${imgLeft2} | 💬 رسائل: ${msgLeft2} | 🔊 صوت: ${ttsLeft2}_`;
+                    }
+                    await reply(imgFinalRes);
                     await react('✅');
                 } catch (e) {
                     console.error('[image]', e.message);
@@ -2624,11 +2823,22 @@ async function startBot() {
                         return;
                     }
 
-                    // فحص حجم الملف (أقصى 1MB)
+                    // فحص حجم الملف — المجاني: 1MB، VIP/أدمن: بلا حدود
                     const fileSize = docMsg?.fileLength || 0;
-                    if (fileSize > 1 * 1024 * 1024) {
+                    const isVIPpdf = isAdmin || isActiveVIP(sender);
+                    const pdfMaxSize = isVIPpdf ? 20 * 1024 * 1024 : 1 * 1024 * 1024; // VIP: 20MB، مجاني: 1MB
+                    if (fileSize > pdfMaxSize) {
                         await react('❌');
-                        await reply(`حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 1MB فقط.\n\nيرجى ضغط الملف أو إرسال جزء منه. 📄`);
+                        if (isVIPpdf) {
+                            await reply(`حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 20MB. 📄`);
+                        } else {
+                            await reply(
+                                `⚠️ حجم الملف كبير جداً (${(fileSize/1024/1024).toFixed(1)}MB).\n` +
+                                `الحد الأقصى للنسخة المجانية *1MB* فقط.\n\n` +
+                                `📌 للحصول على حد *غير محدود* اشترك بالنسخة المميزة:\n` +
+                                `👤 wa.me/972593850520`
+                            );
+                        }
                         return;
                     }
 
@@ -2688,24 +2898,43 @@ async function startBot() {
                             docText = (parsed.text || '').trim();
                         } catch (_) {}
 
+                        // خصم الحد بعد نجاح التحويل فقط (لا نظلم المستخدم عند الفشل)
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
 
-                        // حفظ الصفحات والنص معاً في pending
-                        userPdfPending[sender] = {
-                            fileName,
-                            docText,
-                            pages,
-                            expiresAt: Date.now() + 5 * 60_000
-                        };
-                        await react('📄');
-                        await reply(
-                            `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
-                            `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
-                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
-                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
-                            `أو *لا* للمتابعة بشكل عادي`
-                        );
+                        // ── نظام الاختبارات (VIP): تفعيل تلقائي إذا كان المستخدم في pending ──
+                        if (userExamPending[sender]) {
+                            delete userExamPending[sender];
+                            userExamMode[sender] = { fileName, pages, docText, loadedAt: Date.now() };
+                            await react('📚');
+                            await reply(
+                                `✅ *تم تحميل الملف بنجاح في نظام الاختبارات!*\n` +
+                                `📄 الملف: "${fileName}" (${pageFiles.length} صفحة)\n\n` +
+                                `🤖 *تم قراءة الملف بالكامل — جاهز للإجابة!*\n\n` +
+                                `📌 *يمكنك الآن:*\n` +
+                                `• طرح أي سؤال من داخل الملف\n` +
+                                `• طلب شرح أي مفهوم أو جدول أو صورة\n` +
+                                `• طلب تلخيص أي جزء\n\n` +
+                                `⚠️ الأسئلة الخارجة عن الملف سأُخبرك أنها غير موجودة فيه.\n\n` +
+                                `_اكتب *خروج* للخروج من نظام الاختبارات_`
+                            );
+                        } else {
+                            // الوضع العادي: PDF عادي
+                            userPdfPending[sender] = {
+                                fileName,
+                                docText,
+                                pages,
+                                expiresAt: Date.now() + 5 * 60_000
+                            };
+                            await react('📄');
+                            await reply(
+                                `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
+                                `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
+                                `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
+                                `أرسل *نعم* للدخول لوضع الملف 📑\n` +
+                                `أو *لا* للمتابعة بشكل عادي`
+                            );
+                        }
                     } catch (imgErr) {
                         console.error('[PDF]', imgErr.message);
                         await react('❌');
@@ -2751,15 +2980,16 @@ async function startBot() {
                         return;
                     }
 
-                    // فحص الحد اليومي
-                    const isVIPaudio = vipNumbers.includes(sender);
+                    // فحص الحد اليومي للصوت (حد TTS منفصل)
+                    const isVIPaudio = isAdmin || isActiveVIP(sender);
                     if (!isAdmin && !isVIPaudio) {
-                        const quota = checkDailyMessages(sender);
-                        if (!quota.allowed) {
+                        const ttsQuota = checkDailyTTS(sender);
+                        if (!ttsQuota.allowed) {
                             await react('⛔');
-                            await reply(`⚠️ وصلت للحد اليومي. رصيدك يتجدد منتصف الليل.`);
+                            await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`);
                             return;
                         }
+                        ttsQuota.commit?.(); // خصم بعد التحقق من الإذن
                     }
 
                     // Voxtral يفهم الصوت ويرد مباشرة — بدون OpenAI
@@ -2775,7 +3005,16 @@ async function startBot() {
                     stats.totalMessages++;
                     saveData();
 
-                    await reply(`🎙️ ${res}`);
+                    // إضافة رصيد متبقي للمستخدم العادي
+                    let audioFinalRes = `🎙️ ${res}`;
+                    if (!isVIPaudio) {
+                        const rec3 = getDailyRecord(sender);
+                        const ttsLeft3 = Math.max(0, DAILY_TTS_LIMIT - (rec3.tts || 0));
+                        const imgLeft3 = Math.max(0, DAILY_IMG_LIMIT - (rec3.images || 0));
+                        const msgLeft3 = Math.max(0, getUserDailyLimit(sender) - (rec3.messages || 0));
+                        audioFinalRes += `\n\n─────────────\n_🔊 صوت: ${ttsLeft3} | 💬 رسائل: ${msgLeft3} | 🖼️ صور: ${imgLeft3}_`;
+                    }
+                    await reply(audioFinalRes);
                     await react('✅');
 
                 } catch (audioErr) {
@@ -2903,6 +3142,56 @@ async function startBot() {
             }
 
 
+            // إلغاء انتظار PDF لنظام الاختبارات إذا أرسل "خروج"
+            if (userExamPending[sender] && /^(خروج|exit|إلغاء|الغاء)$/i.test(bodyTrimmed)) {
+                delete userExamPending[sender];
+                await react('✅');
+                await reply('تم إلغاء نظام الاختبارات. يمكنك الكتابة بشكل طبيعي. 👍');
+                return;
+            }
+
+            // ============================================================
+            // نظام الاختبارات — كود التفعيل: 111 (VIP فقط)
+            // ============================================================
+            if (bodyTrimmed === '111') {
+                const isVIPexam = isAdmin || isActiveVIP(sender);
+                if (!isVIPexam) {
+                    await reply(
+                        '🔒 *نظام الاختبارات متاح للنسخة المميزة (VIP) فقط.*\n\n' +
+                        'للاشتراك والحصول على:\n' +
+                        '📚 نظام اختبارات ذكي يقرأ ملفاتك كاملاً\n' +
+                        '♾️ رسائل وصور وصوت غير محدودة\n' +
+                        '📄 PDF بدون حد للحجم\n\n' +
+                        '👤 wa.me/972593850520'
+                    );
+                    return;
+                }
+                // مسح أي جلسة سابقة
+                delete userExamMode[sender];
+                delete userExamPending[sender];
+                userExamPending[sender] = true;
+                await react('📚');
+                await reply(
+                    '📚 *نظام الاختبارات — مرحباً!*\n\n' +
+                    '✅ أرسل ملف PDF الآن وسأقوم بـ:\n' +
+                    '• قراءة كل الصفحات كاملاً (نصوص + جداول + صور)\n' +
+                    '• تحليل كل المحتوى بدقة 100%\n' +
+                    '• الإجابة على أي سؤال من داخل الملف بدقة تامة\n\n' +
+                    '📎 *أرسل ملف PDF الآن...*\n' +
+                    '_اكتب "خروج" للإلغاء_'
+                );
+                return;
+            }
+
+            // ============================================================
+            // نظام الاختبارات — معالجة الأسئلة (إذا كان المستخدم في وضع الاختبار)
+            // ============================================================
+            if (userExamMode[sender]) {
+                const { fileName, pages, docText } = userExamMode[sender];
+                await handleExamMode(sender, body, pages, docText, fileName, reply, react);
+                return;
+            }
+
             const isYes = /^(نعم|yes|نعم\s*✅|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
             if (isYes && userTTSPending[sender] && Date.now() < userTTSPending[sender].expiresAt) {
                 const { term, termAr } = userTTSPending[sender];
@@ -2951,6 +3240,7 @@ async function startBot() {
                         );
                         return;
                     }
+                    ttsCheck.commit?.(); // خصم بعد التحقق من الإذن
                 }
                 const ttsText = ttsMatch[1].trim();
                 await react('🔊');
@@ -3002,6 +3292,7 @@ async function startBot() {
                             await react('✅');
                             return;
                         }
+                        ttsCheck.commit?.(); // خصم بعد التحقق من الإذن
                     }
                     await new Promise(r => setTimeout(r, 300));
                     const audio = await generateTTS(translationResult, targetLangCode);
@@ -3071,16 +3362,25 @@ async function startBot() {
 
             userChats[sender].push({ role: 'assistant', content: res });
 
-            // إضافة عدد الرسائل المتبقية في نهاية الرد (للمستخدم العادي فقط)
+            // إضافة رصيد المتبقي في نهاية الرد (للمستخدم العادي فقط)
             let finalRes = res;
             if (!isAdmin && !isVIP && _quotaCommit) {
                 _quotaCommit(); // خصم الرسالة
                 const rec = getDailyRecord(sender);
-                const remaining = Math.max(0, getUserDailyLimit(sender) - rec.messages);
-                if (remaining <= 5) {
-                    finalRes += `\n\n─────────────\n⚠️ *تنبيه:* متبقي لك *${remaining}* رسالة اليوم.\n_للاشتراك المميز: wa.me/972593850520_`;
+                const msgLimit   = getUserDailyLimit(sender);
+                const msgLeft    = Math.max(0, msgLimit - rec.messages);
+                const imgLeft    = Math.max(0, DAILY_IMG_LIMIT - (rec.images || 0));
+                const ttsLeft    = Math.max(0, DAILY_TTS_LIMIT - (rec.tts || 0));
+                if (msgLeft <= 5) {
+                    finalRes += `\n\n─────────────\n` +
+                        `⚠️ *تنبيه — رصيدك المتبقي اليوم:*\n` +
+                        `💬 رسائل: *${msgLeft}* متبقية\n` +
+                        `🖼️ صور: *${imgLeft}* متبقية\n` +
+                        `🔊 صوت/ترجمة: *${ttsLeft}* متبقية\n` +
+                        `_للاشتراك المميز (غير محدود): wa.me/972593850520_`;
                 } else {
-                    finalRes += `\n\n_💬 رسائل متبقية اليوم: ${remaining}_`;
+                    finalRes += `\n\n─────────────\n` +
+                        `_💬 رسائل: ${msgLeft} | 🖼️ صور: ${imgLeft} | 🔊 صوت: ${ttsLeft}_`;
                 }
             } else if (_quotaCommit) {
                 _quotaCommit();
@@ -3134,6 +3434,25 @@ setInterval(checkVIPExpiry, 60 * 60_000);
 
 
 
+
+
+// ============================================================
+// فحص التبعيات عند البدء
+// ============================================================
+(function checkDependencies() {
+    const { execSync } = require('child_process');
+    // mutool — ضروري لمعالجة PDF
+    try { execSync('which mutool', { stdio: 'ignore' }); } catch {
+        console.error('❌ mutool غير مثبت. ثبّته بـ: pkg install mupdf-tools');
+        process.exit(1);
+    }
+    // ffmpeg — ضروري لتحويل الصوت TTS
+    try { execSync('which ffmpeg', { stdio: 'ignore' }); } catch {
+        console.error('❌ ffmpeg غير مثبت. ثبّته بـ: pkg install ffmpeg');
+        process.exit(1);
+    }
+    console.log('✅ جميع التبعيات موجودة (mutool, ffmpeg)');
+})();
 
 console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
 startQRServer();
