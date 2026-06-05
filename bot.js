@@ -3440,18 +3440,68 @@ setInterval(checkVIPExpiry, 60 * 60_000);
 // فحص التبعيات عند البدء
 // ============================================================
 (function checkDependencies() {
-    const { execSync } = require('child_process');
-    // mutool — ضروري لمعالجة PDF
-    try { execSync('which mutool', { stdio: 'ignore' }); } catch {
-        console.error('❌ mutool غير مثبت. ثبّته بـ: pkg install mupdf-tools');
+    const { execSync, spawnSync } = require('child_process');
+    const path = require('path');
+
+    // دالة مرنة: تبحث عن الأداة في كل المسارات المحتملة
+    function findTool(name) {
+        // 1) which / where (Linux/Mac/Termux)
+        try {
+            const r = spawnSync('which', [name], { encoding: 'utf8' });
+            if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
+        } catch (_) {}
+
+        // 2) مسارات Termux الشائعة
+        const termuxPaths = [
+            `/data/data/com.termux/files/usr/bin/${name}`,
+            `/data/data/com.termux/files/usr/local/bin/${name}`,
+            `/usr/bin/${name}`,
+            `/usr/local/bin/${name}`,
+            `/bin/${name}`,
+        ];
+        for (const p of termuxPaths) {
+            try {
+                if (require('fs').existsSync(p)) return p;
+            } catch (_) {}
+        }
+
+        // 3) محاولة تشغيل مباشرة (قد يكون في PATH لكن which لا تجده)
+        try {
+            const r = spawnSync(name, ['--version'], { encoding: 'utf8', timeout: 3000 });
+            if (r.status === 0 || r.stderr) return name; // موجود
+        } catch (_) {}
+
+        // 4) للـ mutool تحديداً — تجربة اسم بديل
+        if (name === 'mutool') {
+            try {
+                const r = spawnSync('mupdf', ['--version'], { encoding: 'utf8', timeout: 3000 });
+                if (r.status === 0 || r.stderr) return 'mupdf';
+            } catch (_) {}
+        }
+
+        return null;
+    }
+
+    // فحص mutool
+    const mutoolPath = findTool('mutool');
+    if (!mutoolPath) {
+        console.error('❌ mutool غير مثبت أو غير موجود في PATH.');
+        console.error('   ثبّته بـ:  pkg install mupdf-tools');
+        console.error('   أو تأكد من: echo $PATH');
         process.exit(1);
     }
-    // ffmpeg — ضروري لتحويل الصوت TTS
-    try { execSync('which ffmpeg', { stdio: 'ignore' }); } catch {
-        console.error('❌ ffmpeg غير مثبت. ثبّته بـ: pkg install ffmpeg');
+    console.log(`✅ mutool: ${mutoolPath}`);
+
+    // فحص ffmpeg
+    const ffmpegPath = findTool('ffmpeg');
+    if (!ffmpegPath) {
+        console.error('❌ ffmpeg غير مثبت أو غير موجود في PATH.');
+        console.error('   ثبّته بـ:  pkg install ffmpeg');
         process.exit(1);
     }
-    console.log('✅ جميع التبعيات موجودة (mutool, ffmpeg)');
+    console.log(`✅ ffmpeg: ${ffmpegPath}`);
+
+    console.log('✅ جميع التبعيات موجودة وجاهزة.');
 })();
 
 console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
