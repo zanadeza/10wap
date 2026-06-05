@@ -30,6 +30,43 @@ const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
 const WEB_PORT        = 8080;
 
+// ============================================================
+// DASHBOARD AUTH
+// ============================================================
+const DASHBOARD_USER  = '1122134';
+const DASHBOARD_PASS  = '1125567';
+const crypto          = require('crypto');
+// sessions: { token: { ip, createdAt } }
+const _sessions       = {};
+const SESSION_TTL_MS  = 12 * 60 * 60_000; // 12 ساعة
+
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+function isValidSession(req) {
+    const token = parseCookie(req.headers['cookie'] || '')['adm_tok'];
+    if (!token || !_sessions[token]) return false;
+    const s = _sessions[token];
+    if (Date.now() - s.createdAt > SESSION_TTL_MS) {
+        delete _sessions[token];
+        return false;
+    }
+    s.createdAt = Date.now(); // تجديد تلقائي عند كل طلب
+    return true;
+}
+function parseCookie(str) {
+    return Object.fromEntries(
+        str.split(';').map(c => c.trim().split('=').map(p => decodeURIComponent(p.trim())))
+            .filter(p => p.length === 2)
+    );
+}
+// تنظيف sessions منتهية كل ساعة
+setInterval(() => {
+    const now = Date.now();
+    for (const tok of Object.keys(_sessions))
+        if (now - _sessions[tok].createdAt > SESSION_TTL_MS) delete _sessions[tok];
+}, 60 * 60_000);
+
 let currentQR = null;
 let isConnected = false;
 const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
@@ -47,6 +84,7 @@ function loadData() {
         userNames:      {},
         welcomedUsers:  {},
         vipNumbers:     [],
+        vipExpiry:      {},   // { sender: timestamp_ms } — تاريخ انتهاء VIP
         reports:        [],
         userLimits:     {},   // حدود مخصصة لكل مستخدم { sender: limit }
         blacklist:      [],   // أرقام محظورة
@@ -63,7 +101,7 @@ function saveData() {
         try {
             const tmp = DATA_FILE + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(
-                { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats },
+                { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, blacklist, userLanguages, stats },
                 null, 2
             ));
             fs.renameSync(tmp, DATA_FILE);
@@ -73,13 +111,14 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, reports, userLimits, blacklist, userLanguages, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, blacklist, userLanguages, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
 if (!userLimits)               userLimits = {};
 if (!Array.isArray(blacklist)) blacklist = [];
 if (!userLanguages)            userLanguages = {};
+if (!vipExpiry)                vipExpiry = {};
 if (!stats)                    stats   = { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 };
 if (!stats.totalMessages)      stats.totalMessages = 0;
 if (!stats.totalImages)        stats.totalImages   = 0;
@@ -110,6 +149,27 @@ function cleanMemory() {
     }
 }
 
+// فحص دوري لانتهاء اشتراكات VIP
+function checkVIPExpiry() {
+    const now = Date.now();
+    let changed = false;
+    for (const num of [...vipNumbers]) {
+        const expiry = vipExpiry[num];
+        if (expiry && now > expiry) {
+            vipNumbers = vipNumbers.filter(n => n !== num);
+            delete vipExpiry[num];
+            changed = true;
+            console.log(`[VIP] انتهى اشتراك المستخدم ${num}`);
+            if (sock && isConnected) {
+                sock.sendMessage(`${num}@s.whatsapp.net`, {
+                    text: '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 wa.me/972593850520'
+                }).catch(() => {});
+            }
+        }
+    }
+    if (changed) saveData();
+}
+
 // ============================================================
 // PURE HELPERS (no dependencies — must come before SYSTEM PROMPTS)
 // ============================================================
@@ -134,9 +194,11 @@ function nowJerusalem() {
 // ============================================================
 // RATE LIMITING & DAILY MESSAGE QUOTA
 // ============================================================
-const DAILY_MSG_LIMIT = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
-const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع الإدارة.'; // رسالة للمحظورين
-const _userDailyLimit = {}; // { sender: { messages, images, docs, resetAt } }
+const DAILY_MSG_LIMIT   = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
+const DAILY_IMG_LIMIT   = 5;  // صور يومياً للمستخدم العادي
+const DAILY_TTS_LIMIT   = 10; // مرات استخدام الصوت/الترجمة يومياً للمستخدم العادي
+const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع المهندس نادر:\n👤 wa.me/972593850520'; // رسالة للمحظورين
+const _userDailyLimit = {}; // { sender: { messages, images, docs, tts, resetAt } }
 
 // الحد اليومي الفعلي: مخصص إن وُجد، وإلا الافتراضي
 function getUserDailyLimit(sender) {
@@ -165,6 +227,7 @@ function getDailyRecord(sender) {
             messages: 0,
             images:   0,
             docs:     0,
+            tts:      0,
             resetAt:  getNextMidnightMs()
         };
     }
@@ -177,19 +240,48 @@ function checkDailyMessages(sender) {
     const limit = getUserDailyLimit(sender);
     const rec = getDailyRecord(sender);
     if (rec.messages >= limit) return { allowed: false, remaining: 0, limit, commit: () => {} };
+    const remaining = limit - rec.messages - 1;
     const commit = () => { rec.messages++; };
-    return { allowed: true, remaining: limit - rec.messages - 1, limit, commit };
+    return { allowed: true, remaining, limit, commit };
+}
+
+// فحص الحد اليومي للـ TTS — يُعيد { allowed, remaining }
+function checkDailyTTS(sender) {
+    const d = getDailyRecord(sender);
+    if (d.tts >= DAILY_TTS_LIMIT) return { allowed: false, remaining: 0 };
+    const remaining = DAILY_TTS_LIMIT - d.tts - 1;
+    d.tts++;
+    return { allowed: true, remaining };
 }
 
 // فحص الحد اليومي للصور والملفات
 function checkDailyLimit(sender, type) {
     const d = getDailyRecord(sender);
-    if (type === 'image') { if (d.images >= 20) return false; d.images++; return true; }
+    if (type === 'image') { if (d.images >= DAILY_IMG_LIMIT) return false; d.images++; return true; }
     if (type === 'pdf')   { if (d.docs   >= 10) return false; d.docs++;   return true; }
     return true;
 }
 
-// Anti-spam فقط: منع إرسال الرسائل بشكل متسارع جداً (3 رسائل/5 ثواني)
+// التحقق من VIP مع الانتهاء التلقائي
+function isActiveVIP(sender) {
+    if (!vipNumbers.includes(sender)) return false;
+    const expiry = vipExpiry[sender];
+    if (!expiry) return true; // بدون تاريخ انتهاء = دائم
+    if (Date.now() > expiry) {
+        // انتهى الاشتراك — إزالة تلقائية
+        vipNumbers = vipNumbers.filter(n => n !== sender);
+        delete vipExpiry[sender];
+        saveData();
+        // إشعار المستخدم
+        if (sock && isConnected) {
+            sock.sendMessage(`${sender}@s.whatsapp.net`, {
+                text: '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 wa.me/972593850520'
+            }).catch(() => {});
+        }
+        return false;
+    }
+    return true;
+}
 const _spamCheck = {}; // { sender: [timestamps] }
 function checkSpam(sender) {
     const now = Date.now();
@@ -394,17 +486,22 @@ English: [Key interactions]
     openai: null  // يستخدم getSystemPrompt() الأصلي
 };
 
-// رسالة القائمة الرئيسية
+// رسالة الترحيب للمستخدمين الجدد
 function buildModeMenu(name) {
     const first = name ? name.split(' ')[0] : null;
     const greeting = first ? `أهلاً ${first}` : 'أهلاً';
-    return `${greeting} 👋\n\n*اختر النظام الذي تريده:*\n\n` +
-        `1️⃣ *المصطلحات الطبية*\nشرح المصطلحات الطبية بالعربي والإنجليزي\n\n` +
-        `2️⃣ *علم الأدوية*\nمعلومات شاملة عن الأدوية لجميع التخصصات\n\n` +
-        `3️⃣ *ذكاء صناعي طبي*\nإجابة على جميع الأسئلة الطبية\n\n` +
-        `4️⃣ *ذكاء صناعي عام*\nمساعد عام مفتوح بدون قيود\n\n` +
+    return `${greeting} 👋\n\n*مرحباً بك في بوت MedTerm الطبي!*\n\n` +
+        `يمكنني مساعدتك في:\n` +
+        `🏥 شرح المصطلحات الطبية بالعربي والإنجليزي\n` +
+        `💊 معلومات شاملة عن الأدوية والمستحضرات\n` +
+        `⚕️ الإجابة على الأسئلة الطبية والصحية\n` +
+        `🤖 المساعدة في أي موضوع عام\n` +
+        `🖼️ تحليل الصور والتقارير الطبية\n` +
+        `📄 قراءة وتحليل ملفات PDF\n` +
+        `🔊 نطق المصطلحات الطبية صوتياً\n` +
+        `🌐 الترجمة مع الصوت والنطق\n\n` +
         `─────────────────\n` +
-        `📩 *اكتب رقم خيارك (1-4) للبدء*`;
+        `✍️ *فقط أرسل سؤالك وسأرد عليك مباشرة!*`;
 }
 
 // اسم وأيقونة النظام الحالي
@@ -430,6 +527,25 @@ function getModeSystemPrompt(mode) {
     const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
     const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
     return `${base}\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)`;
+}
+
+// كشف إذا كانت الرسالة تتعلق بالمجال الطبي
+function isMedicalQuery(text) {
+    return /دواء|دوا|حبة|علاج|مرض|أعراض|جرعة|وصفة|صيدلي|طبيب|مستشفى|عملية|سكري|ضغط|قلب|كبد|كلى|دم|تحليل|أشعة|رنين|سرطان|التهاب|ألم|حرارة|انفلونزا|covid|corona|كورونا|فيروس|بكتيريا|مضاد حيوي|بنسيلين|ابتوفين|باراسيتامول|اسبرين|ميزوبروستول|فيتامين|هرمون|انسولين|قرحة|ربو|صداع|دوخة|غثيان|اقياء|اسهال|امساك|جلد|عظم|مفصل|عصب|نفسي|اكتئاب|قلق|ضغط دم|كوليسترول|triglyceride|glucose|hemoglobin|wbc|rbc|platelet|creatinine|uric acid|bilirubin|الت|الغدة|بنكرياس|زائدة|حوصلة|الكوليرا|ملاريا|هيباتيتس|hepatitis|diabetes|hypertension|infection|antibiotic|surgery|physician|hospital|diagnosis|prescription|symptom|medication|dosage|overdose|allergy|immune|vaccine|cholesterol|مصطلح طبي|anatomy|physiology|pathology|pharmacology|medical|medicine|health|صحة|طب|صيدلة/i.test(text || '');
+}
+
+// اختيار System Prompt الذكي بناءً على محتوى الرسالة
+function getSmartSystemPrompt(text, userLang) {
+    const langSuffix = (userLang && userLang !== 'ar')
+        ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLang}" فقط، حتى لو كتب بالعربية.`
+        : '';
+
+    if (isMedicalQuery(text)) {
+        // استخدام موجّه الطبي الشامل
+        return getModeSystemPrompt('medai') + langSuffix;
+    }
+    // الموجّه العام للأسئلة غير الطبية
+    return getSystemPrompt() + langSuffix;
 }
 
 const MEDICAL_IMAGE_PROMPT = `أنت طبيب متخصص ومحلل صور طبية خبير. حلّل الصورة الطبية بدقة عالية.
@@ -896,14 +1012,14 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     if (command === '!مساعدة' || command === '!help') {
         await reply(
             `📋 *قائمة الأوامر المتاحة:*\n\n` +
-            `• *!قائمة* — عرض قائمة الأنظمة الأربعة\n` +
-            `• *!وضع* — عرض النظام الحالي\n` +
             `• *!مساعدة* — عرض هذه القائمة\n` +
             `• *!مسح* — مسح سياق المحادثة والبدء من جديد\n` +
             `• *!رصيد* — عرض عدد الرسائل المتبقية اليوم\n` +
             `• *!لغة en* — تغيير لغة الردود (ar/en/fr/...)\n` +
             `• *!ملخص* — تلخيص المحادثة الحالية\n\n` +
-            `_يمكنك أيضاً إرسال صور أو ملفات PDF للتحليل_`
+            `_يمكنك أيضاً إرسال صور أو ملفات PDF للتحليل_\n` +
+            `_لطلب نطق كلمة أو جملة: اكتب "نطق [الكلمة]"_\n` +
+            `_لطلب ترجمة: اكتب "ترجم [النص]" وسأرسل لك الصوت تلقائياً_`
         );
         return true;
     }
@@ -911,9 +1027,8 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     // !مسح — مسح سياق المحادثة
     if (command === '!مسح' || command === '!reset') {
         userChats[sender] = [];
-        delete userModes[sender];
         await react('✅');
-        await reply(`🗑️ تم مسح سياق المحادثة.\n\n${buildModeMenu(userNames[sender] || '')}`);
+        await reply(`🗑️ تم مسح سياق المحادثة. يمكنك البدء من جديد! 👋`);
         return true;
     }
 
@@ -926,14 +1041,18 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
             const rec   = getDailyRecord(sender);
             const used  = rec.messages;
             const remaining = Math.max(0, limit - used);
+            const ttsUsed = rec.tts || 0;
+            const imgUsed = rec.images || 0;
             const resetDate = new Date(rec.resetAt);
             const resetStr  = resetDate.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
             await reply(
-                `📊 *رصيد رسائلك اليوم:*\n\n` +
-                `✅ المستخدم: ${used} رسالة\n` +
-                `🔄 المتبقي: ${remaining} رسالة\n` +
-                `📅 يتجدد عند: ${resetStr}\n\n` +
-                `_الحد اليومي: ${limit} رسالة_`
+                `📊 *رصيدك اليومي:*\n\n` +
+                `💬 الرسائل: ${used}/${limit} (متبقي: ${remaining})\n` +
+                `🖼️ الصور: ${imgUsed}/${DAILY_IMG_LIMIT} (متبقي: ${Math.max(0, DAILY_IMG_LIMIT - imgUsed)})\n` +
+                `🔊 الصوت/الترجمة: ${ttsUsed}/${DAILY_TTS_LIMIT} (متبقي: ${Math.max(0, DAILY_TTS_LIMIT - ttsUsed)})\n` +
+                `🔄 يتجدد عند: ${resetStr}\n\n` +
+                `_للاشتراك المميز (غير محدود) تواصل مع المهندس نادر_\n` +
+                `👤 wa.me/972593850520`
             );
         }
         return true;
@@ -959,7 +1078,7 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     // !ملخص — تلخيص المحادثة الحالية
     if (command === '!ملخص' || command === '!summary') {
         const history = userChats[sender] || [];
-        const convMsgs = history; // نضمّن كل الرسائل (بما فيها السياق الداخلي) لملخص أكثر دقة
+        const convMsgs = history;
         if (convMsgs.length < 2) {
             await reply('📝 لا يوجد محادثة كافية للتلخيص بعد. تحدث أكثر ثم جرب الأمر مجدداً!');
             return true;
@@ -983,23 +1102,6 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
         } catch (e) {
             await reply('عذراً، حدث خطأ أثناء التلخيص. حاول مرة أخرى.');
             await react('❌');
-        }
-        return true;
-    }
-
-    // !قائمة — عرض قائمة الأنظمة
-    if (command === '!قائمة' || command === '!menu' || command === '!modes') {
-        await reply(buildModeMenu(userNames[sender] || ''));
-        return true;
-    }
-
-    // !وضع — عرض الوضع الحالي
-    if (command === '!وضع' || command === '!mode') {
-        const mode = userModes[sender] || null;
-        if (!mode) {
-            await reply(`ℹ️ لم تختر نظاماً بعد.\n\n${buildModeMenu(userNames[sender] || '')}`);
-        } else {
-            await reply(`📍 *نظامك الحالي:* ${getModeName(mode)}\n\nللتغيير اكتب: *!قائمة*`);
         }
         return true;
     }
@@ -1064,8 +1166,54 @@ function startQRServer() {
             if (now - _webRateLimit[ip].first > 120_000) delete _webRateLimit[ip];
     }, 5 * 60_000);
 
+    // صفحة تسجيل الدخول
+    function loginPage(errMsg) {
+        return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${BOT_NAME} — تسجيل الدخول</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0b0f1a;--surface:#111827;--border:#1e2d45;--text:#e2e8f0;--muted:#64748b;--accent:#38bdf8;--red:#f87171;--green:#22c55e}
+body{font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:40px 36px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.logo{display:flex;align-items:center;gap:12px;margin-bottom:32px;justify-content:center}
+.logo-icon{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#0ea5e9,#6366f1);display:flex;align-items:center;justify-content:center;font-size:24px}
+.logo-name{font-size:22px;font-weight:800;color:var(--accent)}
+h2{font-size:16px;color:var(--muted);text-align:center;margin-bottom:28px;font-weight:400}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;margin-top:16px}
+input{width:100%;background:#0b0f1a;border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-size:14px;outline:none;transition:.2s}
+input:focus{border-color:var(--accent)}
+.err{background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.3);border-radius:8px;padding:10px 14px;color:var(--red);font-size:13px;margin-top:14px;display:${errMsg ? 'block' : 'none'}}
+button{width:100%;margin-top:24px;background:linear-gradient(135deg,#0ea5e9,#6366f1);border:none;border-radius:10px;padding:13px;color:#fff;font-size:15px;font-weight:700;cursor:pointer;transition:.2s}
+button:hover{opacity:.9;transform:translateY(-1px)}
+.footer{text-align:center;margin-top:20px;font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">🏥</div>
+    <span class="logo-name">${BOT_NAME}</span>
+  </div>
+  <h2>لوحة تحكم الأدمن</h2>
+  <form method="POST" action="/login">
+    <label>اسم المستخدم</label>
+    <input type="text" name="username" placeholder="أدخل اسم المستخدم" autocomplete="off" required>
+    <label>كلمة السر</label>
+    <input type="password" name="password" placeholder="أدخل كلمة السر" required>
+    <div class="err">${errMsg || ''}</div>
+    <button type="submit">🔐 دخول</button>
+  </form>
+  <div class="footer">${BOT_NAME} Admin Panel &copy; 2025</div>
+</div>
+</body>
+</html>`;
+    }
+
     const server = http.createServer(async (req, res) => {
-        // إغلاق الاتصال بعد الاستجابة
         res.setHeader('Connection', 'close');
         const ip  = req.socket.remoteAddress || 'unknown';
         const url = req.url.split('?')[0];
@@ -1073,6 +1221,66 @@ function startQRServer() {
         if (!checkWebRate(ip)) {
             res.writeHead(429, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, msg: 'Too many requests' }));
+            return;
+        }
+
+        // ===== LOGIN PAGE (GET) =====
+        if (url === '/login' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(loginPage(''));
+            return;
+        }
+
+        // ===== LOGIN SUBMIT (POST) =====
+        if (url === '/login' && req.method === 'POST') {
+            let body = '';
+            req.on('data', d => body += d);
+            req.on('end', () => {
+                try {
+                    const params = Object.fromEntries(
+                        body.split('&').map(p => p.split('=').map(v => decodeURIComponent(v.replace(/\+/g, ' '))))
+                    );
+                    if (params.username === DASHBOARD_USER && params.password === DASHBOARD_PASS) {
+                        const token = generateToken();
+                        _sessions[token] = { ip, createdAt: Date.now() };
+                        res.writeHead(302, {
+                            'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Strict`,
+                            'Location': '/'
+                        });
+                        res.end();
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                        res.end(loginPage('❌ اسم المستخدم أو كلمة السر غير صحيحة'));
+                    }
+                } catch (e) {
+                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                    res.end(loginPage('حدث خطأ، حاول مرة أخرى'));
+                }
+            });
+            return;
+        }
+
+        // ===== LOGOUT =====
+        if (url === '/logout') {
+            const token = parseCookie(req.headers['cookie'] || '')['adm_tok'];
+            if (token) delete _sessions[token];
+            res.writeHead(302, {
+                'Set-Cookie': 'adm_tok=; Path=/; Max-Age=0',
+                'Location': '/login'
+            });
+            res.end();
+            return;
+        }
+
+        // ===== حماية كل الـ endpoints — إعادة توجيه لصفحة الدخول =====
+        if (!isValidSession(req)) {
+            if (url === '/api' || url === '/data' || url === '/qr-image') {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, msg: 'Unauthorized' }));
+            } else {
+                res.writeHead(302, { 'Location': '/login' });
+                res.end();
+            }
             return;
         }
 
@@ -1097,11 +1305,44 @@ function startQRServer() {
 
                     if (action === 'addVip') {
                         const num = (data.num || '').replace(/\D/g, '');
-                        if (num && !vipNumbers.includes(num)) { vipNumbers.push(num); saveData(); }
+                        if (num && !vipNumbers.includes(num)) {
+                            vipNumbers.push(num);
+                            // تاريخ الانتهاء: شهر من الآن
+                            const expiry = Date.now() + 30 * 24 * 60 * 60_000;
+                            vipExpiry[num] = expiry;
+                            saveData();
+                            // إشعار المستخدم
+                            if (sock && isConnected) {
+                                try {
+                                    const expDate = new Date(expiry).toLocaleDateString('ar-SA');
+                                    await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                        text: `🎉 *تهانينا! تم تفعيل اشتراكك المميز (VIP)*\n\n✅ صلاحياتك الآن:\n• رسائل غير محدودة\n• صور غير محدودة\n• صوت وترجمة غير محدودة\n\n📅 تاريخ الانتهاء: ${expDate}\n\nشكراً لاشتراكك! 🌟`
+                                    });
+                                } catch (_) {}
+                            }
+                            result.msg = `تم تفعيل VIP للمستخدم ${num} لمدة شهر`;
+                        } else if (vipNumbers.includes(num)) {
+                            // تجديد الاشتراك — إضافة شهر من الآن
+                            const current = vipExpiry[num] || Date.now();
+                            vipExpiry[num] = Math.max(current, Date.now()) + 30 * 24 * 60 * 60_000;
+                            saveData();
+                            result.msg = `تم تجديد VIP للمستخدم ${num} لشهر إضافي`;
+                        }
                     }
                     else if (action === 'removeVip') {
-                        vipNumbers = vipNumbers.filter(n => n !== data.num);
+                        const num = (data.num || '').replace(/\D/g, '');
+                        vipNumbers = vipNumbers.filter(n => n !== num);
+                        delete vipExpiry[num];
                         saveData();
+                        // إشعار المستخدم
+                        if (num && sock && isConnected) {
+                            try {
+                                await sock.sendMessage(`${num}@s.whatsapp.net`, {
+                                    text: `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nيمكنك التجديد عبر التواصل مع المهندس نادر:\n👤 wa.me/972593850520`
+                                });
+                            } catch (_) {}
+                        }
+                        result.msg = 'تم إزالة VIP';
                     }
                     else if (action === 'deleteUser') {
                         const num = data.num;
@@ -1222,22 +1463,8 @@ function startQRServer() {
             return;
         }
 
-        // ===== DATA API (dashboard-only — requires Origin check) =====
+        // ===== DATA API =====
         if (url === '/data') {
-            // Block cross-origin / external access: allow only same-server origins
-            const origin = req.headers['origin'];
-            if (origin) {
-                // بناء قائمة النطاقات المسموحة ديناميكياً
-                const allowedOrigins = [
-                    `http://localhost:${WEB_PORT}`,
-                    `http://127.0.0.1:${WEB_PORT}`
-                ];
-                if (!allowedOrigins.includes(origin)) {
-                    res.writeHead(403, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: false, msg: 'Forbidden' }));
-                    return;
-                }
-            }
             // بناء بيانات الاستهلاك لكل مستخدم
             const userUsage = {};
             for (const num of Object.keys(welcomedUsers)) {
@@ -1269,6 +1496,7 @@ function startQRServer() {
                     reports: reports.length
                 },
                 vipNumbers,
+                vipExpiry,
                 userLimits,
                 userNames,
                 userUsage,
@@ -1325,6 +1553,8 @@ body{font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);colo
 .topbar-right{display:flex;align-items:center;gap:10px}
 .refresh-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;transition:.2s}
 .refresh-btn:hover{color:var(--accent);border-color:var(--accent)}
+.logout-btn{background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.25);color:var(--red);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;transition:.2s;text-decoration:none}
+.logout-btn:hover{background:rgba(248,113,113,.22)}
 #last-updated{font-size:11px;color:var(--muted)}
 
 /* ── CONTENT ── */
@@ -1481,6 +1711,7 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     </div>
     <div class="topbar-right">
       <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+      <a href="/logout" class="logout-btn">🚪 خروج</a>
     </div>
   </div>
 
@@ -1614,16 +1845,16 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     <!-- ══ VIP ══ -->
     <div class="panel" id="panel-vip">
       <div class="card">
-        <div class="card-header"><div class="card-title">⭐ أعضاء VIP (رسائل غير محدودة)</div></div>
+        <div class="card-header"><div class="card-title">⭐ أعضاء VIP (اشتراك شهري — غير محدود)</div></div>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>الرقم</th><th>الاسم</th><th>الإجراء</th></tr></thead>
-            <tbody id="vip-table"><tr><td colspan="3" class="empty">جاري التحميل...</td></tr></tbody>
+            <thead><tr><th>الرقم</th><th>الاسم</th><th>ينتهي بعد</th><th>الإجراء</th></tr></thead>
+            <tbody id="vip-table"><tr><td colspan="4" class="empty">جاري التحميل...</td></tr></tbody>
           </table>
         </div>
-        <div class="form-row">
+        <div class="form-row" style="margin-top:12px">
           <input class="inp" id="new-vip" placeholder="رقم الهاتف مع كود الدولة" dir="ltr" style="flex:1;min-width:200px">
-          <button class="btn btn-success" onclick="addVip()">+ إضافة VIP</button>
+          <button class="btn btn-success" onclick="addVip()">⭐ تفعيل VIP (شهر)</button>
         </div>
       </div>
     </div>
@@ -1723,6 +1954,7 @@ function toast(msg,color){
 async function api(action,data={}){
   try{
     const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,data})});
+    if(r.status===401){window.location.href='/login';return{ok:false};}
     return await r.json();
   }catch(e){toast('خطأ في الاتصال','#dc2626');return{ok:false};}
 }
@@ -1730,6 +1962,7 @@ async function api(action,data={}){
 async function loadData(){
   try{
     const r=await fetch('/data');
+    if(r.status===401){window.location.href='/login';return;}
     _data=await r.json();
     updateUI();
     document.getElementById('last-updated').textContent=new Date().toLocaleTimeString('ar');
@@ -1910,12 +2143,29 @@ function renderLimits(d){
 // ── VIP ──
 function renderVip(d){
   const tb=document.getElementById('vip-table');
-  if(!d.vipNumbers.length){tb.innerHTML='<tr><td colspan="3" class="empty">لا يوجد أعضاء VIP</td></tr>';return;}
+  if(!d.vipNumbers.length){tb.innerHTML='<tr><td colspan="4" class="empty">لا يوجد أعضاء VIP</td></tr>';return;}
   tb.innerHTML=d.vipNumbers.map(num=>{
+    const expiry=d.vipExpiry?d.vipExpiry[num]:null;
+    let expiryStr='<span class="badge badge-green">دائم ♾️</span>';
+    if(expiry){
+      const now=Date.now();
+      const diff=expiry-now;
+      if(diff<0){expiryStr='<span class="badge badge-red">منتهي ⛔</span>';}
+      else{
+        const days=Math.ceil(diff/(24*60*60*1000));
+        expiryStr='<span class="badge badge-yellow">'+days+' يوم</span>';
+      }
+    }
     return \`<tr>
       <td dir="ltr" style="font-family:monospace;color:var(--accent)">\${esc(num)}</td>
       <td>\${esc(d.userNames[num]||'—')}</td>
-      <td><button class="btn btn-danger" onclick="removeVipNum(\${JSON.stringify(num)})">إزالة من VIP</button></td>
+      <td>\${expiryStr}</td>
+      <td>
+        <div class="action-row">
+          <button class="btn btn-primary" onclick="renewVip(\${JSON.stringify(num)})">🔄 تجديد</button>
+          <button class="btn btn-danger" onclick="removeVipNum(\${JSON.stringify(num)})">❌ إزالة</button>
+        </div>
+      </td>
     </tr>\`;
   }).join('');
 }
@@ -2022,7 +2272,13 @@ async function resetUserLimit(){
   const r=await api('resetUserLimit',{num});
   if(r.ok){toast('تم الإعادة للافتراضي');loadData();}
 }
-async function resetUserLimitNum(num){
+async function renewVip(num){
+  if(!confirm('تجديد VIP للمستخدم '+num+' لشهر إضافي؟'))return;
+  const r=await api('addVip',{num});
+  if(r.ok){toast('✅ تم تجديد VIP لشهر إضافي');loadData();}
+  else toast(r.msg||'فشل','#dc2626');
+}
+
   const r=await api('resetUserLimit',{num});
   if(r.ok){toast('تم الإعادة للافتراضي');loadData();}
 }
@@ -2296,8 +2552,12 @@ async function startBot() {
                     await reply('⚠️ أرسلت صوراً بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
                 }
-                if (!checkDailyLimit(sender, 'image')) {
-                    await reply('⚠️ وصلت للحد اليومي للصور (20 صورة/يوم).');
+                const isVIPimg = isAdmin || isActiveVIP(sender);
+                if (!isVIPimg && !checkDailyLimit(sender, 'image')) {
+                    await reply(
+                        `⚠️ *وصلت للحد اليومي للصور* (${DAILY_IMG_LIMIT} صور/يوم)\n\n` +
+                        `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
+                    );
                     return;
                 }
                 await react('👍');
@@ -2671,77 +2931,88 @@ async function startBot() {
             // إذا أرسل "لا" أو أي شيء آخر بعد عرض النطق → نمسح الانتظار ونكمل طبيعي
             if (userTTSPending[sender]) delete userTTSPending[sender];
 
-            // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص، !قائمة، !وضع) — تعمل دائماً بغض النظر عن النظام
-            const isVIPcmd = vipNumbers.includes(sender);
+            // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص) — تعمل دائماً
+            const isVIPcmd = isActiveVIP(sender);
             const handledCmd = await handleUserCommand(body, sender, reply, react, isAdmin, isVIPcmd);
             if (handledCmd) return;
 
             // ============================================================
-            // اختيار النظام (إذا لم يكن المستخدم قد اختار بعد، أو عند الاختيار)
+            // كشف طلب النطق الصوتي: "نطق [كلمة/جملة]"
             // ============================================================
-            const currentMode = userModes[sender] || null;
-
-            // إذا لم يختر المستخدم نظاماً بعد، انتظر اختياره
-            if (!currentMode) {
-                // فحص إذا أرسل رقم الاختيار
-                const choiceMap = { '1': 'terms', '2': 'pharma', '3': 'medai', '4': 'openai' };
-                const trimmed = body.trim();
-                const choice = choiceMap[trimmed];
-                if (choice) {
-                    userModes[sender] = choice;
-                    userChats[sender] = [];
-                    const modeNames = {
-                        terms:  'المصطلحات الطبية 📌',
-                        pharma: 'علم الأدوية 💊',
-                        medai:  'الذكاء الصناعي الطبي ⚕️',
-                        openai: 'الذكاء الصناعي العام 🤖'
-                    };
-                    const modeDescriptions = {
-                        terms:  'أرسل أي مصطلح طبي بالعربي أو الإنجليزي وسأشرحه لك بالتفصيل.',
-                        pharma: 'أرسل اسم أي دواء أو مادة فعّالة وسأعطيك معلومات كاملة عنه.',
-                        medai:  'اسألني أي سؤال طبي وسأجيبك بشكل مهني ودقيق.',
-                        openai: 'اسألني عن أي شيء! أنا مساعد عام بدون قيود.'
-                    };
-                    await react('✅');
-                    await reply(
-                        `✅ *تم تفعيل نظام: ${modeNames[choice]}*\n\n` +
-                        `${modeDescriptions[choice]}\n\n` +
-                        `💡 لتغيير النظام اكتب: *!قائمة*`
-                    );
-                    return;
+            const ttsMatch = bodyTrimmed.match(/^(?:نطق|صوت|اسمعني|اقرأ|نطقها?|ارسل صوت)\s+(.+)$/i);
+            if (ttsMatch) {
+                const isVIPnow = isActiveVIP(sender);
+                if (!isAdmin && !isVIPnow) {
+                    const ttsCheck = checkDailyTTS(sender);
+                    if (!ttsCheck.allowed) {
+                        await reply(
+                            `⚠️ *وصلت للحد اليومي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
+                            `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
+                        );
+                        return;
+                    }
                 }
-                // إذا أرسل شيئاً غير رقم، اطلب منه الاختيار
-                await reply(buildModeMenu(userName || ''));
+                const ttsText = ttsMatch[1].trim();
+                await react('🔊');
+                try {
+                    const lang = /[\u0600-\u06FF]/.test(ttsText) ? 'ar' : 'en';
+                    const audio = await generateTTS(ttsText, lang);
+                    await sendVoiceNote(jid, audio, msg);
+                    await react('✅');
+                } catch (e) {
+                    await react('❌');
+                    await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
+                }
                 return;
             }
 
-            // المستخدم في نظام — هل يريد تغييره؟ (أرسل رقم 1-4)
-            if (/^[1-4]$/.test(body.trim())) {
-                const choiceMap2 = { '1': 'terms', '2': 'pharma', '3': 'medai', '4': 'openai' };
-                const newMode = choiceMap2[body.trim()];
-                if (newMode && newMode !== currentMode) {
-                    userModes[sender] = newMode;
-                    userChats[sender] = [];
-                    const modeNames = {
-                        terms:  'المصطلحات الطبية 📌',
-                        pharma: 'علم الأدوية 💊',
-                        medai:  'الذكاء الصناعي الطبي ⚕️',
-                        openai: 'الذكاء الصناعي العام 🤖'
-                    };
-                    const modeDescriptions = {
-                        terms:  'أرسل أي مصطلح طبي بالعربي أو الإنجليزي وسأشرحه لك بالتفصيل.',
-                        pharma: 'أرسل اسم أي دواء أو مادة فعّالة وسأعطيك معلومات كاملة عنه.',
-                        medai:  'اسألني أي سؤال طبي وسأجيبك بشكل مهني ودقيق.',
-                        openai: 'اسألني عن أي شيء! أنا مساعد عام بدون قيود.'
-                    };
+            // ============================================================
+            // كشف طلب الترجمة: "ترجم [نص]" — يرسل الترجمة + صوت تلقائياً
+            // ============================================================
+            const translateMatch = bodyTrimmed.match(/^(?:ترجم|translate|ترجمة)\s+(.+)$/i);
+            if (translateMatch) {
+                const isVIPnow = isActiveVIP(sender);
+                const textToTranslate = translateMatch[1].trim();
+                await react('⏳');
+                try {
+                    // تحديد لغة المصدر والهدف
+                    const isArabic = /[\u0600-\u06FF]/.test(textToTranslate);
+                    const targetLang = isArabic ? 'English' : 'العربية';
+                    const targetLangCode = isArabic ? 'en' : 'ar';
+
+                    const translationResult = await callMistral({
+                        model: 'mistral-small-latest',
+                        messages: [
+                            { role: 'system', content: `أنت مترجم محترف. ترجم النص التالي إلى ${targetLang}. أرسل الترجمة فقط بدون أي شرح أو تعليق.` },
+                            { role: 'user', content: textToTranslate }
+                        ],
+                        max_tokens: 500,
+                        temperature: 0.3
+                    });
+
+                    const originalLabel = isArabic ? '🇸🇦 الأصلي:' : '🔤 Original:';
+                    const translatedLabel = isArabic ? '🇬🇧 الترجمة:' : '🇸🇦 الترجمة:';
+                    await reply(`${originalLabel} ${textToTranslate}\n\n${translatedLabel} ${translationResult}`);
+
+                    // إرسال الصوت تلقائياً بدون طلب "نعم"
+                    if (!isAdmin && !isVIPnow) {
+                        const ttsCheck = checkDailyTTS(sender);
+                        if (!ttsCheck.allowed) {
+                            await reply(`⚠️ وصلت للحد اليومي للصوت (${DAILY_TTS_LIMIT} مرات). الترجمة فوق بدون صوت.`);
+                            await react('✅');
+                            return;
+                        }
+                    }
+                    await new Promise(r => setTimeout(r, 300));
+                    const audio = await generateTTS(translationResult, targetLangCode);
+                    await sendVoiceNote(jid, audio);
                     await react('✅');
-                    await reply(
-                        `🔄 *تم التبديل إلى نظام: ${modeNames[newMode]}*\n\n` +
-                        `${modeDescriptions[newMode]}\n\n` +
-                        `💡 لتغيير النظام اكتب: *!قائمة*`
-                    );
-                    return;
+                } catch (e) {
+                    console.error('[translate]', e.message);
+                    await react('❌');
+                    await reply('عذراً، حدث خطأ أثناء الترجمة. حاول مرة أخرى.');
                 }
+                return;
             }
 
             // anti-spam: منع الإرسال المتسارع جداً
@@ -2751,24 +3022,22 @@ async function startBot() {
             }
 
             // الحد اليومي للرسائل (الأدمن وVIP بلا حدود)
-            const isVIP = vipNumbers.includes(sender);
+            const isVIP = isActiveVIP(sender);
             let _quotaCommit = null;
             if (!isAdmin && !isVIP) {
                 const quota = checkDailyMessages(sender);
                 if (!quota.allowed) {
                     await reply(
-                        `⚠️ *وصلت للحد اليومي*\n\n` +
-                        `استخدمت كل رسائلك المجانية الـ ${quota.limit} لهذا اليوم.\n` +
+                        `⚠️ *وصلت للحد اليومي (${DAILY_MSG_LIMIT} رسالة)*\n\n` +
                         `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄\n\n` +
-                        `للاستمرار الآن، تواصل مع الأدمن:\n` +
-                        `👤 wa.me/${ADMIN_NUMBER}`
+                        `للاستمرار الآن تواصل مع المهندس نادر:\n` +
+                        `👤 wa.me/972593850520`
                     );
-                    // إشعار الأدمن عند تجاوز المستخدم لحده
                     const uName = userNames[sender] ? `${userNames[sender]} (${sender})` : sender;
-                    notifyAdmin(`⚠️ المستخدم ${uName} تجاوز حده اليومي (${quota.limit} رسالة).`);
+                    notifyAdmin(`⚠️ المستخدم ${uName} تجاوز حده اليومي (${DAILY_MSG_LIMIT} رسالة).`);
                     return;
                 }
-                _quotaCommit = quota.commit; // سنستدعيها بعد نجاح الرد
+                _quotaCommit = quota.commit;
             }
 
             await react('👍');
@@ -2792,34 +3061,42 @@ async function startBot() {
 
             userChats[sender].push({ role: 'user', content: body });
 
-            // اختيار system prompt بناءً على النظام الحالي
-            const modeSystemPrompt = getModeSystemPrompt(currentMode) +
-                (userLanguages[sender] && userLanguages[sender] !== 'ar'
-                    ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLanguages[sender]}" فقط، حتى لو كتب بالعربية.`
-                    : '');
+            // اختيار system prompt ذكي: طبي للأسئلة الطبية، عام للباقي
+            const smartPrompt = getSmartSystemPrompt(body, userLanguages[sender]);
 
             const res = await askAI([
-                { role: 'system', content: modeSystemPrompt },
+                { role: 'system', content: smartPrompt },
                 ...userChats[sender]
             ]);
 
             userChats[sender].push({ role: 'assistant', content: res });
 
-            await reply(res);
-            await react('✅');
-            // تأكيد خصم الرسالة من العداد بعد نجاح الإرسال
-            if (_quotaCommit) _quotaCommit();
+            // إضافة عدد الرسائل المتبقية في نهاية الرد (للمستخدم العادي فقط)
+            let finalRes = res;
+            if (!isAdmin && !isVIP && _quotaCommit) {
+                _quotaCommit(); // خصم الرسالة
+                const rec = getDailyRecord(sender);
+                const remaining = Math.max(0, getUserDailyLimit(sender) - rec.messages);
+                if (remaining <= 5) {
+                    finalRes += `\n\n─────────────\n⚠️ *تنبيه:* متبقي لك *${remaining}* رسالة اليوم.\n_للاشتراك المميز: wa.me/972593850520_`;
+                } else {
+                    finalRes += `\n\n_💬 رسائل متبقية اليوم: ${remaining}_`;
+                }
+            } else if (_quotaCommit) {
+                _quotaCommit();
+            }
 
-            // ── عرض النطق الصوتي لأنظمة المصطلحات والأدوية فقط ──
-            if (currentMode === 'terms' || currentMode === 'pharma') {
+            await reply(finalRes);
+            await react('✅');
+
+            // ── عرض النطق الصوتي للمصطلحات الطبية والأدوية تلقائياً ──
+            if (isMedicalQuery(body)) {
                 const termEn = extractTermForTTS(res);
-                // استخراج الاسم العربي: أول كلمة عربية واضحة بعد كلمة "العربية:" أو "بالعربية:"
                 let termAr = null;
                 const arMatch = res.match(/(?:العربية|بالعربية)\s*[:\-–]\s*([^\n]{2,40})/i);
                 if (arMatch) termAr = arMatch[1].replace(/[*_📌⭐]/g, '').trim().split(/[،,\n]/)[0].trim();
 
                 if (termEn) {
-                    // احفظ المصطلح لمدة 3 دقائق بانتظار "نعم"
                     userTTSPending[sender] = {
                         term:   termEn,
                         termAr: termAr || null,
@@ -2850,6 +3127,9 @@ async function startBot() {
 // ============================================================
 // تنظيف الذاكرة كل ساعة
 setInterval(cleanMemory, 60 * 60_000);
+
+// فحص انتهاء VIP كل ساعة
+setInterval(checkVIPExpiry, 60 * 60_000);
 
 
 
