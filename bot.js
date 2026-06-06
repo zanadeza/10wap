@@ -89,6 +89,8 @@ function loadData() {
         vipExpiry:      {},   // { sender: timestamp_ms } — تاريخ انتهاء VIP
         reports:        [],
         userLimits:     {},   // حدود مخصصة لكل مستخدم { sender: limit }
+        userLimitsUsage: {},  // استهلاك كل مستخدم { sender: { messages, images, docs, tts, activatedAt } }
+        trialNotified:  {},  // { sender: true } — أُرسلت له رسالة الفترة المجانية
         blacklist:      [],   // أرقام محظورة
         userLanguages:  {},   // لغة كل مستخدم { sender: 'ar'|'en'|... }
         stats:          { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 }
@@ -103,7 +105,7 @@ function saveData() {
         try {
             const tmp = DATA_FILE + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(
-                { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, blacklist, userLanguages, stats },
+                { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, blacklist, userLanguages, stats },
                 null, 2
             ));
             fs.renameSync(tmp, DATA_FILE);
@@ -113,11 +115,13 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, blacklist, userLanguages, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, blacklist, userLanguages, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
 if (!userLimits)               userLimits = {};
+if (!userLimitsUsage)          userLimitsUsage = {};
+if (!trialNotified)            trialNotified = {};
 if (!Array.isArray(blacklist)) blacklist = [];
 if (!userLanguages)            userLanguages = {};
 if (!vipExpiry)                vipExpiry = {};
@@ -279,67 +283,53 @@ const DAILY_MSG_LIMIT   = 20; // رسائل نصية/24 ساعة لكل مستخ
 const DAILY_IMG_LIMIT   = 5;  // صور يومياً للمستخدم العادي
 const DAILY_TTS_LIMIT   = 10; // مرات استخدام الصوت/الترجمة يومياً للمستخدم العادي
 const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع المهندس نادر:\n👤 wa.me/972593850520'; // رسالة للمحظورين
-const _userDailyLimit = {}; // { sender: { messages, images, docs, tts, resetAt } }
+// ============================================================
+// نظام الحدود الدائمة — لا تتجدد تلقائياً، تُحفظ في bot_data.json
+// التجديد فقط: الأدمن يعطي VIP أو يرفع الحد يدوياً
+// ============================================================
 
 // الحد اليومي الفعلي: مخصص إن وُجد، وإلا الافتراضي
 function getUserDailyLimit(sender) {
     return (userLimits && userLimits[sender] != null) ? userLimits[sender] : DAILY_MSG_LIMIT;
 }
 
-// حساب بداية اليوم التالي (منتصف الليل بتوقيت القدس)
-function getNextMidnightMs() {
-    const now = new Date();
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Asia/Jerusalem',
-        year: 'numeric', month: '2-digit', day: '2-digit'
-    });
-    const parts = fmt.formatToParts(now);
-    const get = type => parts.find(p => p.type === type)?.value || '00';
-    // منتصف ليل اليوم التالي بتوقيت القدس
-    const todayMidnightJerusalem = new Date(`${get('year')}-${get('month')}-${get('day')}T00:00:00`);
-    todayMidnightJerusalem.setDate(todayMidnightJerusalem.getDate() + 1);
-    return todayMidnightJerusalem.getTime();
-}
-
+// جلب سجل الاستهلاك من الذاكرة الدائمة
 function getDailyRecord(sender) {
-    const now = Date.now();
-    if (!_userDailyLimit[sender] || now >= _userDailyLimit[sender].resetAt) {
-        _userDailyLimit[sender] = {
-            messages: 0,
-            images:   0,
-            docs:     0,
-            tts:      0,
-            resetAt:  getNextMidnightMs()
-        };
+    if (!userLimitsUsage[sender]) {
+        userLimitsUsage[sender] = { messages: 0, images: 0, docs: 0, tts: 0, activatedAt: Date.now() };
     }
-    return _userDailyLimit[sender];
+    return userLimitsUsage[sender];
 }
 
-// فحص الحد اليومي للرسائل النصية — يُعيد { allowed, remaining, commit }
-// commit() يجب استدعاؤها فقط بعد نجاح إرسال الرد الفعلي
+// إعادة تصفير استهلاك مستخدم (يستدعيها الأدمن فقط عند رفع الحد أو إضافة VIP)
+function resetUserUsage(sender) {
+    userLimitsUsage[sender] = { messages: 0, images: 0, docs: 0, tts: 0, activatedAt: Date.now() };
+    saveData();
+}
+
+// فحص الحد للرسائل النصية — يُعيد { allowed, remaining, commit }
 function checkDailyMessages(sender) {
     const limit = getUserDailyLimit(sender);
     const rec = getDailyRecord(sender);
     if (rec.messages >= limit) return { allowed: false, remaining: 0, limit, commit: () => {} };
     const remaining = limit - rec.messages - 1;
-    const commit = () => { rec.messages++; };
+    const commit = () => { rec.messages++; saveData(); };
     return { allowed: true, remaining, limit, commit };
 }
 
-// فحص الحد اليومي للـ TTS — يُعيد { allowed, remaining }
+// فحص حد الـ TTS — يُعيد { allowed, remaining, commit }
 function checkDailyTTS(sender) {
     const d = getDailyRecord(sender);
     if (d.tts >= DAILY_TTS_LIMIT) return { allowed: false, remaining: 0 };
     const remaining = DAILY_TTS_LIMIT - d.tts - 1;
-    // لا نخصم هنا — نترك الخصم للمستدعي بعد النجاح الفعلي
-    return { allowed: true, remaining, commit: () => { d.tts++; } };
+    return { allowed: true, remaining, commit: () => { d.tts++; saveData(); } };
 }
 
-// فحص الحد اليومي للصور والملفات
+// فحص حد الصور والملفات
 function checkDailyLimit(sender, type) {
     const d = getDailyRecord(sender);
-    if (type === 'image') { if (d.images >= DAILY_IMG_LIMIT) return false; d.images++; return true; }
-    if (type === 'pdf')   { if (d.docs   >= 10) return false; d.docs++;   return true; }
+    if (type === 'image') { if (d.images >= DAILY_IMG_LIMIT) return false; d.images++; saveData(); return true; }
+    if (type === 'pdf')   { if (d.docs   >= 10) return false; d.docs++; saveData(); return true; }
     return true;
 }
 
@@ -380,10 +370,7 @@ setInterval(() => {
         _spamCheck[k] = (_spamCheck[k] || []).filter(t => now - t < 10_000);
         if (!_spamCheck[k].length) delete _spamCheck[k];
     }
-    // تنظيف سجلات Daily المنتهية
-    for (const k of Object.keys(_userDailyLimit)) {
-        if (now >= (_userDailyLimit[k].resetAt || 0)) delete _userDailyLimit[k];
-    }
+    // userLimitsUsage محفوظ دائماً — لا تنظيف تلقائي
 }, 60 * 60_000);
 
 // ============================================================
@@ -1512,6 +1499,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                             vipNumbers.push(num);
                             const expiry = Date.now() + 30 * 24 * 60 * 60_000;
                             vipExpiry[num] = expiry;
+                            resetUserUsage(num);
                             saveData();
                             if (sock && isConnected) {
                                 try {
@@ -1616,7 +1604,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                         } else {
                             const oldLimit = getUserDailyLimit(num);
                             userLimits[num] = limit;
-
+                            resetUserUsage(num); // تصفير الاستهلاك عند رفع الحد
                             // إذا كان المستخدم متجاوزاً وتم رفع الحد عن استهلاكه الحالي
                             // → نصفّر العداد لمستواه الحالي حتى يستطيع الإرسال فوراً
                             const rec = getDailyRecord(num);
@@ -1637,7 +1625,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                                     const name = userNames[num] ? `${userNames[num]}` : '';
                                     const msg = nowAllowed
                                         ? `🎉 ${name ? `أهلاً ${name}، ` : ''}تم رفع حد رسائلك اليومي إلى *${limit}* رسالة!\n\nيمكنك الآن الاستمرار في المحادثة. 🚀`
-                                        : `ℹ️ ${name ? `${name}، ` : ''}تم تعديل حدك اليومي إلى *${limit}* رسالة.\n\nسيتجدد رصيدك في منتصف الليل 🔄`;
+                                        : `ℹ️ ${name ? `${name}، ` : ''}تم تعديل حدك اليومي إلى *${limit}* رسالة.\n\nللحصول على المزيد تواصل مع الأدمن أو اشترك بـ VIP`;
                                     await sock.sendMessage(jid, { text: msg });
                                 } catch (e) {
                                     console.error('[setUserLimit notify]', e.message);
@@ -2748,7 +2736,51 @@ async function startBot() {
             console.log(`📨 [${isAdmin ? 'ADMIN' : 'USER'}] ${sender} | ${msgType} | "${body.slice(0, 50)}"`);
 
             // ============================================================
-            // أوامر الأدمن — تُدار من لوحة التحكم فقط
+            // ============================================================
+    // أوامر الأدمن عبر واتساب (تعمل من رقم الأدمن فقط)
+    // ============================================================
+    if (isAdmin) {
+        // !removevip [رقم]
+        const removeVipMatch = body.match(/^!removevip\s+(\d+)/i);
+        if (removeVipMatch) {
+            const num = removeVipMatch[1].trim();
+            const wasVip = vipNumbers.includes(num);
+            vipNumbers = vipNumbers.filter(n => n !== num);
+            delete vipExpiry[num];
+            saveData();
+            if (wasVip && sock && isConnected) {
+                try { await sock.sendMessage(`${num}@s.whatsapp.net`, { text: `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: wa.me/972593850520` }); } catch (_) {}
+            }
+            await reply(wasVip ? `✅ تم إزالة VIP عن ${num} وتم إشعاره.` : `⚠️ الرقم ${num} لم يكن VIP أصلاً.`);
+            return true;
+        }
+        // !addvip [رقم]
+        const addVipMatch = body.match(/^!addvip\s+(\d+)/i);
+        if (addVipMatch) {
+            const num = addVipMatch[1].trim();
+            if (!vipNumbers.includes(num)) {
+                vipNumbers.push(num);
+                vipExpiry[num] = Date.now() + 30 * 24 * 60 * 60_000;
+                resetUserUsage(num);
+                saveData();
+                try { await sock.sendMessage(`${num}@s.whatsapp.net`, { text: `🌟 *تهانينا! تم تفعيل اشتراكك المميز (VIP)*\nرسائل وصور وصوت غير محدودة ✨` }); } catch (_) {}
+                await reply(`✅ تم تفعيل VIP للرقم ${num} لمدة شهر.`);
+            } else {
+                await reply(`⚠️ الرقم ${num} VIP أصلاً.`);
+            }
+            return true;
+        }
+        // !resetlimit [رقم]
+        const resetLimitMatch = body.match(/^!resetlimit\s+(\d+)/i);
+        if (resetLimitMatch) {
+            const num = resetLimitMatch[1].trim();
+            resetUserUsage(num);
+            await reply(`✅ تم تصفير استهلاك ${num}.`);
+            return true;
+        }
+    }
+
+    // أوامر الأدمن — تُدار من لوحة التحكم فقط
             // الأدمن يستخدم البوت كمستخدم عادي
             // ============================================================
 
@@ -2780,6 +2812,28 @@ async function startBot() {
                     const isProcessable = body || ['imageMessage','documentMessage'].includes(msgType);
                     if (!isProcessable) return;
                 }
+            }
+
+            // ── رسالة الفترة المجانية — تُرسل مرة واحدة فقط لكل مستخدم جديد غير VIP ──
+            if (!isAdmin && !isActiveVIP(sender) && !trialNotified[sender]) {
+                trialNotified[sender] = true;
+                saveData();
+                const rec = getDailyRecord(sender);
+                const msgLimit  = getUserDailyLimit(sender);
+                const imgLimit  = DAILY_IMG_LIMIT;
+                const ttsLimit  = DAILY_TTS_LIMIT;
+                await sock.sendMessage(jid, {
+                    text:
+                        `🎉 *مرحباً بك في MedTerm!*\n\n` +
+                        `أنت الآن في *الفترة التجريبية المجانية* 🆓\n\n` +
+                        `📊 *رصيدك التجريبي:*\n` +
+                        `💬 الرسائل النصية: ${msgLimit - rec.messages} / ${msgLimit}\n` +
+                        `🖼️ الصور: ${imgLimit - rec.images} / ${imgLimit}\n` +
+                        `🔊 الرسائل الصوتية: ${ttsLimit - rec.tts} / ${ttsLimit}\n\n` +
+                        `⚠️ *ملاحظة:* هذا الرصيد للتجربة فقط ولا يتجدد تلقائياً.\n` +
+                        `للاستمرار بعد انتهاء الرصيد، تواصل معنا للاشتراك الشهري 👇\n` +
+                        `📲 wa.me/972593850520`
+                });
             }
 
             // ============================================================
@@ -3335,7 +3389,9 @@ async function startBot() {
             // ============================================================
             // كشف طلب النطق الصوتي: "نطق [كلمة/جملة]"
             // ============================================================
-            const ttsMatch = bodyTrimmed.match(/^(?:نطق|صوت|اسمعني|اقرأ|نطقها?|ارسل صوت)\s+(.+)$/i);
+            const ttsMatch = bodyTrimmed.match(/^(?:نطق|صوت|اسمعني|اقرأ|نطقها?|ارسل صوت|حولها? صوت|بصوت|اقرأها?|قرأ|قراءة|حول(?:ي|وا|)? (?:لـ?|إلى )?صوت)\s+(.+)$/i)
+                          || bodyTrimmed.match(/^(?:.*?)\s*(?:بالصوت|صوتياً|بصوت|voice)\s+(.+)$/i)
+                          || (bodyTrimmed.startsWith('صوت ') ? { 1: bodyTrimmed.slice(4) } : null);
             if (ttsMatch) {
                 const isVIPnow = isActiveVIP(sender);
                 if (!isAdmin && !isVIPnow) {
@@ -3426,13 +3482,28 @@ async function startBot() {
                 const quota = checkDailyMessages(sender);
                 if (!quota.allowed) {
                     await reply(
-                        `⚠️ *وصلت للحد اليومي (${DAILY_MSG_LIMIT} رسالة)*\n\n` +
-                        `سيتجدد رصيدك تلقائياً في منتصف الليل 🔄\n\n` +
-                        `للاستمرار الآن تواصل مع المهندس نادر:\n` +
-                        `👤 wa.me/972593850520`
+                        `📢 *إشعار مهم لمستخدمي بوت MedTerm*\n\n` +
+                        `نشكركم على استخدام النسخة التجريبية من البوت. نود إعلامكم بأن الفترة التجريبية قد انتهت، وللاستمرار بالاستفادة من جميع خدمات البوت أصبح الاشتراك الشهري متاحاً الآن.\n\n` +
+                        `💰 *سعر الاشتراك: 5 شيكل فقط شهرياً*\n\n` +
+                        `عند الاشتراك ستحصل على وصول غير محدود إلى جميع ميزات البوت، ومنها:\n\n` +
+                        `🤖 الذكاء الاصطناعي على واتساب على مدار 24 ساعة\n` +
+                        `💬 دعم غير محدود للرسائل النصية\n` +
+                        `🔬 تحليل وشرح الصور الطبية وغير الطبية\n` +
+                        `🎙️ دعم الرسائل الصوتية والرد عليها\n` +
+                        `📄 إمكانية إرسال الملفات وتحليل محتواها\n` +
+                        `🏥 شرح المصطلحات الطبية بشكل مفصل ومبسط\n` +
+                        `💊 معلومات علم الأدوية واستخداماتها التعليمية\n` +
+                        `👨‍⚕️ المساعدة في مختلف التخصصات الطبية\n` +
+                        `❓ الإجابة عن الأسئلة العامة وغير الطبية\n` +
+                        `🔊 النطق الصحيح للمصطلحات الطبية وأسماء الأدوية\n` +
+                        `♾️ استخدام غير محدود لجميع الميزات دون قيود\n\n` +
+                        `*كل هذه الخدمات مقابل 5 شيكل فقط شهرياً.*\n\n` +
+                        `للاشتراك أو الاستفسار، يرجى التواصل معنا وسيتم تفعيل اشتراكك مباشرة:\n` +
+                        `📲 https://wa.me/972593850520\n\n` +
+                        `شكراً لثقتكم بنا، ونتمنى لكم تجربة مميزة مع *MedTerm* 💙`
                     );
                     const uName = userNames[sender] ? `${userNames[sender]} (${sender})` : sender;
-                    notifyAdmin(`⚠️ المستخدم ${uName} تجاوز حده اليومي (${DAILY_MSG_LIMIT} رسالة).`);
+                    notifyAdmin(`⚠️ المستخدم ${uName} انتهت فترته التجريبية (${DAILY_MSG_LIMIT} رسالة).`);
                     return;
                 }
                 _quotaCommit = quota.commit;
