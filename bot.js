@@ -1684,7 +1684,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
             const userUsage = {};
             for (const num of Object.keys(welcomedUsers)) {
                 const cleanNum = cleanNumber(num);
-                const rec = _userDailyLimit[cleanNum];
+                const rec = userLimitsUsage[cleanNum];
                 const limit = getUserDailyLimit(cleanNum);
                 userUsage[cleanNum] = {
                     used: rec ? rec.messages : 0,
@@ -1692,7 +1692,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     docs: rec ? rec.docs : 0,
                     limit,
                     remaining: Math.max(0, limit - (rec ? rec.messages : 0)),
-                    resetAt: rec ? rec.resetAt : null
+                    resetAt: rec ? rec.activatedAt : null
                 };
             }
             const d = {
