@@ -692,50 +692,74 @@ function extractTermForTTS(botReply) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (espeak-ng محلي → ffmpeg → OGG Opus)
-// يعمل بدون إنترنت، بدون حدود، بدون ذكاء اصطناعي
+// TEXT-TO-SPEECH (espeak محلي → ffmpeg → OGG Opus)
+// جودة عالية، صوت واضح وبطيء
 // ============================================================
 const { execFile } = require('child_process');
 const os           = require('os');
 
 async function generateTTS(text, lang = 'en') {
-    // espeak-ng يدعم العربية والإنجليزية محلياً
-    const espeakLang = lang === 'ar' ? 'ar' : 'en';
-    const speed = lang === 'ar' ? '150' : '160'; // سرعة الكلام
-    const pitch = '50'; // حدة الصوت
+    const espeakLang = lang === 'ar' ? 'ar' : 'en+m3';  // m3 = صوت ذكر أوضح للإنجليزي
+    const speed = lang === 'ar' ? '120' : '130';          // أبطأ = أوضح
+    const pitch = lang === 'ar' ? '45' : '40';            // حدة طبيعية
+    const amplitude = '180';                               // صوت أعلى
 
     const tmpId   = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const wavFile = require('path').join(os.tmpdir(), `tts_${tmpId}.wav`);
+    const wav2File = require('path').join(os.tmpdir(), `tts_${tmpId}_enh.wav`);
     const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}.ogg`);
 
-    // تنظيف النص من رموز خاصة قد تسبب مشاكل
-    const cleanText = text.slice(0, 500).replace(/[<>]/g, '');
+    // تنظيف النص
+    const cleanText = text
+        .slice(0, 500)
+        .replace(/[<>*_#]/g, '')
+        .replace(/\n/g, ' ')
+        .trim();
 
-    // الخطوة 1: espeak-ng → WAV
+    // الخطوة 1: espeak → WAV بجودة عالية
     await new Promise((resolve, reject) => {
-        execFile('espeak-ng', [
+        execFile('espeak', [
             '-v', espeakLang,
             '-s', speed,
             '-p', pitch,
+            '-a', amplitude,
+            '-g', '8',      // فترة صمت بين الكلمات = أوضح
             '-w', wavFile,
             cleanText
         ], { timeout: 30_000 }, (err, _stdout, stderr) => {
-            if (err) return reject(new Error(`espeak-ng فشل: ${err.message} | ${stderr}`));
+            if (err) return reject(new Error(`espeak فشل: ${err.message} | ${stderr}`));
             resolve();
         });
     });
 
-    // الخطوة 2: WAV → OGG Opus عبر ffmpeg (WhatsApp يحتاج Opus)
+    // الخطوة 2: تحسين الصوت بـ ffmpeg (رفع جودة + تقليل ضجيج)
     await new Promise((resolve, reject) => {
         execFile('ffmpeg', [
             '-y', '-i', wavFile,
+            '-af', 'aresample=22050,volume=1.5,highpass=f=80,lowpass=f=8000',
+            wav2File
+        ], { timeout: 15_000 }, (err) => {
+            require('fs').unlink(wavFile, () => {});
+            if (err) {
+                // إذا فشل التحسين، نستخدم الأصلي
+                require('fs').copyFileSync(wavFile, wav2File);
+            }
+            resolve();
+        });
+    });
+
+    // الخطوة 3: WAV → OGG Opus (WhatsApp)
+    await new Promise((resolve, reject) => {
+        execFile('ffmpeg', [
+            '-y', '-i', wav2File,
             '-c:a', 'libopus',
-            '-b:a', '32k',
+            '-b:a', '48k',   // جودة أعلى
+            '-vbr', 'on',
             '-vn',
             oggFile
         ], { timeout: 15_000 }, (err) => {
-            require('fs').unlink(wavFile, () => {});
-            if (err) return reject(new Error(`ffmpeg فشل: ${err.message}`));
+            require('fs').unlink(wav2File, () => {});
+            if (err) return reject(new Error(`ffmpeg OGG فشل: ${err.message}`));
             resolve();
         });
     });
@@ -749,131 +773,69 @@ async function generateTTS(text, lang = 'en') {
 }
 
 // ============================================================
-// SPEECH-TO-TEXT (Vosk محلي — بدون إنترنت)
-// يستخدم vosk-api لاستخراج النص من الصوت محلياً
-// التثبيت: pip install vosk && تنزيل موديل عربي/إنجليزي
+// SPEECH-TO-TEXT (whisper.cpp محلي — بدون إنترنت)
 // ============================================================
 async function transcribeAudioLocally(buffer, mimeType) {
-    const tmpId    = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const tmpId     = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const inputFile = require('path').join(os.tmpdir(), `stt_in_${tmpId}.ogg`);
     const wavFile   = require('path').join(os.tmpdir(), `stt_${tmpId}.wav`);
+
+    const WHISPER_BIN   = '/data/data/com.termux/files/home/whisper.cpp/build/bin/main';
+    const WHISPER_MODEL = '/data/data/com.termux/files/home/whisper.cpp/models/ggml-tiny.bin';
 
     try {
         await require('fs').promises.writeFile(inputFile, buffer);
 
-        // تحويل الصوت → WAV 16kHz mono (مطلوب لـ Vosk)
+        // تحويل الصوت → WAV 16kHz mono (مطلوب لـ whisper)
         await new Promise((resolve, reject) => {
             execFile('ffmpeg', [
                 '-y', '-i', inputFile,
                 '-ar', '16000',
                 '-ac', '1',
+                '-c:a', 'pcm_s16le',
                 '-f', 'wav',
                 wavFile
-            ], { timeout: 30_000 }, (err) => {
-                if (err) return reject(new Error(`ffmpeg تحويل الصوت فشل: ${err.message}`));
+            ], { timeout: 30_000 }, (err, _so, se) => {
+                if (err) return reject(new Error(`ffmpeg تحويل الصوت فشل: ${se || err.message}`));
                 resolve();
             });
         });
 
-        // استخدام vosk-cli أو Python لاستخراج النص
-        // نحاول vosk أولاً ثم whisper كـ fallback
-        let transcription = '';
-
-        // محاولة vosk عبر Python
-        try {
-            transcription = await new Promise((resolve, reject) => {
-                const { spawn } = require('child_process');
-                const py = spawn('python3', ['-c', `
-import sys, json
-try:
-    from vosk import Model, KaldiRecognizer
-    import wave
-    import os
-
-    # ابحث عن أي موديل vosk متاح
-    model_dirs = [
-        '/data/data/com.termux/files/home/vosk-model-ar',
-        '/data/data/com.termux/files/home/vosk-model-en',
-        '/data/data/com.termux/files/home/vosk-model-small-ar',
-        '/data/data/com.termux/files/home/vosk-model-small-en-us',
-        os.path.expanduser('~/vosk-model-ar'),
-        os.path.expanduser('~/vosk-model-en'),
-        os.path.expanduser('~/vosk-model-small-ar'),
-        os.path.expanduser('~/vosk-model-small-en-us'),
-    ]
-    model_path = None
-    for d in model_dirs:
-        if os.path.isdir(d):
-            model_path = d
-            break
-    if not model_path:
-        print(json.dumps({"error": "no_model"}))
-        sys.exit(0)
-    model = Model(model_path)
-    wf = wave.open(sys.argv[1], 'rb')
-    rec = KaldiRecognizer(model, wf.getframerate())
-    results = []
-    while True:
-        data = wf.readframes(4000)
-        if not data: break
-        if rec.AcceptWaveform(data):
-            r = json.loads(rec.Result())
-            if r.get('text'): results.append(r['text'])
-    r = json.loads(rec.FinalResult())
-    if r.get('text'): results.append(r['text'])
-    print(json.dumps({"text": ' '.join(results)}))
-except ImportError:
-    print(json.dumps({"error": "vosk_not_installed"}))
-except Exception as e:
-    print(json.dumps({"error": str(e)}))
-`, wavFile], { timeout: 60_000 });
-
-                let output = '';
-                py.stdout.on('data', d => output += d.toString());
-                py.on('close', (code) => {
-                    try {
-                        const result = JSON.parse(output.trim());
-                        if (result.text) resolve(result.text);
-                        else reject(new Error(result.error || 'vosk فشل'));
-                    } catch {
-                        reject(new Error('vosk: خرج غير صالح'));
-                    }
-                });
-                py.on('error', reject);
+        // استخراج النص بـ whisper.cpp
+        const transcription = await new Promise((resolve, reject) => {
+            execFile(WHISPER_BIN, [
+                '-m', WHISPER_MODEL,
+                '-f', wavFile,
+                '-l', 'auto',
+                '--no-timestamps',
+                '-t', '4',    // 4 threads
+                '--print-special', 'false'
+            ], { timeout: 120_000 }, (err, stdout, stderr) => {
+                if (err) return reject(new Error(`whisper فشل: ${err.message}\n${stderr?.slice(0,200)}`));
+                // تنظيف الخرج من whisper
+                const clean = stdout
+                    .replace(/\[.*?\]/g, '')      // إزالة timestamps
+                    .replace(/\(.*?\)/g, '')       // إزالة tags
+                    .replace(/whisper_.*/gs, '')    // إزالة debug output
+                    .split('\n')
+                    .filter(l => l.trim() && !l.startsWith('[') && !l.includes('whisper_'))
+                    .join(' ')
+                    .trim();
+                resolve(clean || '');
             });
-        } catch (voskErr) {
-            console.warn('[STT] vosk فشل:', voskErr.message, '— جرب whisper...');
+        });
 
-            // fallback: whisper-cpp أو whisper CLI
-            transcription = await new Promise((resolve, reject) => {
-                execFile('whisper', [
-                    wavFile,
-                    '--model', 'base',
-                    '--output_format', 'txt',
-                    '--output_dir', os.tmpdir(),
-                    '--language', 'auto'
-                ], { timeout: 120_000 }, (err, stdout) => {
-                    if (err) return reject(new Error(`whisper فشل: ${err.message}`));
-                    // whisper يكتب ملف .txt جنب الـ wav
-                    const txtFile = wavFile.replace('.wav', '.txt');
-                    try {
-                        const txt = require('fs').readFileSync(txtFile, 'utf-8').trim();
-                        require('fs').unlink(txtFile, () => {});
-                        resolve(txt || stdout.trim());
-                    } catch {
-                        resolve(stdout.trim() || '');
-                    }
-                });
-            });
-        }
-
-        return transcription || '';
+        console.log(`[STT] ✅ نص مستخرج: "${transcription.slice(0,80)}"`);
+        return transcription;
 
     } finally {
         require('fs').unlink(inputFile, () => {});
         require('fs').unlink(wavFile, () => {});
     }
 }
+
+// ============================================================
+
 
 // إرسال voice note لـ WhatsApp
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
