@@ -554,11 +554,11 @@ English: [Key interactions]
     openai: null  // يستخدم getSystemPrompt() الأصلي
 };
 
-// رسالة الترحيب للمستخدمين الجدد
+// رسالة الترحيب للمستخدمين الجدد (بدون قائمة أنظمة — البوت مفتوح)
 function buildModeMenu(name) {
     const first = name ? name.split(' ')[0] : null;
     const greeting = first ? `أهلاً ${first}` : 'أهلاً';
-    return `${greeting} 👋\n\n*مرحباً بك في بوت MedTerm الطبي!*\n\n` +
+    return `${greeting} 👋\n\n*مرحباً بك في بوت MedTerm!*\n\n` +
         `يمكنني مساعدتك في:\n` +
         `🏥 شرح المصطلحات الطبية بالعربي والإنجليزي\n` +
         `💊 معلومات شاملة عن الأدوية والمستحضرات\n` +
@@ -566,10 +566,11 @@ function buildModeMenu(name) {
         `🤖 المساعدة في أي موضوع عام\n` +
         `🖼️ تحليل الصور والتقارير الطبية\n` +
         `📄 قراءة وتحليل ملفات PDF\n` +
-        `🔊 نطق المصطلحات الطبية صوتياً\n` +
+        `🎙️ فهم والرد على رسائلك الصوتية\n` +
+        `🔊 نطق المصطلحات الطبية صوتياً (espeak-ng محلي)\n` +
         `🌐 الترجمة مع الصوت والنطق\n\n` +
         `─────────────────\n` +
-        `✍️ *فقط أرسل سؤالك وسأرد عليك مباشرة!*`;
+        `✍️ *فقط أرسل سؤالك وسأرد عليك مباشرة — بدون قيود على المواضيع!*`;
 }
 
 // اسم وأيقونة النظام الحالي
@@ -691,38 +692,49 @@ function extractTermForTTS(botReply) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (Google Translate TTS → ffmpeg → OGG Opus)
+// TEXT-TO-SPEECH (espeak-ng محلي → ffmpeg → OGG Opus)
+// يعمل بدون إنترنت، بدون حدود، بدون ذكاء اصطناعي
 // ============================================================
 const { execFile } = require('child_process');
 const os           = require('os');
 
 async function generateTTS(text, lang = 'en') {
-    const ttsLang   = lang === 'ar' ? 'ar' : 'en';
-    const cleanText = text.slice(0, 100).replace(/[^\w\s\u0600-\u06FF]/g, '');
-    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=${ttsLang}&client=tw-ob&ttsspeed=0.9`;
+    // espeak-ng يدعم العربية والإنجليزية محلياً
+    const espeakLang = lang === 'ar' ? 'ar' : 'en';
+    const speed = lang === 'ar' ? '150' : '160'; // سرعة الكلام
+    const pitch = '50'; // حدة الصوت
 
-    // الخطوة 1: جلب MP3 من Google TTS
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Google TTS HTTP ${response.status}`);
-    const mp3Buffer = Buffer.from(await response.arrayBuffer());
-    if (!mp3Buffer || mp3Buffer.length < 100) throw new Error(`MP3 فارغ (${mp3Buffer?.length} bytes)`);
-
-    // الخطوة 2: تحويل MP3 → OGG Opus عبر ffmpeg (WhatsApp يحتاج Opus)
-    const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const mp3File = require('path').join(os.tmpdir(), `tts_${tmpId}.mp3`);
+    const tmpId   = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const wavFile = require('path').join(os.tmpdir(), `tts_${tmpId}.wav`);
     const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}.ogg`);
 
-    await require('fs').promises.writeFile(mp3File, mp3Buffer);
+    // تنظيف النص من رموز خاصة قد تسبب مشاكل
+    const cleanText = text.slice(0, 500).replace(/[<>]/g, '');
 
+    // الخطوة 1: espeak-ng → WAV
+    await new Promise((resolve, reject) => {
+        execFile('espeak-ng', [
+            '-v', espeakLang,
+            '-s', speed,
+            '-p', pitch,
+            '-w', wavFile,
+            cleanText
+        ], { timeout: 30_000 }, (err, _stdout, stderr) => {
+            if (err) return reject(new Error(`espeak-ng فشل: ${err.message} | ${stderr}`));
+            resolve();
+        });
+    });
+
+    // الخطوة 2: WAV → OGG Opus عبر ffmpeg (WhatsApp يحتاج Opus)
     await new Promise((resolve, reject) => {
         execFile('ffmpeg', [
-            '-y', '-i', mp3File,
+            '-y', '-i', wavFile,
             '-c:a', 'libopus',
             '-b:a', '32k',
             '-vn',
             oggFile
         ], { timeout: 15_000 }, (err) => {
-            require('fs').unlink(mp3File, () => {});
+            require('fs').unlink(wavFile, () => {});
             if (err) return reject(new Error(`ffmpeg فشل: ${err.message}`));
             resolve();
         });
@@ -732,8 +744,135 @@ async function generateTTS(text, lang = 'en') {
     require('fs').unlink(oggFile, () => {});
 
     if (!oggBuffer || oggBuffer.length < 100) throw new Error(`OGG فارغ (${oggBuffer?.length} bytes)`);
-    console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" → ${oggBuffer.length} bytes`);
+    console.log(`[TTS-Local] ✅ ${lang} "${text.slice(0,30)}" → ${oggBuffer.length} bytes`);
     return oggBuffer;
+}
+
+// ============================================================
+// SPEECH-TO-TEXT (Vosk محلي — بدون إنترنت)
+// يستخدم vosk-api لاستخراج النص من الصوت محلياً
+// التثبيت: pip install vosk && تنزيل موديل عربي/إنجليزي
+// ============================================================
+async function transcribeAudioLocally(buffer, mimeType) {
+    const tmpId    = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const inputFile = require('path').join(os.tmpdir(), `stt_in_${tmpId}.ogg`);
+    const wavFile   = require('path').join(os.tmpdir(), `stt_${tmpId}.wav`);
+
+    try {
+        await require('fs').promises.writeFile(inputFile, buffer);
+
+        // تحويل الصوت → WAV 16kHz mono (مطلوب لـ Vosk)
+        await new Promise((resolve, reject) => {
+            execFile('ffmpeg', [
+                '-y', '-i', inputFile,
+                '-ar', '16000',
+                '-ac', '1',
+                '-f', 'wav',
+                wavFile
+            ], { timeout: 30_000 }, (err) => {
+                if (err) return reject(new Error(`ffmpeg تحويل الصوت فشل: ${err.message}`));
+                resolve();
+            });
+        });
+
+        // استخدام vosk-cli أو Python لاستخراج النص
+        // نحاول vosk أولاً ثم whisper كـ fallback
+        let transcription = '';
+
+        // محاولة vosk عبر Python
+        try {
+            transcription = await new Promise((resolve, reject) => {
+                const { spawn } = require('child_process');
+                const py = spawn('python3', ['-c', `
+import sys, json
+try:
+    from vosk import Model, KaldiRecognizer
+    import wave
+    import os
+
+    # ابحث عن أي موديل vosk متاح
+    model_dirs = [
+        '/data/data/com.termux/files/home/vosk-model-ar',
+        '/data/data/com.termux/files/home/vosk-model-en',
+        '/data/data/com.termux/files/home/vosk-model-small-ar',
+        '/data/data/com.termux/files/home/vosk-model-small-en-us',
+        os.path.expanduser('~/vosk-model-ar'),
+        os.path.expanduser('~/vosk-model-en'),
+        os.path.expanduser('~/vosk-model-small-ar'),
+        os.path.expanduser('~/vosk-model-small-en-us'),
+    ]
+    model_path = None
+    for d in model_dirs:
+        if os.path.isdir(d):
+            model_path = d
+            break
+    if not model_path:
+        print(json.dumps({"error": "no_model"}))
+        sys.exit(0)
+    model = Model(model_path)
+    wf = wave.open(sys.argv[1], 'rb')
+    rec = KaldiRecognizer(model, wf.getframerate())
+    results = []
+    while True:
+        data = wf.readframes(4000)
+        if not data: break
+        if rec.AcceptWaveform(data):
+            r = json.loads(rec.Result())
+            if r.get('text'): results.append(r['text'])
+    r = json.loads(rec.FinalResult())
+    if r.get('text'): results.append(r['text'])
+    print(json.dumps({"text": ' '.join(results)}))
+except ImportError:
+    print(json.dumps({"error": "vosk_not_installed"}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+`, wavFile], { timeout: 60_000 });
+
+                let output = '';
+                py.stdout.on('data', d => output += d.toString());
+                py.on('close', (code) => {
+                    try {
+                        const result = JSON.parse(output.trim());
+                        if (result.text) resolve(result.text);
+                        else reject(new Error(result.error || 'vosk فشل'));
+                    } catch {
+                        reject(new Error('vosk: خرج غير صالح'));
+                    }
+                });
+                py.on('error', reject);
+            });
+        } catch (voskErr) {
+            console.warn('[STT] vosk فشل:', voskErr.message, '— جرب whisper...');
+
+            // fallback: whisper-cpp أو whisper CLI
+            transcription = await new Promise((resolve, reject) => {
+                execFile('whisper', [
+                    wavFile,
+                    '--model', 'base',
+                    '--output_format', 'txt',
+                    '--output_dir', os.tmpdir(),
+                    '--language', 'auto'
+                ], { timeout: 120_000 }, (err, stdout) => {
+                    if (err) return reject(new Error(`whisper فشل: ${err.message}`));
+                    // whisper يكتب ملف .txt جنب الـ wav
+                    const txtFile = wavFile.replace('.wav', '.txt');
+                    try {
+                        const txt = require('fs').readFileSync(txtFile, 'utf-8').trim();
+                        require('fs').unlink(txtFile, () => {});
+                        resolve(txt || stdout.trim());
+                    } catch {
+                        resolve(stdout.trim() || '');
+                    }
+                });
+            });
+        }
+
+        return transcription || '';
+
+    } finally {
+        require('fs').unlink(inputFile, () => {});
+        require('fs').unlink(wavFile, () => {});
+    }
 }
 
 // إرسال voice note لـ WhatsApp
@@ -1007,76 +1146,42 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
 }
 
 // ============================================================
-// VOXTRAL (Mistral) — تحويل الصوت إلى نص والرد عليه
+// معالجة الرسائل الصوتية — STT محلي (Vosk/Whisper) + Mistral للرد
 // ============================================================
 async function transcribeAndReplyAudio(buffer, mimeType, userQuestion, userName, chatHistory) {
-    // نحوّل الصوت لـ base64
-    const audioBase64 = buffer.toString('base64');
-
-    // نبني محتوى الرسالة: صوت + سؤال (إن وُجد)
-    const userContent = [
-        {
-            type: 'input_audio',
-            input_audio: audioBase64   // base64 مباشرة بدون data URI
-        }
-    ];
-
-    // إذا أرسل المستخدم نصاً مع الصوت نضيفه
-    if (userQuestion && userQuestion.trim()) {
-        userContent.push({ type: 'text', text: userQuestion.trim() });
-    } else {
-        userContent.push({
-            type: 'text',
-            text: userName
-                ? `اسم المستخدم: ${userName}\nاستمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.`
-                : 'استمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.'
-        });
+    // الخطوة 1: استخراج النص من الصوت محلياً
+    let transcribedText = '';
+    try {
+        transcribedText = await transcribeAudioLocally(buffer, mimeType);
+        console.log(`[STT] نص مستخرج: "${transcribedText.slice(0, 80)}"`);
+    } catch (sttErr) {
+        console.error('[STT] فشل استخراج النص:', sttErr.message);
+        throw new Error(`STT_FAILED: ${sttErr.message}`);
     }
 
-    // نبني messages: system + سياق محدود + رسالة الصوت
+    if (!transcribedText || transcribedText.trim().length < 2) {
+        return '🎙️ لم أتمكن من فهم الرسالة الصوتية. يرجى التحدث بوضوح أو إرسال رسالتك كتابةً.';
+    }
+
+    // الخطوة 2: الرد على النص المستخرج بـ Mistral
+    const finalText = userQuestion
+        ? `[رسالة صوتية - النص المستخرج]: ${transcribedText}\n[نص إضافي من المستخدم]: ${userQuestion}`
+        : `[رسالة صوتية - النص المستخرج]: ${transcribedText}`;
+
+    const userContent = userName
+        ? `اسم المستخدم: ${userName}\n${finalText}`
+        : finalText;
+
     const messages = [
         { role: 'system', content: getSystemPrompt() },
-        // آخر 6 رسائل من السياق للتواصل الطبيعي
         ...(chatHistory || []).slice(-6),
         { role: 'user', content: userContent }
     ];
 
-    const release = await aiSemaphore();
-    try {
-        const response = await fetchWithTimeout(
-            'https://api.mistral.ai/v1/chat/completions',
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: 'voxtral-small-2507',   // النموذج الأقوى للصوت
-                    messages,
-                    max_tokens: 1000,
-                    temperature: 0.5
-                })
-            },
-            60_000
-        );
+    const reply = await askAI(messages);
 
-        if (response.status === 429) throw new Error('RATE_LIMIT');
-        if (response.status === 401) throw new Error('AUTH_ERROR');
-        if (response.status === 402) throw new Error('QUOTA_ERROR');
-        if (!response.ok) {
-            const errBody = await response.text();
-            throw new Error(`Voxtral HTTP ${response.status}: ${errBody.slice(0, 120)}`);
-        }
-
-        const data = await response.json();
-        const reply = data?.choices?.[0]?.message?.content;
-        if (!reply) throw new Error('استجابة فارغة من Voxtral');
-        return reply;
-
-    } finally {
-        release();
-    }
+    // إرجاع النص المستخرج + الرد معاً
+    return `📝 *فهمت منك:*\n"${transcribedText}"\n\n🤖 *الرد:*\n${reply}`;
 }
 
 // ============================================================
@@ -1127,15 +1232,13 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
             const msgLeft  = Math.max(0, limit - msgUsed);
             const imgLeft  = Math.max(0, DAILY_IMG_LIMIT - imgUsed);
             const ttsLeft  = Math.max(0, DAILY_TTS_LIMIT - ttsUsed);
-            const resetDate = new Date(rec.resetAt);
-            const resetStr  = resetDate.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
             await reply(
-                `📊 *رصيدك اليومي — النسخة المجانية:*\n\n` +
+                `📊 *رصيدك التجريبي — النسخة المجانية:*\n\n` +
                 `💬 الرسائل النصية:    ${msgUsed}/${limit} — متبقي: *${msgLeft}*\n` +
                 `🖼️ الصور المحللة:     ${imgUsed}/${DAILY_IMG_LIMIT} — متبقي: *${imgLeft}*\n` +
                 `🔊 الرسائل الصوتية:  ${ttsUsed}/${DAILY_TTS_LIMIT} — متبقي: *${ttsLeft}*\n` +
                 `📄 PDF:              حد الحجم 1MB فقط\n\n` +
-                `🔄 يتجدد تلقائياً عند: *${resetStr}*\n\n` +
+                `⚠️ *هذا الرصيد لمرة واحدة فقط — لا يتجدد تلقائياً*\n\n` +
                 `─────────────\n` +
                 `💎 *النسخة المميزة (VIP):*\n` +
                 `✅ رسائل + صور + صوت: ♾️ غير محدود\n` +
@@ -2826,12 +2929,12 @@ async function startBot() {
                     text:
                         `🎉 *مرحباً بك في MedTerm!*\n\n` +
                         `أنت الآن في *الفترة التجريبية المجانية* 🆓\n\n` +
-                        `📊 *رصيدك التجريبي:*\n` +
+                        `📊 *رصيدك التجريبي (لمرة واحدة فقط — لا يتجدد):*\n` +
                         `💬 الرسائل النصية: ${msgLimit - rec.messages} / ${msgLimit}\n` +
                         `🖼️ الصور: ${imgLimit - rec.images} / ${imgLimit}\n` +
                         `🔊 الرسائل الصوتية: ${ttsLimit - rec.tts} / ${ttsLimit}\n\n` +
-                        `⚠️ *ملاحظة:* هذا الرصيد للتجربة فقط ولا يتجدد تلقائياً.\n` +
-                        `للاستمرار بعد انتهاء الرصيد، تواصل معنا للاشتراك الشهري 👇\n` +
+                        `⚠️ *ملاحظة هامة:* عند انتهاء هذا الرصيد لن يتجدد تلقائياً.\n` +
+                        `للاستمرار بعد انتهاء الرصيد، اشترك بالخطة الشهرية:\n` +
                         `📲 wa.me/972593850520`
                 });
             }
@@ -2859,7 +2962,8 @@ async function startBot() {
                 const isVIPimg = isAdmin || isActiveVIP(sender);
                 if (!isVIPimg && !checkDailyLimit(sender, 'image')) {
                     await reply(
-                        `⚠️ *وصلت للحد اليومي للصور* (${DAILY_IMG_LIMIT} صور/يوم)\n\n` +
+                        `⚠️ *وصلت للحد النهائي للصور* (${DAILY_IMG_LIMIT} صور)\n\n` +
+                        `هذا الحد لمرة واحدة فقط ولا يتجدد.\n` +
                         `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
                     );
                     return;
@@ -3143,11 +3247,12 @@ async function startBot() {
 
                     // فحص الحد اليومي للصوت (حد TTS منفصل)
                     const isVIPaudio = isAdmin || isActiveVIP(sender);
+                    let ttsQuota = { allowed: true, commit: () => {} };
                     if (!isAdmin && !isVIPaudio) {
-                        const ttsQuota = checkDailyTTS(sender);
+                        ttsQuota = checkDailyTTS(sender);
                         if (!ttsQuota.allowed) {
                             await react('⛔');
-                            await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`);
+                            await reply(`⚠️ *وصلت للحد النهائي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nهذا الحد لمرة واحدة فقط ولا يتجدد.\nللاستمرار بدون حدود اشترك بـ VIP:\n👤 wa.me/972593850520`);
                             return;
                         }
                     }
@@ -3179,14 +3284,16 @@ async function startBot() {
                     await react('✅');
 
                 } catch (audioErr) {
-                    console.error('[audio/voxtral]', audioErr.message);
-                    if (audioErr.message === 'AUTH_ERROR') {
-                        notifyAdmin('⚠️ خطأ 401 في Voxtral — تحقق من MISTRAL_API_KEY');
+                    console.error('[audio/stt]', audioErr.message);
+                    if (audioErr.message?.startsWith('STT_FAILED')) {
                         await react('❌');
-                        await reply('عذراً، مشكلة في إعدادات الخدمة. تم إشعار الأدمن.');
-                    } else if (audioErr.message === 'QUOTA_ERROR') {
-                        await react('❌');
-                        await reply('عذراً، نفاد رصيد Mistral API مؤقتاً. تم إشعار الأدمن.');
+                        await reply(
+                            '⚠️ لم أتمكن من استخراج النص من الرسالة الصوتية.\n\n' +
+                            '📌 *للإصلاح، تأكد من تثبيت أحد هذين:*\n' +
+                            '• `pip install vosk` + تنزيل موديل عربي\n' +
+                            '• أو `pip install openai-whisper` (يعمل بدون إنترنت)\n\n' +
+                            'يمكنك إرسال رسالتك كتابةً في الوقت الحالي. ✍️'
+                        );
                     } else {
                         await react('❌');
                         await reply('عذراً، حدث خطأ في معالجة الرسالة الصوتية. حاول مجدداً أو اكتب رسالتك نصياً. ✍️');
@@ -3398,7 +3505,8 @@ async function startBot() {
                     const ttsCheck = checkDailyTTS(sender);
                     if (!ttsCheck.allowed) {
                         await reply(
-                            `⚠️ *وصلت للحد اليومي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
+                            `⚠️ *وصلت للحد النهائي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
+                            `هذا الحد لمرة واحدة فقط ولا يتجدد.\n` +
                             `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
                         );
                         return;
@@ -3451,7 +3559,7 @@ async function startBot() {
                     if (!isAdmin && !isVIPnow) {
                         const ttsCheck = checkDailyTTS(sender);
                         if (!ttsCheck.allowed) {
-                            await reply(`⚠️ وصلت للحد اليومي للصوت (${DAILY_TTS_LIMIT} مرات). الترجمة فوق بدون صوت.`);
+                            await reply(`⚠️ وصلت للحد النهائي للصوت (${DAILY_TTS_LIMIT} مرات). هذا الحد لا يتجدد. الترجمة فوق بدون صوت.`);
                             await react('✅');
                             return;
                         }
@@ -3660,6 +3768,15 @@ setInterval(checkVIPExpiry, 60 * 60_000);
         return null;
     }
 
+    // فحص espeak-ng (بدل Google TTS — محلي)
+    const espeakPath = findTool('espeak-ng');
+    if (!espeakPath) {
+        console.error('❌ espeak-ng غير مثبت أو غير موجود في PATH.');
+        console.error('   ثبّته بـ:  pkg install espeak-ng');
+        process.exit(1);
+    }
+    console.log(`✅ espeak-ng: ${espeakPath}`);
+
     // فحص mutool
     const mutoolPath = findTool('mutool');
     if (!mutoolPath) {
@@ -3669,6 +3786,25 @@ setInterval(checkVIPExpiry, 60 * 60_000);
         process.exit(1);
     }
     console.log(`✅ mutool: ${mutoolPath}`);
+
+    // فحص STT (vosk أو whisper) — تحذير فقط، لا إيقاف
+    const { spawnSync: spawnS } = require('child_process');
+    let sttAvailable = false;
+    try {
+        const r = spawnS('python3', ['-c', 'import vosk; print("ok")'], { encoding: 'utf8', timeout: 5000 });
+        if (!r.error && r.stdout.includes('ok')) { sttAvailable = true; console.log('✅ vosk (STT): متاح'); }
+    } catch (_) {}
+    if (!sttAvailable) {
+        try {
+            const r = spawnS('whisper', ['--help'], { encoding: 'utf8', timeout: 5000 });
+            if (!r.error) { sttAvailable = true; console.log('✅ whisper (STT): متاح'); }
+        } catch (_) {}
+    }
+    if (!sttAvailable) {
+        console.warn('⚠️  STT (تحويل صوت→نص) غير مثبت. الرسائل الصوتية ستعطي خطأ.');
+        console.warn('   للتثبيت: pip install vosk   ثم نزّل موديل من alphacephei.com/vosk/models');
+        console.warn('   أو:       pip install openai-whisper');
+    }
 
     // فحص ffmpeg
     const ffmpegPath = findTool('ffmpeg');
