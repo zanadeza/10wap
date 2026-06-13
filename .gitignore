@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+bot_data.json
+pdf_cache/
