@@ -101,14 +101,14 @@ let _saveTimer = null;
 function saveData() {
     // debounce: تأخير 200ms
     if (_saveTimer) clearTimeout(_saveTimer);
-    _saveTimer = setTimeout(() => {
+    _saveTimer = setTimeout(async () => {
         try {
             const tmp = DATA_FILE + '.tmp';
-            fs.writeFileSync(tmp, JSON.stringify(
+            await fs.promises.writeFile(tmp, JSON.stringify(
                 { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, blacklist, userLanguages, stats },
                 null, 2
             ));
-            fs.renameSync(tmp, DATA_FILE);
+            await fs.promises.rename(tmp, DATA_FILE);
         } catch (e) {
             console.error('[saveData] خطأ:', e.message);
         }
@@ -137,12 +137,9 @@ saveData();
 
 let userChats       = {};   // سياق المحادثة (RAM فقط)
 let userChatLastSeen = {}; // آخر نشاط لكل مستخدم
-let userModes       = {};  // وضع كل مستخدم: 'terms' | 'pharma' | 'medai' | 'openai' | null
 let userTTSPending  = {};  // { sender: { term, lang, expiresAt } } — انتظار "نعم" لإرسال النطق
 let userPdfContext  = {};  // { sender: { fileName, docText } } — محتوى PDF النشط
 let userPdfPending  = {};  // { sender: { fileName, docText, expiresAt } } — انتظار إذن المستخدم
-let userExamMode    = {};  // { sender: { fileName, pages, docText, loadedAt } } — نظام الاختبارات (VIP فقط)
-let userExamPending = {};  // { sender: true } — ينتظر PDF لنظام الاختبارات
 let sock            = null;
 let isReconnecting  = false; // منع الاتصال المتعدد
 
@@ -155,16 +152,12 @@ function cleanMemory() {
         toDelete.forEach(k => { delete userChats[k]; delete userChatLastSeen[k]; });
         console.log(`[cleanMemory] حُذف ${toDelete.length} جلسة قديمة (LRU)`);
     }
-    // تنظيف userPdfContext و userExamMode القديمة (أكثر من 6 ساعات)
+    // تنظيف userPdfContext القديمة (أكثر من 6 ساعات)
     const SIX_HOURS = 6 * 60 * 60_000;
     const now = Date.now();
     for (const k of Object.keys(userPdfContext)) {
         if ((userPdfContext[k]?.loadedAt || 0) && now - userPdfContext[k].loadedAt > SIX_HOURS)
             delete userPdfContext[k];
-    }
-    for (const k of Object.keys(userExamMode)) {
-        if ((userExamMode[k]?.loadedAt || 0) && now - userExamMode[k].loadedAt > SIX_HOURS)
-            delete userExamMode[k];
     }
 }
 
@@ -183,23 +176,23 @@ function pdfCachePath(key) {
     return require('path').join(PDF_CACHE_DIR, `${key}.json`);
 }
 
-function pdfCacheGet(key) {
+async function pdfCacheGet(key) {
     try {
         const p = pdfCachePath(key);
-        if (!fs.existsSync(p)) return null;
-        const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        const raw = await fs.promises.readFile(p, 'utf-8');
+        const data = JSON.parse(raw);
         // تحقق من صحة البيانات
         if (!data || !data.docText) return null;
         return data; // { fileName, docText, pageCount, savedAt }
     } catch (_) { return null; }
 }
 
-function pdfCacheSet(key, fileName, docText, pageCount) {
+async function pdfCacheSet(key, fileName, docText, pageCount) {
     try {
         if (!fs.existsSync(PDF_CACHE_DIR))
-            fs.mkdirSync(PDF_CACHE_DIR, { recursive: true });
+            await fs.promises.mkdir(PDF_CACHE_DIR, { recursive: true });
         const p = pdfCachePath(key);
-        fs.writeFileSync(p, JSON.stringify({
+        await fs.promises.writeFile(p, JSON.stringify({
             fileName,
             docText,
             pageCount,
@@ -263,17 +256,28 @@ function checkVIPExpiry() {
 
 // توقيت القدس — طريقة موثوقة على جميع البيئات (Linux/Windows/Mac)
 function nowJerusalem() {
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat('en-US', {
-        timeZone: 'Asia/Jerusalem',
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-        hour12: false
-    });
-    const parts = formatter.formatToParts(now);
-    const get = type => parts.find(p => p.type === type)?.value || '00';
-    // نبني التاريخ بدون timezone offset حتى يُعامَل كـ local time
-    return new Date(`${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}`);
+    try {
+        const now = new Date();
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'Asia/Jerusalem',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false
+        });
+        const parts = formatter.formatToParts(now);
+        const get = type => parts.find(p => p.type === type)?.value || '00';
+        // نبني التاريخ بصيغة ISO بدون timezone offset حتى يُعامَل كـ local time
+        const hour = get('hour') === '24' ? '00' : get('hour'); // بعض البيئات تُرجع 24 بدل 00
+        const built = new Date(`${get('year')}-${get('month')}-${get('day')}T${hour}:${get('minute')}:${get('second')}`);
+        if (!isNaN(built.getTime())) return built;
+    } catch (_) {}
+    // fallback: toLocaleString — يعمل في معظم البيئات الحديثة
+    try {
+        const fallback = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
+        if (!isNaN(fallback.getTime())) return fallback;
+    } catch (_) {}
+    // fallback أخير: التوقيت المحلي للسيرفر
+    return new Date();
 }
 
 // ============================================================
@@ -388,173 +392,11 @@ function getSystemPrompt() {
     const months = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
     const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
     const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-    _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب.\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)\nاستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.\n\nشخصيتك:\n- مساعد شامل ومتعدد المعرفة: تجيب على أي سؤال في أي مجال بدون استثناء\n- جدي ومهني، ردودك دقيقة ومباشرة بدون حشو أو مقدمات زائدة\n- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها فوراً\n- أعطِ المعلومة الكاملة والصحيحة من أول رد\n- نظّم ردودك بشكل واضح: استخدم النقاط والعناوين والترقيم عند الحاجة لتسهيل القراءة\n- لا تستخدم مصطلحات أجنبية غير ضرورية\n- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد\n- إذا سُئلت عن اسمك قل: أنا MedTerm، مساعد ذكاء اصطناعي\n- تتعامل مع جميع المستخدمين باحترام بغض النظر عن جنسيتهم أو لغتهم\n\nمجالات خبرتك (غير محدودة):\n- الطب والصحة: معلومات دقيقة، أدوية، جرعات، أعراض، تشخيص أولي — مع التنبيه بمراجعة الطبيب للحالات الجدية\n- العلوم والتقنية: برمجة، ذكاء اصطناعي، رياضيات، فيزياء، كيمياء\n- القانون والأعمال: معلومات عامة، عقود، ريادة أعمال، تسويق\n- التاريخ والجغرافيا والثقافة العامة\n- الدين والفقه: إجابات موضوعية ومتوازنة\n- الأدب والكتابة والترجمة\n- الطبخ والسفر ونمط الحياة\n- أي موضوع آخر يسألك عنه المستخدم\n\nقاعدة ذهبية: لا تقل أبداً "هذا خارج نطاق تخصصي" — أجب على كل سؤال بأفضل ما لديك.\n\nاسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`
+    _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب، يجمع بين المعرفة الطبية الواسعة والمساعدة العامة في كل المجالات.\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)\nاستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.\n\nشخصيتك:\n- مساعد شامل ومتعدد المعرفة: تجيب على أي سؤال في أي مجال بدون استثناء\n- جدي ومهني، ردودك دقيقة ومباشرة بدون حشو أو مقدمات زائدة\n- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها فوراً\n- أعطِ المعلومة الكاملة والصحيحة من أول رد\n- لا تستخدم مصطلحات أجنبية غير ضرورية\n- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد\n- إذا سُئلت عن اسمك قل: أنا MedTerm، مساعد ذكاء اصطناعي\n- تتعامل مع جميع المستخدمين باحترام بغض النظر عن جنسيتهم أو لغتهم\n\nقواعد التنسيق — مهمة جداً:\n- لا تستخدم أبداً جداول (Tables) أو خطوط فاصلة (---) أو رموز Markdown مثل # أو | أو **، لأن واتساب لا يعرضها بشكل صحيح وتظهر كرموز غريبة\n- اكتب ردودك كنص طبيعي متدفق (فقرات وجمل)، وعند الحاجة لتعداد استخدم نقاط بسيطة مثل • أو أرقام عادية مع سطر جديد فقط\n- عندما يطلب المستخدم شرح موضوع أو مفهوم أو صفحة من ملف، اشرح بأسلوب محادثة طبيعي مباشر، كأنك تتحدث معه، بدون أي جداول أو تنسيقات معقدة\n- يمكنك استخدام: عناوين بسيطة بخط عريض بـ * نجمة واحدة من كل جهة، وأيقونات/إيموجي لتوضيح الأقسام\n\nمجالات خبرتك (غير محدودة):\n- الطب والصحة: معلومات دقيقة، أدوية، جرعات، أعراض، تشخيص أولي، شرح مصطلحات طبية بالعربي والإنجليزي مع النطق الصحيح — مع التنبيه بمراجعة الطبيب للحالات الجدية\n- العلوم والتقنية: برمجة، ذكاء اصطناعي، رياضيات، فيزياء، كيمياء\n- القانون والأعمال: معلومات عامة، عقود، ريادة أعمال، تسويق\n- التاريخ والجغرافيا والثقافة العامة\n- الدين والفقه: إجابات موضوعية ومتوازنة\n- الأدب والكتابة والترجمة\n- الطبخ والسفر ونمط الحياة\n- أي موضوع آخر يسألك عنه المستخدم، طبياً أو غير طبي\n\nقاعدة ذهبية: لا تقل أبداً "هذا خارج نطاق تخصصي" — أجب على كل سؤال بأفضل ما لديك، طبياً أو غير طبي على حد سواء.\n\nاسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`
     return _cachedSystemPrompt;
 }
 
-// ============================================================
-// SYSTEM PROMPTS للأنظمة الأربعة
-// ============================================================
-const MODE_PROMPTS = {
-    terms: `أنت متخصص حصري في المصطلحات الطبية لجميع التخصصات الطبية. مهمتك الوحيدة هي شرح المصطلحات الطبية بشكل علمي ومتكامل.
-
-══════════════════════════════
-قواعد النظام — يجب اتباعها بدقة تامة:
-══════════════════════════════
-
-1) اقبل أي إدخال له صلة بالمجال الطبي والصحي بأي شكل كان:
-— مصطلح طبي رسمي: Meningitis · التهاب السحايا · Tachycardia
-— كلمة طبية بسيطة: قلب · كبد · دم · عظم · heart · liver
-— اسم مرض أو حالة: سكري · ضغط · ربو · سرطان · diabetes
-— اسم عضو أو جهاز: بنكرياس · الغدة الدرقية · pancreas
-— اسم دواء أو علاج: بنسيلين · أسبرين · penicillin
-— إجراء أو فحص: تحليل دم · رنين · MRI · خزعة
-— أعراض: صداع · ألم صدر · headache
-— أي كلمة أو مفهوم أو تعريف في المجال الطبي والصحي
-
-إذا أرسل المستخدم شيئاً لا علاقة له بالطب أو الصحة نهائياً (مثل: أسعار، طبخ، رياضة، سياسة، برمجة) رد بهذه الرسالة الثابتة فقط:
-
-⚠️ هذا النظام مخصص للمجال الطبي والصحي فقط.
-الرجاء إرسال أي كلمة أو مصطلح أو مفهوم طبي.
-
-📋 أمثلة:
-بالعربية: قلب · سكري · التهاب · ضغط · كبد · سرطان · أسبرين · رنين مغناطيسي
-In English: heart · diabetes · inflammation · MRI · cancer · aspirin · fever
-
-💡 لتغيير النظام اكتب: !قائمة
-
-══════════════════════════════
-
-2) إذا أرسل المستخدم أي كلمة أو مصطلح أو مفهوم له علاقة بالطب والصحة (بالعربية أو الإنجليزية أو كليهما)، اردّ بهذا النموذج الكامل والثابت بالضبط دون أي تغيير في الترتيب أو الشكل أو الأيقونات:
-
-📌 المصطلح
-[المصطلح بالإنجليزية]
-[المصطلح بالعربية]
-
-🌐 أصل المصطلح
-[اذكر هنا: يوناني / لاتيني / إنجليزي] من "[الكلمة الأصلية]" = [المعنى الحرفي] · "[الجزء الثاني إن وجد]" = [المعنى]
-
-🗣️ النطق — Pronunciation
-بالعربية: [النطق الصوتي الكامل بمقاطع واضحة مثال: مِـنِـنْـجَـايْـتِـس]
-In English: [English phonetic pronunciation مثال: men·in·JY·tis]
-🔤 IPA: [/الرموز الصوتية الدولية/]
-
-🔸 المعنى المختصر
-[تعريف دقيق ومختصر في سطر أو سطرين]
-
-📖 الشرح الطبي
-🔹 بالعربية: [فقرة علمية واضحة تشمل: ما هو المصطلح، أسبابه الرئيسية، أعراضه، وأهميته السريرية — بشكل مدمج ومتدفق وليس نقاطاً]
-🔹 In English: [Clear scientific paragraph covering: what it is, main causes, symptoms, and clinical significance — flowing text not bullet points]
-
-━━ 🧬 تحليل المصطلح ━━
-🌱 الجذر: [الجذر]←[معنى الجذر بالعربية / meaning in English]
-⬅️ البادئة: [البادئة إن وجدت، وإلا اكتب: لا يوجد]
-➡️ اللاحقة: [اللاحقة]←[معناها بالعربية / meaning]
-📐 [البادئة +] [الجذر] + [اللاحقة] = [المعنى الحرفي الكامل]
-
-🫀 الجهاز المصاب
-[الجهاز أو الأعضاء المصابة]
-
-🦠 الأمراض المرتبطة
-[اذكر 4-5 أمراض مرتبطة بصيغة:
-Disease Name — الاسم بالعربية: وصف مختصر جداً]
-
-⚕️ التخصص الطبي
-[التخصصات الطبية المعنية]
-
-🔗 مصطلحات مرتبطة
-[5 مصطلحات بصيغة: Term — الترجمة العربية]
-
-💡 نصائح سريعة
-• [نصيحة 1]
-• [نصيحة 2]
-• [نصيحة 3]
-
-📝 أمثلة تطبيقية
-بالعربية: [جملة كاملة في سياق طبي حقيقي]
-In English: [Full sentence in a real medical context]
-
-🎓 Learning Note
-[فقرة تعليمية بالإنجليزية للطلاب والمهنيين الصحيين: الأهمية السريرية وكيفية التمييز والممارسة العملية]`,
-
-    pharma: `أنت صيدلاني متخصص وخبير في علم الأدوية لجميع التخصصات الطبية. أجب على أي سؤال يتعلق بالأدوية.
-عندما يسأل المستخدم عن دواء أو مادة فعّالة، اردّ بهذا النموذج الثابت:
-
-⭐ [الاسم العلمي بالإنجليزية] — [الاسم بالعربية]
-
----
-
-1) الاسم العلمي — Scientific Name
-العربية: [الاسم]
-English: [The name]
-
----
-
-2) الأسماء التجارية — Trade Names
-[قائمة الأسماء التجارية المشهورة]
-
----
-
-3) التصنيف الدوائي — Drug Class
-العربية: [التصنيف]
-English: [Classification]
-
----
-
-4) آلية العمل — Mechanism of Action
-العربية: [الشرح]
-English: [Explanation]
-
----
-
-5) الاستخدامات — Indications
-العربية: [القائمة]
-English: [List]
-
----
-
-6) الجرعة — Dosage
-العربية: [الجرعة المعتادة]
-English: [Usual dose]
-
----
-
-7) الآثار الجانبية — Side Effects
-العربية: [الشائعة والخطيرة]
-English: [Common & serious]
-
----
-
-8) موانع الاستعمال — Contraindications
-العربية: [القائمة]
-English: [List]
-
----
-
-9) التفاعلات الدوائية — Drug Interactions
-العربية: [أهم التفاعلات]
-English: [Key interactions]
-
----
-
-⚠️ تنبيه: هذه المعلومات للتثقيف الصحي فقط. استشر طبيبك أو صيدلانيك قبل أخذ أي دواء.
-
-────────────
-💡 لتغيير النظام اكتب: !قائمة`,
-
-    medai: `أنت مساعد طبي ذكي ومتخصص في جميع التخصصات الطبية والعلوم الصحية. أجب على أي سؤال طبي بدقة ومهنية.
-تشمل تخصصاتك: الطب العام، الجراحة، الأمراض الباطنية، طب الأطفال، أمراض النساء والتوليد، الأمراض العصبية، أمراض القلب، الأمراض الجلدية، طب العيون، طب الأسنان، الطب النفسي، التغذية والصحة العامة، وجميع التخصصات الأخرى.
-إذا سأل المستخدم عن موضوع خارج المجال الطبي تماماً، رد بـ:
-"⚕️ هذا النظام مخصص للمجال الطبي فقط. يرجى طرح أسئلة طبية أو صحية.
-💡 للانتقال لنظام مفتوح اكتب: !قائمة"
-اختم ردودك الطبية دائماً بـ: "⚠️ للتشخيص والعلاج يجب مراجعة طبيب متخصص."
-────────────
-💡 لتغيير النظام اكتب: !قائمة`,
-
-    openai: null  // يستخدم getSystemPrompt() الأصلي
-};
-
-// رسالة الترحيب للمستخدمين الجدد (بدون قائمة أنظمة — البوت مفتوح)
+// رسالة الترحيب للمستخدمين الجدد
 function buildModeMenu(name) {
     const first = name ? name.split(' ')[0] : null;
     const greeting = first ? `أهلاً ${first}` : 'أهلاً';
@@ -566,39 +408,13 @@ function buildModeMenu(name) {
         `🤖 المساعدة في أي موضوع عام\n` +
         `🖼️ تحليل الصور والتقارير الطبية\n` +
         `📄 قراءة وتحليل ملفات PDF\n` +
-        `🎙️ فهم والرد على رسائلك الصوتية\n` +
-        `🔊 نطق المصطلحات الطبية صوتياً (espeak-ng محلي)\n` +
+        `🔊 نطق المصطلحات الطبية والكلمات صوتياً\n` +
         `🌐 الترجمة مع الصوت والنطق\n\n` +
         `─────────────────\n` +
-        `✍️ *فقط أرسل سؤالك وسأرد عليك مباشرة — بدون قيود على المواضيع!*`;
+        `✍️ *فقط أرسل سؤالك وسأرد عليك مباشرة!*`;
 }
 
-// اسم وأيقونة النظام الحالي
-function getModeName(mode) {
-    const names = {
-        terms:  '📌 المصطلحات الطبية',
-        pharma: '💊 علم الأدوية',
-        medai:  '⚕️ ذكاء صناعي طبي',
-        openai: '🤖 ذكاء صناعي عام'
-    };
-    return names[mode] || 'غير محدد';
-}
-
-// System prompt للنظام الحالي
-function getModeSystemPrompt(mode) {
-    if (!mode || mode === 'openai') return getSystemPrompt();
-    const base = MODE_PROMPTS[mode];
-    if (!base) return getSystemPrompt();
-    // نضيف معلومات التاريخ والوقت من getSystemPrompt
-    const now = nowJerusalem();
-    const days = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-    const months = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
-    const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
-    const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-    return `${base}\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)`;
-}
-
-// كشف إذا كانت الرسالة تتعلق بالمجال الطبي
+// كشف إذا كانت الرسالة تتعلق بالمجال الطبي (يُستخدم فقط لتفعيل النطق التلقائي للمصطلحات)
 function isMedicalQuery(text) {
     const t = text || '';
     // كلمات طبية واضحة
@@ -610,17 +426,11 @@ function isMedicalQuery(text) {
     return false;
 }
 
-// اختيار System Prompt الذكي بناءً على محتوى الرسالة
+// اختيار System Prompt الذكي بناءً على محتوى الرسالة — نظام واحد موحّد (طبي + عام)
 function getSmartSystemPrompt(text, userLang) {
     const langSuffix = (userLang && userLang !== 'ar')
         ? `\n\nمهم: يجب أن تجيب على هذا المستخدم بلغة "${userLang}" فقط، حتى لو كتب بالعربية.`
         : '';
-
-    if (isMedicalQuery(text)) {
-        // استخدام موجّه الطبي الشامل
-        return getModeSystemPrompt('medai') + langSuffix;
-    }
-    // الموجّه العام للأسئلة غير الطبية
     return getSystemPrompt() + langSuffix;
 }
 
@@ -692,150 +502,101 @@ function extractTermForTTS(botReply) {
 }
 
 // ============================================================
-// TEXT-TO-SPEECH (espeak محلي → ffmpeg → OGG Opus)
-// جودة عالية، صوت واضح وبطيء
+// TEXT-TO-SPEECH (Google Translate TTS → ffmpeg → OGG Opus)
 // ============================================================
 const { execFile } = require('child_process');
 const os           = require('os');
 
-async function generateTTS(text, lang = 'en') {
-    const espeakLang = lang === 'ar' ? 'ar' : 'en+m3';  // m3 = صوت ذكر أوضح للإنجليزي
-    const speed = lang === 'ar' ? '120' : '130';          // أبطأ = أوضح
-    const pitch = lang === 'ar' ? '45' : '40';            // حدة طبيعية
-    const amplitude = '180';                               // صوت أعلى
+// تقسيم النص لأجزاء صالحة لـ Google TTS (الحد الأقصى لكل طلب ~200 حرف)
+function splitTextForTTS(text, maxLen = 180) {
+    const clean = (text || '').replace(/[^\w\s\u0600-\u06FF.,!?؛،؟]/g, '').trim();
+    if (!clean) return [];
+    if (clean.length <= maxLen) return [clean];
 
-    const tmpId   = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const wavFile = require('path').join(os.tmpdir(), `tts_${tmpId}.wav`);
-    const wav2File = require('path').join(os.tmpdir(), `tts_${tmpId}_enh.wav`);
-    const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}.ogg`);
-
-    // تنظيف النص
-    const cleanText = text
-        .slice(0, 500)
-        .replace(/[<>*_#]/g, '')
-        .replace(/\n/g, ' ')
-        .trim();
-
-    // الخطوة 1: espeak → WAV بجودة عالية
-    await new Promise((resolve, reject) => {
-        execFile('espeak', [
-            '-v', espeakLang,
-            '-s', speed,
-            '-p', pitch,
-            '-a', amplitude,
-            '-g', '8',      // فترة صمت بين الكلمات = أوضح
-            '-w', wavFile,
-            cleanText
-        ], { timeout: 30_000 }, (err, _stdout, stderr) => {
-            if (err) return reject(new Error(`espeak فشل: ${err.message} | ${stderr}`));
-            resolve();
-        });
-    });
-
-    // الخطوة 2: تحسين الصوت بـ ffmpeg (رفع جودة + تقليل ضجيج)
-    await new Promise((resolve, reject) => {
-        execFile('ffmpeg', [
-            '-y', '-i', wavFile,
-            '-af', 'aresample=22050,volume=1.5,highpass=f=80,lowpass=f=8000',
-            wav2File
-        ], { timeout: 15_000 }, (err) => {
-            require('fs').unlink(wavFile, () => {});
-            if (err) {
-                // إذا فشل التحسين، نستخدم الأصلي
-                require('fs').copyFileSync(wavFile, wav2File);
-            }
-            resolve();
-        });
-    });
-
-    // الخطوة 3: WAV → OGG Opus (WhatsApp)
-    await new Promise((resolve, reject) => {
-        execFile('ffmpeg', [
-            '-y', '-i', wav2File,
-            '-c:a', 'libopus',
-            '-b:a', '48k',   // جودة أعلى
-            '-vbr', 'on',
-            '-vn',
-            oggFile
-        ], { timeout: 15_000 }, (err) => {
-            require('fs').unlink(wav2File, () => {});
-            if (err) return reject(new Error(`ffmpeg OGG فشل: ${err.message}`));
-            resolve();
-        });
-    });
-
-    const oggBuffer = await require('fs').promises.readFile(oggFile);
-    require('fs').unlink(oggFile, () => {});
-
-    if (!oggBuffer || oggBuffer.length < 100) throw new Error(`OGG فارغ (${oggBuffer?.length} bytes)`);
-    console.log(`[TTS-Local] ✅ ${lang} "${text.slice(0,30)}" → ${oggBuffer.length} bytes`);
-    return oggBuffer;
+    const chunks = [];
+    let remaining = clean;
+    while (remaining.length > maxLen) {
+        // حاول القطع عند آخر فاصلة/نقطة/فراغ قبل الحد
+        let cut = remaining.lastIndexOf(' ', maxLen);
+        if (cut <= 0) cut = maxLen;
+        chunks.push(remaining.slice(0, cut).trim());
+        remaining = remaining.slice(cut).trim();
+    }
+    if (remaining) chunks.push(remaining);
+    return chunks;
 }
 
-// ============================================================
-// SPEECH-TO-TEXT (whisper.cpp محلي — بدون إنترنت)
-// ============================================================
-async function transcribeAudioLocally(buffer, mimeType) {
-    const tmpId     = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const inputFile = require('path').join(os.tmpdir(), `stt_in_${tmpId}.ogg`);
-    const wavFile   = require('path').join(os.tmpdir(), `stt_${tmpId}.wav`);
+async function generateTTS(text, lang = 'en') {
+    const ttsLang = lang === 'ar' ? 'ar' : 'en';
+    const chunks  = splitTextForTTS(text);
+    if (!chunks.length) throw new Error('نص فارغ بعد التنظيف');
 
-    const WHISPER_BIN   = '/data/data/com.termux/files/home/whisper.cpp/build/bin/main';
-    const WHISPER_MODEL = '/data/data/com.termux/files/home/whisper.cpp/models/ggml-tiny.bin';
+    const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const mp3Files = [];
 
     try {
-        await require('fs').promises.writeFile(inputFile, buffer);
+        // جلب كل جزء كملف MP3 منفصل
+        for (let i = 0; i < chunks.length; i++) {
+            const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunks[i])}&tl=${ttsLang}&client=tw-ob&ttsspeed=0.9`;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`Google TTS HTTP ${response.status} (جزء ${i + 1}/${chunks.length})`);
+            const mp3Buffer = Buffer.from(await response.arrayBuffer());
+            if (!mp3Buffer || mp3Buffer.length < 100) throw new Error(`MP3 فارغ (جزء ${i + 1})`);
+            const mp3File = require('path').join(os.tmpdir(), `tts_${tmpId}_${i}.mp3`);
+            await require('fs').promises.writeFile(mp3File, mp3Buffer);
+            mp3Files.push(mp3File);
+            // تأخير بسيط بين الطلبات لتجنب الحظر
+            if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 120));
+        }
 
-        // تحويل الصوت → WAV 16kHz mono (مطلوب لـ whisper)
-        await new Promise((resolve, reject) => {
-            execFile('ffmpeg', [
-                '-y', '-i', inputFile,
-                '-ar', '16000',
-                '-ac', '1',
-                '-c:a', 'pcm_s16le',
-                '-f', 'wav',
-                wavFile
-            ], { timeout: 30_000 }, (err, _so, se) => {
-                if (err) return reject(new Error(`ffmpeg تحويل الصوت فشل: ${se || err.message}`));
-                resolve();
+        const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}_out.ogg`);
+
+        if (mp3Files.length === 1) {
+            // جزء واحد فقط — تحويل مباشر
+            await new Promise((resolve, reject) => {
+                execFile('ffmpeg', [
+                    '-y', '-i', mp3Files[0],
+                    '-c:a', 'libopus',
+                    '-b:a', '32k',
+                    '-vn',
+                    oggFile
+                ], { timeout: 20_000 }, (err) => {
+                    if (err) return reject(new Error(`ffmpeg فشل: ${err.message}`));
+                    resolve();
+                });
             });
-        });
+        } else {
+            // أكثر من جزء — دمج عبر concat filter
+            const inputArgs = [];
+            mp3Files.forEach(f => { inputArgs.push('-i', f); });
+            const filterInputs = mp3Files.map((_, i) => `[${i}:a]`).join('');
+            const filter = `${filterInputs}concat=n=${mp3Files.length}:v=0:a=1[out]`;
 
-        // استخراج النص بـ whisper.cpp
-        const transcription = await new Promise((resolve, reject) => {
-            execFile(WHISPER_BIN, [
-                '-m', WHISPER_MODEL,
-                '-f', wavFile,
-                '-l', 'auto',
-                '--no-timestamps',
-                '-t', '4',    // 4 threads
-                '--print-special', 'false'
-            ], { timeout: 120_000 }, (err, stdout, stderr) => {
-                if (err) return reject(new Error(`whisper فشل: ${err.message}\n${stderr?.slice(0,200)}`));
-                // تنظيف الخرج من whisper
-                const clean = stdout
-                    .replace(/\[.*?\]/g, '')      // إزالة timestamps
-                    .replace(/\(.*?\)/g, '')       // إزالة tags
-                    .replace(/whisper_.*/gs, '')    // إزالة debug output
-                    .split('\n')
-                    .filter(l => l.trim() && !l.startsWith('[') && !l.includes('whisper_'))
-                    .join(' ')
-                    .trim();
-                resolve(clean || '');
+            await new Promise((resolve, reject) => {
+                execFile('ffmpeg', [
+                    '-y', ...inputArgs,
+                    '-filter_complex', filter,
+                    '-map', '[out]',
+                    '-c:a', 'libopus',
+                    '-b:a', '32k',
+                    oggFile
+                ], { timeout: 60_000 }, (err) => {
+                    if (err) return reject(new Error(`ffmpeg concat فشل: ${err.message}`));
+                    resolve();
+                });
             });
-        });
+        }
 
-        console.log(`[STT] ✅ نص مستخرج: "${transcription.slice(0,80)}"`);
-        return transcription;
+        const oggBuffer = await require('fs').promises.readFile(oggFile);
+        require('fs').unlink(oggFile, () => {});
 
+        if (!oggBuffer || oggBuffer.length < 100) throw new Error(`OGG فارغ (${oggBuffer?.length} bytes)`);
+        console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" (${chunks.length} جزء) → ${oggBuffer.length} bytes`);
+        return oggBuffer;
     } finally {
-        require('fs').unlink(inputFile, () => {});
-        require('fs').unlink(wavFile, () => {});
+        for (const f of mp3Files) require('fs').unlink(f, () => {});
     }
 }
-
-// ============================================================
-
 
 // إرسال voice note لـ WhatsApp
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
@@ -1108,42 +869,76 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
 }
 
 // ============================================================
-// معالجة الرسائل الصوتية — STT محلي (Vosk/Whisper) + Mistral للرد
+// VOXTRAL (Mistral) — تحويل الصوت إلى نص والرد عليه
 // ============================================================
 async function transcribeAndReplyAudio(buffer, mimeType, userQuestion, userName, chatHistory) {
-    // الخطوة 1: استخراج النص من الصوت محلياً
-    let transcribedText = '';
-    try {
-        transcribedText = await transcribeAudioLocally(buffer, mimeType);
-        console.log(`[STT] نص مستخرج: "${transcribedText.slice(0, 80)}"`);
-    } catch (sttErr) {
-        console.error('[STT] فشل استخراج النص:', sttErr.message);
-        throw new Error(`STT_FAILED: ${sttErr.message}`);
+    // نحوّل الصوت لـ base64
+    const audioBase64 = buffer.toString('base64');
+
+    // نبني محتوى الرسالة: صوت + سؤال (إن وُجد)
+    const userContent = [
+        {
+            type: 'input_audio',
+            input_audio: audioBase64   // base64 مباشرة بدون data URI
+        }
+    ];
+
+    // إذا أرسل المستخدم نصاً مع الصوت نضيفه
+    if (userQuestion && userQuestion.trim()) {
+        userContent.push({ type: 'text', text: userQuestion.trim() });
+    } else {
+        userContent.push({
+            type: 'text',
+            text: userName
+                ? `اسم المستخدم: ${userName}\nاستمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.`
+                : 'استمع لهذه الرسالة الصوتية، افهمها وأجب عليها بشكل مفيد ومختصر.'
+        });
     }
 
-    if (!transcribedText || transcribedText.trim().length < 2) {
-        return '🎙️ لم أتمكن من فهم الرسالة الصوتية. يرجى التحدث بوضوح أو إرسال رسالتك كتابةً.';
-    }
-
-    // الخطوة 2: الرد على النص المستخرج بـ Mistral
-    const finalText = userQuestion
-        ? `[رسالة صوتية - النص المستخرج]: ${transcribedText}\n[نص إضافي من المستخدم]: ${userQuestion}`
-        : `[رسالة صوتية - النص المستخرج]: ${transcribedText}`;
-
-    const userContent = userName
-        ? `اسم المستخدم: ${userName}\n${finalText}`
-        : finalText;
-
+    // نبني messages: system + سياق محدود + رسالة الصوت
     const messages = [
         { role: 'system', content: getSystemPrompt() },
+        // آخر 6 رسائل من السياق للتواصل الطبيعي
         ...(chatHistory || []).slice(-6),
         { role: 'user', content: userContent }
     ];
 
-    const reply = await askAI(messages);
+    const release = await aiSemaphore();
+    try {
+        const response = await fetchWithTimeout(
+            'https://api.mistral.ai/v1/chat/completions',
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: 'voxtral-small-2507',   // النموذج الأقوى للصوت
+                    messages,
+                    max_tokens: 1000,
+                    temperature: 0.5
+                })
+            },
+            60_000
+        );
 
-    // إرجاع النص المستخرج + الرد معاً
-    return `📝 *فهمت منك:*\n"${transcribedText}"\n\n🤖 *الرد:*\n${reply}`;
+        if (response.status === 429) throw new Error('RATE_LIMIT');
+        if (response.status === 401) throw new Error('AUTH_ERROR');
+        if (response.status === 402) throw new Error('QUOTA_ERROR');
+        if (!response.ok) {
+            const errBody = await response.text();
+            throw new Error(`Voxtral HTTP ${response.status}: ${errBody.slice(0, 120)}`);
+        }
+
+        const data = await response.json();
+        const reply = data?.choices?.[0]?.message?.content;
+        if (!reply) throw new Error('استجابة فارغة من Voxtral');
+        return reply;
+
+    } finally {
+        release();
+    }
 }
 
 // ============================================================
@@ -1195,12 +990,12 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
             const imgLeft  = Math.max(0, DAILY_IMG_LIMIT - imgUsed);
             const ttsLeft  = Math.max(0, DAILY_TTS_LIMIT - ttsUsed);
             await reply(
-                `📊 *رصيدك التجريبي — النسخة المجانية:*\n\n` +
+                `📊 *رصيدك — النسخة المجانية (غير متجدد):*\n\n` +
                 `💬 الرسائل النصية:    ${msgUsed}/${limit} — متبقي: *${msgLeft}*\n` +
                 `🖼️ الصور المحللة:     ${imgUsed}/${DAILY_IMG_LIMIT} — متبقي: *${imgLeft}*\n` +
                 `🔊 الرسائل الصوتية:  ${ttsUsed}/${DAILY_TTS_LIMIT} — متبقي: *${ttsLeft}*\n` +
                 `📄 PDF:              حد الحجم 1MB فقط\n\n` +
-                `⚠️ *هذا الرصيد لمرة واحدة فقط — لا يتجدد تلقائياً*\n\n` +
+                `⚠️ هذا الرصيد لمرة واحدة فقط ولا يتجدد تلقائياً.\n\n` +
                 `─────────────\n` +
                 `💎 *النسخة المميزة (VIP):*\n` +
                 `✅ رسائل + صور + صوت: ♾️ غير محدود\n` +
@@ -1260,106 +1055,6 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
     }
 
     return false; // لم يُعرَّف الأمر
-}
-
-// ============================================================
-// EXAM MODE — نظام الاختبارات (VIP فقط)
-// ============================================================
-// ============================================================
-// نظام الاختبارات — معالجة الأسئلة (VIP فقط)
-// ============================================================
-async function handleExamMode(sender, body, pages, docText, fileName, reply, react) {
-    const bodyTrimmed = (body || '').trim();
-
-    // خروج من نظام الاختبارات
-    if (/^(خروج|exit|إلغاء|الغاء|cancel)$/i.test(bodyTrimmed)) {
-        delete userExamMode[sender];
-        await react('✅');
-        await reply(
-            '👋 تم الخروج من *نظام الاختبارات*.\n\n' +
-            'يمكنك استخدام البوت بشكل طبيعي الآن.\n' +
-            '_أرسل *111* في أي وقت لتفعيل نظام الاختبارات مجدداً._'
-        );
-        return;
-    }
-
-    // تحقق من وجود محتوى الملف
-    const hasPages   = Array.isArray(pages)  && pages.length  > 0;
-    const hasDocText = typeof docText === 'string' && docText.trim().length > 0;
-
-    if (!hasPages && !hasDocText) {
-        await react('❌');
-        await reply(
-            '⚠️ لم يتم تحميل محتوى الملف بشكل صحيح.\n\n' +
-            'أرسل *111* وأعد رفع ملف PDF من جديد.'
-        );
-        return;
-    }
-
-    await react('⏳');
-
-    // System prompt ذكي يفهم السؤال ويجيب من الملف
-    const examSystemPrompt =
-        'أنت مساعد تعليمي ذكي ومتفهّم. مهمتك: الإجابة على أسئلة المستخدم اعتماداً على محتوى الملف المرفق.\n\n' +
-        '══ تعليمات الإجابة ══\n\n' +
-        '1. افهم السؤال جيداً — قد يكون السؤال مباشراً أو غير مباشر أو بصياغة مختلفة عما في الملف، ابحث عن المعنى لا عن النص الحرفي.\n' +
-        '2. إذا وجدت الإجابة في الملف (كاملةً أو جزئياً):\n' +
-        '   ✅ أجب بشكل واضح ومفصّل\n' +
-        '   ✅ اذكر الأرقام والتواريخ والأسماء بدقة\n' +
-        '   ✅ إذا كانت الإجابة موزعة على أجزاء عدة اجمعها معاً\n' +
-        '3. إذا لم يكن السؤال في الملف إطلاقاً:\n' +
-        '   ❌ أجب فقط: "⚠️ هذا السؤال غير موجود في محتوى الملف المرفق."\n' +
-        '4. لا تخترع معلومات ولا تضف شيئاً من خارج الملف\n' +
-        '5. أجب بنفس لغة السؤال (عربي أو إنجليزي)\n\n' +
-        `الملف الحالي: "${fileName}"`;
-
-    try {
-        // نستخدم النص دائماً — أسرع بكثير من إرسال الصور
-        const rawText = hasDocText ? docText : '';
-        const fullText = rawText.length > 60000
-            ? rawText.slice(0, 60000) + '\n\n[... باقي الملف محذوف بسبب الطول ...]'
-            : rawText;
-
-        const res = await callMistral({
-            model: 'mistral-large-latest',
-            messages: [
-                { role: 'system', content: examSystemPrompt },
-                {
-                    role: 'user',
-                    content:
-                        '══ محتوى الملف ══\n' + fullText +
-                        '\n\n══ سؤال المستخدم ══\n' + bodyTrimmed +
-                        '\n\nأجب بدقة من محتوى الملف.'
-                }
-            ],
-            max_tokens: 2048,  // حد آمن لجميع نماذج Mistral
-            temperature: 0.3
-        }, 4);   // 4 محاولات بدل 3
-
-        // إرسال الجواب مع header واضح
-        await reply(
-            '📚 *نظام الاختبارات*\n' +
-            '📄 ' + fileName + '\n' +
-            '─────────────\n\n' +
-            res +
-            '\n\n─────────────\n' +
-            '_💡 اكتب سؤالاً آخر أو اكتب *خروج* للخروج_'
-        );
-        await react('✅');
-
-    } catch (e) {
-        console.error('[examMode]', e.message);
-        await react('❌');
-        if (e.message === 'AUTH_ERROR') {
-            await reply('عذراً، مشكلة في إعدادات الخدمة. تم إشعار الأدمن.');
-        } else if (e.message === 'QUOTA_ERROR') {
-            await reply('عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.');
-        } else if (e.name === 'AbortError') {
-            await reply('⏱️ الملف كبير واستغرق وقتاً طويلاً. يرجى المحاولة مرة أخرى أو إرسال ملف أصغر.');
-        } else {
-            await reply('حدث خطأ أثناء معالجة سؤالك. يرجى المحاولة مرة أخرى.');
-        }
-    }
 }
 
 
@@ -2891,12 +2586,12 @@ async function startBot() {
                     text:
                         `🎉 *مرحباً بك في MedTerm!*\n\n` +
                         `أنت الآن في *الفترة التجريبية المجانية* 🆓\n\n` +
-                        `📊 *رصيدك التجريبي (لمرة واحدة فقط — لا يتجدد):*\n` +
+                        `📊 *رصيدك التجريبي:*\n` +
                         `💬 الرسائل النصية: ${msgLimit - rec.messages} / ${msgLimit}\n` +
                         `🖼️ الصور: ${imgLimit - rec.images} / ${imgLimit}\n` +
                         `🔊 الرسائل الصوتية: ${ttsLimit - rec.tts} / ${ttsLimit}\n\n` +
-                        `⚠️ *ملاحظة هامة:* عند انتهاء هذا الرصيد لن يتجدد تلقائياً.\n` +
-                        `للاستمرار بعد انتهاء الرصيد، اشترك بالخطة الشهرية:\n` +
+                        `⚠️ *ملاحظة:* هذا الرصيد للتجربة فقط ولا يتجدد تلقائياً.\n` +
+                        `للاستمرار بعد انتهاء الرصيد، تواصل معنا للاشتراك الشهري 👇\n` +
                         `📲 wa.me/972593850520`
                 });
             }
@@ -2904,16 +2599,6 @@ async function startBot() {
             // ============================================================
             // معالجة أنواع الرسائل
             // ============================================================
-
-            // ── تذكير: إذا كان ينتظر PDF لنظام الاختبارات وأرسل نصاً ──
-            if (userExamPending[sender] && msgType !== 'documentMessage') {
-                await reply(
-                    '📎 *أنت في وضع تفعيل نظام الاختبارات.*\n\n' +
-                    'يرجى إرسال ملف *PDF* الآن للبدء.\n' +
-                    '_أرسل "خروج" للإلغاء._'
-                );
-                return;
-            }
 
             // --- صور ---
             if (msgType === 'imageMessage') {
@@ -2924,8 +2609,7 @@ async function startBot() {
                 const isVIPimg = isAdmin || isActiveVIP(sender);
                 if (!isVIPimg && !checkDailyLimit(sender, 'image')) {
                     await reply(
-                        `⚠️ *وصلت للحد النهائي للصور* (${DAILY_IMG_LIMIT} صور)\n\n` +
-                        `هذا الحد لمرة واحدة فقط ولا يتجدد.\n` +
+                        `⚠️ *وصلت للحد اليومي للصور* (${DAILY_IMG_LIMIT} صور/يوم)\n\n` +
                         `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
                     );
                     return;
@@ -2980,8 +2664,7 @@ async function startBot() {
                     await reply('⚠️ أرسلت ملفات بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
                 }
-                // لا نخصم حد PDF إذا كان المستخدم في وضع نظام الاختبارات
-                if (!userExamPending[sender] && !checkDailyLimit(sender, 'pdf')) {
+                if (!checkDailyLimit(sender, 'pdf')) {
                     await reply('⚠️ وصلت للحد اليومي للملفات (10 ملفات/يوم).');
                     return;
                 }
@@ -3043,7 +2726,7 @@ async function startBot() {
 
                     // ── فحص الكاش أولاً (اسم + هاش المحتوى) ──
                     const cacheKey  = pdfCacheKey(fileName, buffer);
-                    const cacheHit  = pdfCacheGet(cacheKey);
+                    const cacheHit  = await pdfCacheGet(cacheKey);
 
                     if (cacheHit) {
                         // ✅ الملف موجود في الكاش — تحميل فوري بدون استخراج
@@ -3054,48 +2737,37 @@ async function startBot() {
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
 
-                        if (userExamPending[sender]) {
-                            delete userExamPending[sender];
-                            userExamMode[sender] = { fileName, pages, docText, loadedAt: Date.now() };
-                            await react('📚');
-                            await reply(
-                                `✅ *تم تحميل الملف من الذاكرة المؤقتة!*\n` +
-                                `📄 الملف: "${fileName}" (${pageCount} صفحة)\n` +
-                                `⚡ *تم تحميله بشكل فوري — موجود مسبقاً في النظام*\n\n` +
-                                `🤖 جاهز للإجابة على أسئلتك!\n\n` +
-                                `_اكتب *خروج* للخروج من نظام الاختبارات_`
-                            );
-                        } else {
-                            userPdfPending[sender] = {
-                                fileName,
-                                docText,
-                                pages,
-                                expiresAt: Date.now() + 5 * 60_000
-                            };
-                            await react('📄');
-                            await reply(
-                                `📄 *"${fileName}"*\n` +
-                                `⚡ هذا الملف موجود مسبقاً في النظام (${pageCount} صفحة) — تم تحميله فوراً!\n\n` +
-                                `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
-                                `أرسل *نعم* للدخول لوضع الملف 📑\n` +
-                                `أو *لا* للمتابعة بشكل عادي`
-                            );
-                        }
+                        userPdfPending[sender] = {
+                            fileName,
+                            docText,
+                            pages,
+                            expiresAt: Date.now() + 5 * 60_000
+                        };
+                        await react('📄');
+                        await reply(
+                            `📄 *"${fileName}"*\n` +
+                            `⚡ هذا الملف موجود مسبقاً في النظام (${pageCount} صفحة) — تم تحميله فوراً!\n\n` +
+                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
+                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
+                            `أو *لا* للمتابعة بشكل عادي`
+                        );
                         return;
                     }
 
                     // ── الملف جديد — استخراج كامل ──
                     console.log(`[PDF] جاري تحويل "${fileName}" بـ mutool...`);
-                    const tmpDir = `${os.tmpdir()}/pdf_${sender}_${Date.now()}`;
-                    try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (_) {}
+                    // اسم مجلد عشوائي غير قابل للتنبؤ — لا يعتمد على مدخلات المستخدم (sender/fileName)
+                    const tmpDirName = `pdf_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+                    const tmpDir = path.join(os.tmpdir(), tmpDirName);
+                    await fs.promises.mkdir(tmpDir, { recursive: true });
                     try {
-                        const pdfPath = `${tmpDir}/input.pdf`;
-                        fs.writeFileSync(pdfPath, buffer);
+                        const pdfPath = path.join(tmpDir, 'input.pdf');
+                        await fs.promises.writeFile(pdfPath, buffer);
 
                         await new Promise((resolve, reject) => {
                             execFile('mutool', [
                                 'convert',
-                                '-o', `${tmpDir}/page-%d.jpg`,
+                                '-o', path.join(tmpDir, 'page-%d.jpg'),
                                 '-O', 'resolution=150',
                                 pdfPath
                             ], { timeout: 30_000 }, (err, _so, se) => {
@@ -3104,15 +2776,16 @@ async function startBot() {
                             });
                         });
 
-                        const pageFiles = fs.readdirSync(tmpDir)
+                        const dirEntries = await fs.promises.readdir(tmpDir);
+                        const pageFiles = dirEntries
                             .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
                             .sort();
 
                         if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
                         console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
 
-                        const pages = pageFiles.map(f =>
-                            fs.readFileSync(`${tmpDir}/${f}`).toString('base64')
+                        const pages = await Promise.all(
+                            pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
                         );
 
                         // استخراج النص أيضاً كـ fallback للأسئلة النصية
@@ -3123,51 +2796,32 @@ async function startBot() {
                         } catch (_) {}
 
                         // ── حفظ في الكاش بعد نجاح الاستخراج ──
-                        if (docText) pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
+                        if (docText) await pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
 
                         // خصم الحد بعد نجاح التحويل فقط (لا نظلم المستخدم عند الفشل)
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
 
-                        // ── نظام الاختبارات (VIP): تفعيل تلقائي إذا كان المستخدم في pending ──
-                        if (userExamPending[sender]) {
-                            delete userExamPending[sender];
-                            userExamMode[sender] = { fileName, pages, docText, loadedAt: Date.now() };
-                            await react('📚');
-                            await reply(
-                                `✅ *تم تحميل الملف بنجاح في نظام الاختبارات!*\n` +
-                                `📄 الملف: "${fileName}" (${pageFiles.length} صفحة)\n\n` +
-                                `🤖 *تم قراءة الملف بالكامل — جاهز للإجابة!*\n\n` +
-                                `📌 *يمكنك الآن:*\n` +
-                                `• طرح أي سؤال من داخل الملف\n` +
-                                `• طلب شرح أي مفهوم أو جدول أو صورة\n` +
-                                `• طلب تلخيص أي جزء\n\n` +
-                                `⚠️ الأسئلة الخارجة عن الملف سأُخبرك أنها غير موجودة فيه.\n\n` +
-                                `_اكتب *خروج* للخروج من نظام الاختبارات_`
-                            );
-                        } else {
-                            // الوضع العادي: PDF عادي
-                            userPdfPending[sender] = {
-                                fileName,
-                                docText,
-                                pages,
-                                expiresAt: Date.now() + 5 * 60_000
-                            };
-                            await react('📄');
-                            await reply(
-                                `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
-                                `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
-                                `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
-                                `أرسل *نعم* للدخول لوضع الملف 📑\n` +
-                                `أو *لا* للمتابعة بشكل عادي`
-                            );
-                        }
+                        userPdfPending[sender] = {
+                            fileName,
+                            docText,
+                            pages,
+                            expiresAt: Date.now() + 5 * 60_000
+                        };
+                        await react('📄');
+                        await reply(
+                            `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
+                            `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
+                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
+                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
+                            `أو *لا* للمتابعة بشكل عادي`
+                        );
                     } catch (imgErr) {
                         console.error('[PDF]', imgErr.message);
                         await react('❌');
                         await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور.`);
                     } finally {
-                        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+                        try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch (_) {}
                     }
 
                 } catch (e) {
@@ -3209,12 +2863,12 @@ async function startBot() {
 
                     // فحص الحد اليومي للصوت (حد TTS منفصل)
                     const isVIPaudio = isAdmin || isActiveVIP(sender);
-                    let ttsQuota = { allowed: true, commit: () => {} };
+                    let ttsQuota = null;
                     if (!isAdmin && !isVIPaudio) {
                         ttsQuota = checkDailyTTS(sender);
                         if (!ttsQuota.allowed) {
                             await react('⛔');
-                            await reply(`⚠️ *وصلت للحد النهائي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nهذا الحد لمرة واحدة فقط ولا يتجدد.\nللاستمرار بدون حدود اشترك بـ VIP:\n👤 wa.me/972593850520`);
+                            await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`);
                             return;
                         }
                     }
@@ -3242,20 +2896,18 @@ async function startBot() {
                         audioFinalRes += `\n\n─────────────\n_🔊 صوت: ${ttsLeft3} | 💬 رسائل: ${msgLeft3} | 🖼️ صور: ${imgLeft3}_`;
                     }
                     await reply(audioFinalRes);
-                    if (!isVIPaudio) ttsQuota.commit?.(); // خصم بعد نجاح الرد فعلياً
+                    if (!isVIPaudio && ttsQuota) ttsQuota.commit?.(); // خصم بعد نجاح الرد فعلياً
                     await react('✅');
 
                 } catch (audioErr) {
-                    console.error('[audio/stt]', audioErr.message);
-                    if (audioErr.message?.startsWith('STT_FAILED')) {
+                    console.error('[audio/voxtral]', audioErr.message);
+                    if (audioErr.message === 'AUTH_ERROR') {
+                        notifyAdmin('⚠️ خطأ 401 في Voxtral — تحقق من MISTRAL_API_KEY');
                         await react('❌');
-                        await reply(
-                            '⚠️ لم أتمكن من استخراج النص من الرسالة الصوتية.\n\n' +
-                            '📌 *للإصلاح، تأكد من تثبيت أحد هذين:*\n' +
-                            '• `pip install vosk` + تنزيل موديل عربي\n' +
-                            '• أو `pip install openai-whisper` (يعمل بدون إنترنت)\n\n' +
-                            'يمكنك إرسال رسالتك كتابةً في الوقت الحالي. ✍️'
-                        );
+                        await reply('عذراً، مشكلة في إعدادات الخدمة. تم إشعار الأدمن.');
+                    } else if (audioErr.message === 'QUOTA_ERROR') {
+                        await react('❌');
+                        await reply('عذراً، نفاد رصيد Mistral API مؤقتاً. تم إشعار الأدمن.');
                     } else {
                         await react('❌');
                         await reply('عذراً، حدث خطأ في معالجة الرسالة الصوتية. حاول مجدداً أو اكتب رسالتك نصياً. ✍️');
@@ -3316,7 +2968,6 @@ async function startBot() {
                 // رجوع للقائمة الرئيسية
                 if (/^قائمة$/i.test(bodyTrimmed)) {
                     delete userPdfContext[sender];
-                    delete userModes[sender];
                     userChats[sender] = [];
                     await react('🔄');
                     await reply(buildModeMenu(userName || ''));
@@ -3372,56 +3023,6 @@ async function startBot() {
             }
 
 
-            // إلغاء انتظار PDF لنظام الاختبارات إذا أرسل "خروج"
-            if (userExamPending[sender] && /^(خروج|exit|إلغاء|الغاء)$/i.test(bodyTrimmed)) {
-                delete userExamPending[sender];
-                await react('✅');
-                await reply('تم إلغاء نظام الاختبارات. يمكنك الكتابة بشكل طبيعي. 👍');
-                return;
-            }
-
-            // ============================================================
-            // نظام الاختبارات — كود التفعيل: 111 (VIP فقط)
-            // ============================================================
-            if (bodyTrimmed === '111') {
-                const isVIPexam = isAdmin || isActiveVIP(sender);
-                if (!isVIPexam) {
-                    await reply(
-                        '🔒 *نظام الاختبارات متاح للنسخة المميزة (VIP) فقط.*\n\n' +
-                        'للاشتراك والحصول على:\n' +
-                        '📚 نظام اختبارات ذكي يقرأ ملفاتك كاملاً\n' +
-                        '♾️ رسائل وصور وصوت غير محدودة\n' +
-                        '📄 PDF بدون حد للحجم\n\n' +
-                        '👤 wa.me/972593850520'
-                    );
-                    return;
-                }
-                // مسح أي جلسة سابقة
-                delete userExamMode[sender];
-                delete userExamPending[sender];
-                userExamPending[sender] = true;
-                await react('📚');
-                await reply(
-                    '📚 *نظام الاختبارات — مرحباً!*\n\n' +
-                    '✅ أرسل ملف PDF الآن وسأقوم بـ:\n' +
-                    '• قراءة كل الصفحات كاملاً (نصوص + جداول + صور)\n' +
-                    '• تحليل كل المحتوى بدقة 100%\n' +
-                    '• الإجابة على أي سؤال من داخل الملف بدقة تامة\n\n' +
-                    '📎 *أرسل ملف PDF الآن...*\n' +
-                    '_اكتب "خروج" للإلغاء_'
-                );
-                return;
-            }
-
-            // ============================================================
-            // نظام الاختبارات — معالجة الأسئلة (إذا كان المستخدم في وضع الاختبار)
-            // ============================================================
-            if (userExamMode[sender]) {
-                const { fileName, pages, docText } = userExamMode[sender];
-                await handleExamMode(sender, body, pages, docText, fileName, reply, react);
-                return;
-            }
-
             const isYes = /^(نعم|yes|نعم\s*✅|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
             if (isYes && userTTSPending[sender] && Date.now() < userTTSPending[sender].expiresAt) {
                 const { term, termAr } = userTTSPending[sender];
@@ -3463,12 +3064,12 @@ async function startBot() {
                           || (bodyTrimmed.startsWith('صوت ') ? { 1: bodyTrimmed.slice(4) } : null);
             if (ttsMatch) {
                 const isVIPnow = isActiveVIP(sender);
+                let ttsCheck = null;
                 if (!isAdmin && !isVIPnow) {
-                    const ttsCheck = checkDailyTTS(sender);
+                    ttsCheck = checkDailyTTS(sender);
                     if (!ttsCheck.allowed) {
                         await reply(
-                            `⚠️ *وصلت للحد النهائي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
-                            `هذا الحد لمرة واحدة فقط ولا يتجدد.\n` +
+                            `⚠️ *وصلت للحد اليومي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
                             `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
                         );
                         return;
@@ -3480,7 +3081,7 @@ async function startBot() {
                     const lang = /[\u0600-\u06FF]/.test(ttsText) ? 'ar' : 'en';
                     const audio = await generateTTS(ttsText, lang);
                     await sendVoiceNote(jid, audio, msg);
-                    if (!isAdmin && !isVIPnow) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
+                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
                     await react('✅');
                 } catch (e) {
                     await react('❌');
@@ -3518,10 +3119,11 @@ async function startBot() {
                     await reply(`${originalLabel} ${textToTranslate}\n\n${translatedLabel} ${translationResult}`);
 
                     // إرسال الصوت تلقائياً بدون طلب "نعم"
+                    let ttsCheck = null;
                     if (!isAdmin && !isVIPnow) {
-                        const ttsCheck = checkDailyTTS(sender);
+                        ttsCheck = checkDailyTTS(sender);
                         if (!ttsCheck.allowed) {
-                            await reply(`⚠️ وصلت للحد النهائي للصوت (${DAILY_TTS_LIMIT} مرات). هذا الحد لا يتجدد. الترجمة فوق بدون صوت.`);
+                            await reply(`⚠️ وصلت للحد اليومي للصوت (${DAILY_TTS_LIMIT} مرات). الترجمة فوق بدون صوت.`);
                             await react('✅');
                             return;
                         }
@@ -3529,7 +3131,7 @@ async function startBot() {
                     await new Promise(r => setTimeout(r, 300));
                     const audio = await generateTTS(translationResult, targetLangCode);
                     await sendVoiceNote(jid, audio);
-                    if (!isAdmin && !isVIPnow) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
+                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
                     await react('✅');
                 } catch (e) {
                     console.error('[translate]', e.message);
@@ -3730,15 +3332,6 @@ setInterval(checkVIPExpiry, 60 * 60_000);
         return null;
     }
 
-    // فحص espeak-ng (بدل Google TTS — محلي)
-    const espeakPath = findTool('espeak-ng');
-    if (!espeakPath) {
-        console.error('❌ espeak-ng غير مثبت أو غير موجود في PATH.');
-        console.error('   ثبّته بـ:  pkg install espeak-ng');
-        process.exit(1);
-    }
-    console.log(`✅ espeak-ng: ${espeakPath}`);
-
     // فحص mutool
     const mutoolPath = findTool('mutool');
     if (!mutoolPath) {
@@ -3748,25 +3341,6 @@ setInterval(checkVIPExpiry, 60 * 60_000);
         process.exit(1);
     }
     console.log(`✅ mutool: ${mutoolPath}`);
-
-    // فحص STT (vosk أو whisper) — تحذير فقط، لا إيقاف
-    const { spawnSync: spawnS } = require('child_process');
-    let sttAvailable = false;
-    try {
-        const r = spawnS('python3', ['-c', 'import vosk; print("ok")'], { encoding: 'utf8', timeout: 5000 });
-        if (!r.error && r.stdout.includes('ok')) { sttAvailable = true; console.log('✅ vosk (STT): متاح'); }
-    } catch (_) {}
-    if (!sttAvailable) {
-        try {
-            const r = spawnS('whisper', ['--help'], { encoding: 'utf8', timeout: 5000 });
-            if (!r.error) { sttAvailable = true; console.log('✅ whisper (STT): متاح'); }
-        } catch (_) {}
-    }
-    if (!sttAvailable) {
-        console.warn('⚠️  STT (تحويل صوت→نص) غير مثبت. الرسائل الصوتية ستعطي خطأ.');
-        console.warn('   للتثبيت: pip install vosk   ثم نزّل موديل من alphacephei.com/vosk/models');
-        console.warn('   أو:       pip install openai-whisper');
-    }
 
     // فحص ffmpeg
     const ffmpegPath = findTool('ffmpeg');
