@@ -827,42 +827,216 @@ function isComplexQuery(text) {
         .test(text || '');
 }
 
-// askAI: نموذج سريع للمحادثات العادية، قوي للأسئلة المعقدة
-// ✅ تحسين: رفع حد الـ large من 400 → 700 حرف (توفير استخدام النموذج الغالي)
-// ✅ تحسين: تقليص max_tokens من 1500 → 900 للردود العادية (الردود الفعلية نادراً تتجاوز 900)
+// ============================================================
+// 1. كاش الأسئلة المتكررة — صفر استهلاك للأسئلة المكررة
+// ============================================================
+// حجم الكاش: 500 سؤال | TTL: 24 ساعة | مشترك بين كل المستخدمين
+const _qaCache     = new Map(); // key: نص السؤال المُنقّح → value: { answer, hits, createdAt }
+const QA_CACHE_MAX = 500;
+const QA_CACHE_TTL = 24 * 60 * 60_000;
+
+// تنقيح السؤال للـ cache key: حذف الأسماء والتشكيل والمسافات الزائدة
+function normalizeQuestion(text) {
+    return (text || '')
+        .replace(/[\u064B-\u065F]/g, '')  // حذف التشكيل
+        .replace(/[،,.:؟?!]/g, '')         // حذف الترقيم
+        .replace(/\s+/g, ' ')              // مسافة واحدة
+        .toLowerCase()
+        .trim()
+        .slice(0, 120);                    // أول 120 حرف كـ key
+}
+
+function qaGet(question) {
+    const key = normalizeQuestion(question);
+    const hit = _qaCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.createdAt > QA_CACHE_TTL) { _qaCache.delete(key); return null; }
+    hit.hits++;
+    console.log(`[cache] ✅ HIT (${hit.hits}x): "${key.slice(0,40)}"`);
+    return hit.answer;
+}
+
+function qaSet(question, answer) {
+    // لا نكاش: أسئلة قصيرة جداً أو شخصية أو تحتوي أرقام (نتائج تتغير)
+    const q = normalizeQuestion(question);
+    if (q.length < 10) return;
+    if (/رصيد|اشتراك|وقت|تاريخ|اليوم|الآن|الان|كم|عمري|اسمي/i.test(q)) return;
+    // تنظيف الكاش إذا امتلأ
+    if (_qaCache.size >= QA_CACHE_MAX) {
+        // احذف أقدم 50 عنصر
+        const keys = [..._qaCache.keys()].slice(0, 50);
+        keys.forEach(k => _qaCache.delete(k));
+    }
+    _qaCache.set(q, { answer, hits: 0, createdAt: Date.now() });
+}
+
+// تنظيف الكاش كل 6 ساعات
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of _qaCache.entries())
+        if (now - v.createdAt > QA_CACHE_TTL) _qaCache.delete(k);
+    console.log(`[cache] تنظيف دوري — الحجم الحالي: ${_qaCache.size}`);
+}, 6 * 60 * 60_000);
+
+// ============================================================
+// 2. فلتر الرسائل التافهة — ردود جاهزة بدون AI
+// ============================================================
+const TRIVIAL_RESPONSES = {
+    // تعابير موافقة
+    ok:    ['حسناً 😊', 'تمام 👍', 'أوكيه 😄'],
+    okay:  ['حسناً 😊', 'تمام 👍'],
+    tمام:  ['👍', 'تمام!', '😊'],
+    تمام:  ['👍', 'تمام!', '😊'],
+    حسنا:  ['👍', 'حسناً!'],
+    حسناً: ['👍', 'حسناً!'],
+    اوك:   ['👍', 'أوكيه!'],
+    اوكيه: ['👍', 'أوكيه!'],
+    // ضحك
+    هه:    ['😄', 'هههه 😄'],
+    هههه:  ['😄😄', 'هههه 😂'],
+    هه:    ['😄'],
+    lol:   ['😂', 'هههه 😂'],
+    // شكر
+    شكرا:  ['العفو 😊', 'على الرحب والسعة!', 'بكل سرور 🌟'],
+    شكراً: ['العفو 😊', 'على الرحب والسعة!'],
+    thanks:['You\'re welcome! 😊', 'Anytime! 🌟'],
+    thank: ['You\'re welcome! 😊'],
+    // تحية إنهاء
+    باي:   ['إلى اللقاء 👋', 'مع السلامة 😊'],
+    'مع السلامة': ['إلى اللقاء 👋', 'مع السلامة 😊'],
+    goodbye: ['Goodbye! 👋', 'Take care! 😊'],
+    bye:   ['Goodbye! 👋', 'Bye! 😊'],
+};
+
+// فحص إذا الرسالة تافهة وإعادة رد جاهز (أو null)
+function getTrivialReply(text) {
+    const t = (text || '').trim().toLowerCase()
+        .replace(/[!.،؟?]+$/, '')  // حذف علامات الترقيم من النهاية
+        .replace(/[\u064B-\u065F]/g, ''); // حذف التشكيل
+
+    // رسائل قصيرة جداً (أقل من 3 حروف) — إيموجي أو حرف واحد
+    if (t.length < 3 && !/[a-zA-Z\u0600-\u06FF]/.test(t)) return '😊';
+
+    // بحث في القاموس
+    const options = TRIVIAL_RESPONSES[t];
+    if (options) return options[Math.floor(Math.random() * options.length)];
+
+    // أنماط إضافية
+    if (/^ه+$/.test(t)) return ['😄', '😂', 'هههه 😄'][Math.floor(Math.random()*3)];
+    if (/^[👍👌✅🙏😊❤️]+$/.test(text?.trim())) return '😊';
+
+    return null; // ليست تافهة
+}
+
+// ============================================================
+// 3. ضغط السياق عند الامتلاء
+// ============================================================
+// بدل حذف الرسائل القديمة، يضغطها بملخص واحد → توفير 70% من tokens السياق
+async function compressContext(history) {
+    if (!history || history.length < 8) return history;
+    try {
+        // نأخذ الرسائل القديمة (كل ما عدا آخر 4) ونلخصها
+        const toCompress = history.slice(0, -4);
+        const toKeep     = history.slice(-4);
+        const convText   = toCompress.map(m =>
+            `${m.role === 'user' ? 'المستخدم' : 'المساعد'}: ${m.content.slice(0, 200)}`
+        ).join('\n');
+
+        const summary = await callMistral({
+            model: 'open-mistral-nemo', // ✅ النموذج الأرخص للملخص
+            messages: [
+                { role: 'system', content: 'لخّص هذه المحادثة في جملتين أو ثلاث. ركّز على المواضيع الرئيسية فقط. اكتب الملخص بصيغة "تحدثنا عن..."' },
+                { role: 'user', content: convText }
+            ],
+            max_tokens: 150,
+            temperature: 0.3
+        });
+
+        console.log(`[context] ضغط: ${toCompress.length} رسالة → ملخص (${summary.length} حرف)`);
+        return [
+            { role: 'user',      content: `[ملخص المحادثة السابقة: ${summary}]` },
+            { role: 'assistant', content: 'حسناً، أكمل معك.' },
+            ...toKeep
+        ];
+    } catch {
+        // فشل الضغط — نعود للحذف العادي
+        return history.slice(-6);
+    }
+}
+
+// ============================================================
+// 4. كشف نوع المحادثة للسياق المتغير
+// ============================================================
+function detectContextNeeded(body, history) {
+    if (!history || history.length === 0) return 2; // محادثة جديدة — 2 رسائل كافية
+    const lastTopic = history.slice(-1)[0]?.content || '';
+    // تشابه الموضوع — نستخدم سياق أطول
+    const sameTopicWords = (body || '').split(' ').filter(w => w.length > 3 && lastTopic.includes(w));
+    if (sameTopicWords.length >= 2) return 8;  // متابعة محادثة — 8 رسائل
+    if (isComplexQuery(body))       return 10; // سؤال معقد — 10 رسائل
+    return 4; // موضوع جديد — 4 رسائل
+}
+
+// ============================================================
+// 5. اختيار النموذج بذكاء (3 مستويات بدل 2)
+// ============================================================
+function selectModel(text, historyLen) {
+    // نموذج مصغّر للأسئلة البسيطة جداً (بدون سياق طبي ومحادثة قصيرة)
+    const isSimple = text.length < 80 && historyLen <= 2 && !isMedicalQuery(text) && !isComplexQuery(text);
+    if (isSimple) return { model: 'open-mistral-nemo', maxTok: 600 }; // الأرخص بـ 80%
+
+    // نموذج متوسط للمحادثات العادية
+    const useLarge = isComplexQuery(text) || text.length > 700;
+    if (useLarge) return { model: 'mistral-large-latest', maxTok: 1200 };
+    return { model: 'mistral-small-latest', maxTok: 900 };
+}
+
+// ============================================================
+// 6. Rate Limiting ذكي (منفصل عن checkSpam)
+// ============================================================
+// checkSpam يمنع الإرسال المتسارع جداً (أكثر من 3 في 5 ثوانٍ)
+// هذا يضيف تأخيراً ذكياً لو المستخدم أرسل رسالتين خلال ثانية واحدة
+const _lastMsgTime = {};
+async function smartRateDelay(sender) {
+    const now  = Date.now();
+    const last = _lastMsgTime[sender] || 0;
+    const diff = now - last;
+    _lastMsgTime[sender] = now;
+
+    // لو أرسل رسالتين خلال ثانية — انتظر ثانيتين قبل الإرسال لـ AI
+    // هذا يمنع الإرسال المتسارع الذي يستهلك tokens بدون فائدة
+    if (diff < 1000 && diff > 0) {
+        console.log(`[rateDelay] ${sender} — تأخير 2 ثانية (${diff}ms بين الرسائل)`);
+        await new Promise(r => setTimeout(r, 2000));
+    }
+}
+
+
+// askAI: 3 مستويات من النماذج حسب تعقيد السؤال
+// Ministral Nemo (أرخص) → Small → Large
 async function askAI(messages) {
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-    // ✅ رفع الحد: 700 حرف بدل 400 — رسائل أطول لا تعني بالضرورة سؤالاً معقداً
-    const useLarge = isComplexQuery(lastUserMsg) || lastUserMsg.length > 700;
-    const model = useLarge ? 'mistral-large-latest' : 'mistral-small-latest';
+    const historyLen  = messages.filter(m => m.role !== 'system').length;
+    const { model, maxTok } = selectModel(lastUserMsg, historyLen);
 
-    console.log(`[askAI] نموذج: ${model} | طول الرسالة: ${lastUserMsg.length}`);
+    console.log(`[askAI] ${model} | ${lastUserMsg.length}ch | history:${historyLen}`);
     try {
-        return await callMistral({
-            model,
-            messages,
-            max_tokens: useLarge ? 1200 : 900, // ✅ تقليص: large→1200، small→900 (كان 1500 للجميع)
-            temperature: 0.5
-        });
+        return await callMistral({ model, messages, max_tokens: maxTok, temperature: 0.5 });
     } catch (e) {
-        if (model === 'mistral-small-latest') {
-            console.warn('[askAI] small فشل، محاولة large...');
+        // Fallback تصاعدي: nemo → small → large
+        const fallbacks = [
+            { model: 'mistral-small-latest',  maxTok: 900  },
+            { model: 'mistral-large-latest',  maxTok: 1200 }
+        ].filter(f => f.model !== model);
+
+        for (const fb of fallbacks) {
             try {
-                return await callMistral({
-                    model: 'mistral-large-latest',
-                    messages,
-                    max_tokens: 1200,
-                    temperature: 0.5
-                });
+                console.warn(`[askAI] fallback → ${fb.model}`);
+                return await callMistral({ model: fb.model, messages, max_tokens: fb.maxTok, temperature: 0.5 });
             } catch (e2) {
-                console.error('[askAI] large فشل أيضاً:', e2.message);
-                if (e2.name === 'AbortError') return 'الرد يأخذ وقتاً أطول من المعتاد، يرجى إعادة المحاولة.';
-                if (e2.message === 'AUTH_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
-                if (e2.message === 'QUOTA_ERROR') return 'عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.';
-                return 'عذراً، تعذّر الرد الآن. يرجى المحاولة مرة أخرى.';
+                if (e2.message === 'AUTH_ERROR' || e2.message === 'QUOTA_ERROR') throw e2;
             }
         }
-        console.error('[askAI] فشل نهائي:', e.message);
         if (e.name === 'AbortError') return 'الرد يأخذ وقتاً أطول من المعتاد، يرجى إعادة المحاولة.';
         if (e.message === 'AUTH_ERROR') return 'عذراً، حدثت مشكلة في إعدادات الخدمة. تم إشعار الأدمن.';
         if (e.message === 'QUOTA_ERROR') return 'عذراً، نفاد رصيد الخدمة مؤقتاً. تم إشعار الأدمن.';
@@ -3520,6 +3694,17 @@ async function processIncomingMessage(adaptedMsg) {
                 return;
             }
 
+            // ── 2. فلتر الرسائل التافهة (بدون AI) ──
+            const trivialReply = getTrivialReply(body);
+            if (trivialReply) {
+                await reply(trivialReply);
+                await react('😊');
+                return;
+            }
+
+            // ── 6. Rate limiting ذكي ──
+            await smartRateDelay(sender);
+
             // الحد اليومي للرسائل (الأدمن وVIP بلا حدود)
             const isVIP = isActiveVIP(sender);
             let _quotaCommit = null;
@@ -3554,9 +3739,27 @@ async function processIncomingMessage(adaptedMsg) {
                 _quotaCommit = quota.commit;
             }
 
-            await react('👍');
+            // ── 1. فحص كاش الأسئلة المتكررة ──
+            const cachedAnswer = qaGet(body);
+            if (cachedAnswer) {
+                await react('⚡');
+                // إضافة علامة خفية للأدمن فقط
+                const cacheNote = isAdmin ? '\n\n_(من الكاش ⚡)_' : '';
+                let cachedFinal = cachedAnswer + cacheNote;
+                if (!isAdmin && !isVIP && _quotaCommit) {
+                    _quotaCommit();
+                    const rec = getDailyRecord(sender);
+                    const msgLeft = Math.max(0, getUserDailyLimit(sender) - rec.messages);
+                    cachedFinal += `\n\n─────────────\n_💬 رسائل: ${msgLeft}_`;
+                } else if (_quotaCommit) {
+                    _quotaCommit();
+                }
+                await reply(cachedFinal);
+                await react('✅');
+                return;
+            }
 
-            const maxHist = isVIP ? 60 : MAX_HISTORY;
+            await react('👍');
 
             if (!userChats[sender]) userChats[sender] = [];
 
@@ -3569,9 +3772,15 @@ async function processIncomingMessage(adaptedMsg) {
             stats.totalMessages++;
             saveData();
 
-            // تقليم السياق قبل الإضافة
-            if (userChats[sender].length >= maxHist)
-                userChats[sender] = userChats[sender].slice(-(maxHist - 1));
+            // ── 5. ضغط السياق عند الامتلاء (بدل الحذف المباشر) ──
+            const maxHist = isVIP ? 60 : MAX_HISTORY;
+            if (userChats[sender].length >= maxHist) {
+                userChats[sender] = await compressContext(userChats[sender]);
+            }
+
+            // ── 3. سياق متغير حسب نوع المحادثة ──
+            const contextNeeded = isVIP ? maxHist : detectContextNeeded(body, userChats[sender]);
+            const trimmedHistory = userChats[sender].slice(-contextNeeded);
 
             userChats[sender].push({ role: 'user', content: body });
 
@@ -3580,10 +3789,14 @@ async function processIncomingMessage(adaptedMsg) {
 
             const res = await askAI([
                 { role: 'system', content: smartPrompt },
-                ...userChats[sender]
+                ...trimmedHistory,
+                { role: 'user', content: body }
             ]);
 
             userChats[sender].push({ role: 'assistant', content: res });
+
+            // ── 1. حفظ الجواب في الكاش ──
+            qaSet(body, res);
 
             // إضافة رصيد المتبقي في نهاية الرد (للمستخدم العادي فقط)
             let finalRes = res;
