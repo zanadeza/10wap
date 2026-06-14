@@ -885,7 +885,6 @@ const TRIVIAL_RESPONSES = {
     // تعابير موافقة
     ok:    ['حسناً 😊', 'تمام 👍', 'أوكيه 😄'],
     okay:  ['حسناً 😊', 'تمام 👍'],
-    tمام:  ['👍', 'تمام!', '😊'],
     تمام:  ['👍', 'تمام!', '😊'],
     حسنا:  ['👍', 'حسناً!'],
     حسناً: ['👍', 'حسناً!'],
@@ -894,7 +893,6 @@ const TRIVIAL_RESPONSES = {
     // ضحك
     هه:    ['😄', 'هههه 😄'],
     هههه:  ['😄😄', 'هههه 😂'],
-    هه:    ['😄'],
     lol:   ['😂', 'هههه 😂'],
     // شكر
     شكرا:  ['العفو 😊', 'على الرحب والسعة!', 'بكل سرور 🌟'],
@@ -943,7 +941,7 @@ async function compressContext(history) {
         ).join('\n');
 
         const summary = await callMistral({
-            model: 'open-mistral-nemo', // ✅ النموذج الأرخص للملخص
+            model: 'mistral-small-latest', // ✅ النموذج الصحيح — open-mistral-nemo غير متاح
             messages: [
                 { role: 'system', content: 'لخّص هذه المحادثة في جملتين أو ثلاث. ركّز على المواضيع الرئيسية فقط. اكتب الملخص بصيغة "تحدثنا عن..."' },
                 { role: 'user', content: convText }
@@ -981,11 +979,11 @@ function detectContextNeeded(body, history) {
 // 5. اختيار النموذج بذكاء (3 مستويات بدل 2)
 // ============================================================
 function selectModel(text, historyLen) {
-    // نموذج مصغّر للأسئلة البسيطة جداً (بدون سياق طبي ومحادثة قصيرة)
+    // mistral-small للأسئلة البسيطة جداً (بدون سياق طبي ومحادثة قصيرة)
+    // ملاحظة: open-mistral-nemo غير متاح عبر API العادي — نستخدم small كأرخص خيار متاح
     const isSimple = text.length < 80 && historyLen <= 2 && !isMedicalQuery(text) && !isComplexQuery(text);
-    if (isSimple) return { model: 'open-mistral-nemo', maxTok: 600 }; // الأرخص بـ 80%
+    if (isSimple) return { model: 'mistral-small-latest', maxTok: 600 };
 
-    // نموذج متوسط للمحادثات العادية
     const useLarge = isComplexQuery(text) || text.length > 700;
     if (useLarge) return { model: 'mistral-large-latest', maxTok: 1200 };
     return { model: 'mistral-small-latest', maxTok: 900 };
@@ -1023,10 +1021,10 @@ async function askAI(messages) {
     try {
         return await callMistral({ model, messages, max_tokens: maxTok, temperature: 0.5 });
     } catch (e) {
-        // Fallback تصاعدي: nemo → small → large
+        // Fallback تصاعدي: small → large
         const fallbacks = [
-            { model: 'mistral-small-latest',  maxTok: 900  },
-            { model: 'mistral-large-latest',  maxTok: 1200 }
+            { model: 'mistral-small-latest', maxTok: 900  },
+            { model: 'mistral-large-latest', maxTok: 1200 }
         ].filter(f => f.model !== model);
 
         for (const fb of fallbacks) {
@@ -2951,7 +2949,7 @@ async function processIncomingMessage(adaptedMsg) {
                 if (!isGroup) {
                     await reply(buildWelcome(userName));
                     const isProcessable = body || ['imageMessage','documentMessage'].includes(msgType);
-                    if (!isProcessable) return;
+                    if (!isProcessable) continue; // ✅ continue بدل return — نكمل بقية الرسائل
                 }
             }
 
@@ -3355,7 +3353,7 @@ async function processIncomingMessage(adaptedMsg) {
             }
 
             // --- نص ---
-            if (!body) return;
+            if (!body) continue; // ✅ continue بدل return — نكمل بقية الرسائل
 
             // ============================================================
             // كشف "نعم" لإرسال النطق الصوتي (TTS)
@@ -3595,7 +3593,7 @@ async function processIncomingMessage(adaptedMsg) {
             // أوامر المستخدم (!مساعدة، !مسح، !رصيد، !لغة، !ملخص) — تعمل دائماً
             const isVIPcmd = isActiveVIP(sender);
             const handledCmd = await handleUserCommand(body, sender, reply, react, isAdmin, isVIPcmd);
-            if (handledCmd) return;
+            if (handledCmd) continue; // ✅ continue بدل return
 
             // ============================================================
             // كشف طلب النطق الصوتي: "نطق [كلمة/جملة]"
@@ -3780,17 +3778,18 @@ async function processIncomingMessage(adaptedMsg) {
 
             // ── 3. سياق متغير حسب نوع المحادثة ──
             const contextNeeded = isVIP ? maxHist : detectContextNeeded(body, userChats[sender]);
-            const trimmedHistory = userChats[sender].slice(-contextNeeded);
 
+            // ✅ نضيف body للتاريخ أولاً، ثم نأخذ slice بعده
             userChats[sender].push({ role: 'user', content: body });
+            const trimmedHistory = userChats[sender].slice(-contextNeeded);
 
             // اختيار system prompt ذكي: طبي للأسئلة الطبية، عام للباقي
             const smartPrompt = getSmartSystemPrompt(body, userLanguages[sender]);
 
             const res = await askAI([
                 { role: 'system', content: smartPrompt },
-                ...trimmedHistory,
-                { role: 'user', content: body }
+                ...trimmedHistory
+                // ✅ لا نضيف body مرة ثانية — هو موجود بالفعل في trimmedHistory
             ]);
 
             userChats[sender].push({ role: 'assistant', content: res });
