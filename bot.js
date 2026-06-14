@@ -290,6 +290,10 @@ function nowJerusalem() {
 const DAILY_MSG_LIMIT   = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
 const DAILY_IMG_LIMIT   = 5;  // صور يومياً للمستخدم العادي
 const DAILY_TTS_LIMIT   = 10; // مرات استخدام الصوت/الترجمة يومياً للمستخدم العادي
+
+// ✅ حد مدة الرسائل الصوتية الواردة (Voxtral + استخراج النص)
+const AUDIO_MAX_SECONDS_FREE = 5 * 60;  // 5 دقائق للمجاني
+const AUDIO_MAX_SECONDS_VIP  = 15 * 60; // 15 دقيقة للـ VIP
 const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع المهندس نادر:\n👤 wa.me/972593850520'; // رسالة للمحظورين
 // ============================================================
 // نظام الحدود الدائمة — لا تتجدد تلقائياً، تُحفظ في bot_data.json
@@ -523,23 +527,48 @@ function extractTermForTTS(botReply) {
 const { execFile } = require('child_process');
 const os           = require('os');
 
-// تقسيم النص لأجزاء صالحة لـ Google TTS (الحد الأقصى لكل طلب ~200 حرف)
-function splitTextForTTS(text, maxLen = 180) {
-    const clean = (text || '').replace(/[^\w\s\u0600-\u06FF.,!?؛،؟]/g, '').trim();
+// تقسيم النص لأجزاء صالحة لـ Google TTS
+// لا يوجد حد للنص الكلي — يُقسَّم تلقائياً لأجزاء بحد أقصى 200 حرف لكل طلب
+// بدون حذف أي نص مهما طال (جملة أو فقرة أو صفحة كاملة)
+function splitTextForTTS(text, maxLen = 190) {
+    // تنظيف الرموز غير المدعومة في TTS مع الحفاظ على النص الكامل
+    const clean = (text || '')
+        .replace(/[*_#\[\](){}|\\^~`<>]/g, '')  // رموز markdown
+        .replace(/\s+/g, ' ')                    // مسافات متعددة → مسافة واحدة
+        .trim();
+
     if (!clean) return [];
     if (clean.length <= maxLen) return [clean];
 
     const chunks = [];
     let remaining = clean;
-    while (remaining.length > maxLen) {
-        // حاول القطع عند آخر فاصلة/نقطة/فراغ قبل الحد
-        let cut = remaining.lastIndexOf(' ', maxLen);
+
+    while (remaining.length > 0) {
+        if (remaining.length <= maxLen) {
+            chunks.push(remaining.trim());
+            break;
+        }
+
+        // أولاً: قطع عند نهاية جملة (. أو ؟ أو ! أو ، أو ؛)
+        let cut = -1;
+        for (const sep of ['. ', '؟ ', '! ', '، ', '؛ ', '\n']) {
+            const idx = remaining.lastIndexOf(sep, maxLen);
+            if (idx > maxLen * 0.4) { cut = idx + sep.length - 1; break; }
+        }
+
+        // ثانياً: إذا لم توجد نهاية جملة، قطع عند فراغ
+        if (cut <= 0) {
+            cut = remaining.lastIndexOf(' ', maxLen);
+        }
+
+        // ثالثاً: إذا لم يوجد فراغ، قطع بالحد الأقصى
         if (cut <= 0) cut = maxLen;
+
         chunks.push(remaining.slice(0, cut).trim());
         remaining = remaining.slice(cut).trim();
     }
-    if (remaining) chunks.push(remaining);
-    return chunks;
+
+    return chunks.filter(c => c.length > 0);
 }
 
 async function generateTTS(text, lang = 'en') {
@@ -547,7 +576,9 @@ async function generateTTS(text, lang = 'en') {
     const chunks  = splitTextForTTS(text);
     if (!chunks.length) throw new Error('نص فارغ بعد التنظيف');
 
-    const tmpId  = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    console.log(`[TTS] بدء التوليد: ${chunks.length} جزء، إجمالي ${text.length} حرف`);
+
+    const tmpId    = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const mp3Files = [];
 
     try {
@@ -561,8 +592,8 @@ async function generateTTS(text, lang = 'en') {
             const mp3File = require('path').join(os.tmpdir(), `tts_${tmpId}_${i}.mp3`);
             await require('fs').promises.writeFile(mp3File, mp3Buffer);
             mp3Files.push(mp3File);
-            // تأخير بسيط بين الطلبات لتجنب الحظر
-            if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 120));
+            // تأخير بسيط بين الطلبات لتجنب الحجب
+            if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 150));
         }
 
         const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}_out.ogg`);
@@ -576,7 +607,7 @@ async function generateTTS(text, lang = 'en') {
                     '-b:a', '32k',
                     '-vn',
                     oggFile
-                ], { timeout: 20_000 }, (err) => {
+                ], { timeout: 30_000 }, (err) => {
                     if (err) return reject(new Error(`ffmpeg فشل: ${err.message}`));
                     resolve();
                 });
@@ -596,7 +627,7 @@ async function generateTTS(text, lang = 'en') {
                     '-c:a', 'libopus',
                     '-b:a', '32k',
                     oggFile
-                ], { timeout: 60_000 }, (err) => {
+                ], { timeout: 120_000 }, (err) => { // ✅ رفع timeout لـ 120 ثانية للنصوص الطويلة
                     if (err) return reject(new Error(`ffmpeg concat فشل: ${err.message}`));
                     resolve();
                 });
@@ -607,8 +638,9 @@ async function generateTTS(text, lang = 'en') {
         require('fs').unlink(oggFile, () => {});
 
         if (!oggBuffer || oggBuffer.length < 100) throw new Error(`OGG فارغ (${oggBuffer?.length} bytes)`);
-        console.log(`[TTS] ✅ ${lang} "${text.slice(0,30)}" (${chunks.length} جزء) → ${oggBuffer.length} bytes`);
+        console.log(`[TTS] ✅ ${lang} | ${chunks.length} جزء | ${text.length} حرف → ${(oggBuffer.length/1024).toFixed(0)}KB`);
         return oggBuffer;
+
     } finally {
         for (const f of mp3Files) require('fs').unlink(f, () => {});
     }
@@ -618,6 +650,35 @@ async function generateTTS(text, lang = 'en') {
 // jid هنا هو رقم الهاتف مباشرة (cleanNumber). quotedMsg غير مستخدم في Cloud API للصوت.
 async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
     await wa.sendVoiceNote(jid, audioBuffer);
+}
+
+// ✅ قياس مدة ملف صوتي بالثواني عبر ffprobe
+// يُعيد null إذا فشل — البوت يكمل بدون فحص المدة
+async function getAudioDurationSeconds(buffer) {
+    const tmpFile = path.join(os.tmpdir(), `dur_${Date.now()}.ogg`);
+    try {
+        await fs.promises.writeFile(tmpFile, buffer);
+        const duration = await new Promise((resolve, reject) => {
+            execFile('ffprobe', [
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_streams',
+                tmpFile
+            ], { timeout: 10_000 }, (err, stdout) => {
+                if (err) return reject(err);
+                try {
+                    const info = JSON.parse(stdout);
+                    const dur  = parseFloat(info?.streams?.[0]?.duration || '0');
+                    resolve(isNaN(dur) ? null : Math.ceil(dur));
+                } catch { resolve(null); }
+            });
+        });
+        return duration;
+    } catch {
+        return null; // ffprobe غير متوفر أو فشل — نكمل بدون فحص
+    } finally {
+        fs.unlink(tmpFile, () => {});
+    }
 }
 
 // تنظيف TTS pending و PDF pending المنتهية كل 10 دقائق
@@ -1060,9 +1121,19 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
             `• *!رصيد* — عرض عدد الرسائل المتبقية اليوم\n` +
             `• *!لغة en* — تغيير لغة الردود (ar/en/fr/...)\n` +
             `• *!ملخص* — تلخيص المحادثة الحالية\n\n` +
-            `_يمكنك أيضاً إرسال صور أو ملفات PDF للتحليل_\n` +
-            `_لطلب نطق كلمة أو جملة: اكتب "نطق [الكلمة]"_\n` +
-            `_لطلب ترجمة: اكتب "ترجم [النص]" وسأرسل لك الصوت تلقائياً_`
+            `*🔊 ميزات الصوت:*\n` +
+            `• *نطق [جملة أو فقرة]* — تحويل أي نص لصوت (بدون حد للطول)\n` +
+            `• *صوت [نص]* — نفس أمر النطق\n` +
+            `• أرسل رسالة صوتية — البوت يفهمها ويرد عليها\n` +
+            `• أرسل رسالة صوتية مع caption *!نص* — يستخرج النص فقط\n` +
+            `• أرسل رسالة صوتية مع caption *رد بصوت* — يرد صوتياً\n\n` +
+            `*📄 ميزات الملفات:*\n` +
+            `• أرسل ملف PDF — يفعّل وضع الملف تلقائياً\n` +
+            `• *صفحة [رقم]* — شرح صفحة معينة\n` +
+            `• *ملخص* — ملخص الملف\n` +
+            `• *خروج* — الخروج من وضع الملف\n\n` +
+            `_يمكنك إرسال الصور للتحليل أو قراءة النص_\n` +
+            `_لطلب ترجمة: اكتب "ترجم [النص]"_`
         );
         return true;
     }
@@ -2998,8 +3069,28 @@ async function processIncomingMessage(adaptedMsg) {
                         return;
                     }
 
-                    // فحص الحد اليومي للصوت (حد TTS منفصل)
-                    const isVIPaudio = isAdmin || isActiveVIP(sender);
+                    // ✅ فحص مدة الرسالة الصوتية
+                    const isVIPaudio  = isAdmin || isActiveVIP(sender);
+                    const maxSeconds  = isVIPaudio ? AUDIO_MAX_SECONDS_VIP : AUDIO_MAX_SECONDS_FREE;
+                    const durationSec = await getAudioDurationSeconds(buffer);
+
+                    if (durationSec !== null && durationSec > maxSeconds) {
+                        await react('⛔');
+                        const maxMin = Math.floor(maxSeconds / 60);
+                        const durMin = Math.floor(durationSec / 60);
+                        const durSec = durationSec % 60;
+                        await reply(
+                            `⚠️ *الرسالة الصوتية طويلة جداً*\n\n` +
+                            `مدتها: *${durMin}:${String(durSec).padStart(2,'0')} دقيقة*\n` +
+                            `الحد الأقصى: *${maxMin} دقيقة* ${isVIPaudio ? '(VIP)' : '(مجاني)'}\n\n` +
+                            (isVIPaudio ? '' :
+                                `💎 *النسخة المميزة VIP:* حتى 15 دقيقة\n` +
+                                `👤 wa.me/972593850520`)
+                        );
+                        return;
+                    }
+
+                    // فحص الحد اليومي للصوت
                     let ttsQuota = null;
                     if (!isAdmin && !isVIPaudio) {
                         ttsQuota = checkDailyTTS(sender);
@@ -3010,31 +3101,67 @@ async function processIncomingMessage(adaptedMsg) {
                         }
                     }
 
-                    // Voxtral يفهم الصوت ويرد مباشرة — بدون OpenAI
-                    if (!userChats[sender]) userChats[sender] = [];
-                    const res = await transcribeAndReplyAudio(
-                        buffer, mime, body, userName, userChats[sender]
-                    );
+                    // ✅ كشف طلب استخراج النص فقط (بدون رد من AI)
+                    // المستخدم يرسل رسالة صوتية مع caption: "!نص" أو "استخرج النص" أو "حول لنص"
+                    const wantsTextOnly = body && /^(?:!نص|!text|استخرج النص|حول.{0,5}نص|نص فقط|transcribe|نصّ|نص|اكتب اللي قلتو|اكتب ما قيل)$/i.test(body.trim());
 
-                    // حفظ في السياق
-                    userChats[sender].push({ role: 'user',      content: body ? `[رسالة صوتية + نص: ${body}]` : '[رسالة صوتية]' });
-                    userChats[sender].push({ role: 'assistant', content: res });
+                    if (wantsTextOnly) {
+                        // ── استخراج النص فقط من الصوت ──
+                        await reply('⏳ جاري استخراج النص من الرسالة الصوتية...');
+                        const transcribed = await transcribeAndReplyAudio(
+                            buffer, mime,
+                            'استمع لهذه الرسالة الصوتية واكتب نصها الحرفي كاملاً بدون أي رد أو تعليق. اكتب النص فقط كما سمعته.',
+                            userName,
+                            [] // بدون سياق
+                        );
+                        await reply(`📝 *النص المستخرج:*\n\n${transcribed}`);
+                        if (!isVIPaudio && ttsQuota) ttsQuota.commit?.();
+                        await react('✅');
 
-                    stats.totalMessages++;
-                    saveData();
+                        // حفظ في السياق
+                        if (!userChats[sender]) userChats[sender] = [];
+                        userChats[sender].push({ role: 'user',      content: '[طلب استخراج نص من رسالة صوتية]' });
+                        userChats[sender].push({ role: 'assistant', content: transcribed });
 
-                    // إضافة رصيد متبقي للمستخدم العادي
-                    let audioFinalRes = `🎙️ ${res}`;
-                    if (!isVIPaudio) {
-                        const rec3 = getDailyRecord(sender);
-                        const ttsLeft3 = Math.max(0, DAILY_TTS_LIMIT - (rec3.tts || 0));
-                        const imgLeft3 = Math.max(0, DAILY_IMG_LIMIT - (rec3.images || 0));
-                        const msgLeft3 = Math.max(0, getUserDailyLimit(sender) - (rec3.messages || 0));
-                        audioFinalRes += `\n\n─────────────\n_🔊 صوت: ${ttsLeft3} | 💬 رسائل: ${msgLeft3} | 🖼️ صور: ${imgLeft3}_`;
+                    } else {
+                        // ── الوضع العادي: Voxtral يفهم ويرد ──
+                        if (!userChats[sender]) userChats[sender] = [];
+                        const res = await transcribeAndReplyAudio(
+                            buffer, mime, body, userName, userChats[sender]
+                        );
+
+                        // حفظ في السياق
+                        userChats[sender].push({ role: 'user',      content: body ? `[رسالة صوتية + نص: ${body}]` : '[رسالة صوتية]' });
+                        userChats[sender].push({ role: 'assistant', content: res });
+
+                        stats.totalMessages++;
+                        saveData();
+
+                        // إضافة رصيد متبقي للمستخدم العادي
+                        let audioFinalRes = `🎙️ ${res}`;
+                        if (!isVIPaudio) {
+                            const rec3 = getDailyRecord(sender);
+                            const ttsLeft3 = Math.max(0, DAILY_TTS_LIMIT - (rec3.tts || 0));
+                            const msgLeft3 = Math.max(0, getUserDailyLimit(sender) - (rec3.messages || 0));
+                            const imgLeft3 = Math.max(0, DAILY_IMG_LIMIT - (rec3.images || 0));
+                            audioFinalRes += `\n\n─────────────\n_🔊 صوت: ${ttsLeft3} | 💬 رسائل: ${msgLeft3} | 🖼️ صور: ${imgLeft3}_`;
+                        }
+                        await reply(audioFinalRes);
+
+                        // ✅ ميزة جديدة: إرسال الرد صوتياً إذا طلب المستخدم
+                        // caption يحتوي "رد صوت" أو "صوتي" أو "بصوت"
+                        const wantsVoiceReply = body && /رد صوت|رد بصوت|صوتي|بصوت|voice reply|voice/i.test(body);
+                        if (wantsVoiceReply) {
+                            try {
+                                const replyLang = /[\u0600-\u06FF]/.test(res) ? 'ar' : 'en';
+                                const replyAudio = await generateTTS(res, replyLang);
+                                await sendVoiceNote(jid, replyAudio);
+                            } catch (_) {} // فشل TTS لا يوقف البوت
+                        }
+
+                        if (!isVIPaudio && ttsQuota) ttsQuota.commit?.();
+                        await react('✅');
                     }
-                    await reply(audioFinalRes);
-                    if (!isVIPaudio && ttsQuota) ttsQuota.commit?.(); // خصم بعد نجاح الرد فعلياً
-                    await react('✅');
 
                 } catch (audioErr) {
                     console.error('[audio/voxtral]', audioErr.message);
@@ -3299,8 +3426,7 @@ async function processIncomingMessage(adaptedMsg) {
             // ============================================================
             // كشف طلب النطق الصوتي: "نطق [كلمة/جملة]"
             // ============================================================
-            const ttsMatch = bodyTrimmed.match(/^(?:نطق|صوت|اسمعني|اقرأ|نطقها?|ارسل صوت|حولها? صوت|بصوت|اقرأها?|قرأ|قراءة|حول(?:ي|وا|)? (?:لـ?|إلى )?صوت)\s+(.+)$/i)
-                          || bodyTrimmed.match(/^(?:.*?)\s*(?:بالصوت|صوتياً|بصوت|voice)\s+(.+)$/i)
+            const ttsMatch = bodyTrimmed.match(/^(?:نطق|صوت|اسمعني|اقرأ|نطقها?|ارسل صوت|حولها? صوت|بصوت|اقرأها?|قرأ|قراءة|حول(?:ي|وا|)? (?:لـ?|إلى )?صوت)\s+(.+)$/is)
                           || (bodyTrimmed.startsWith('صوت ') ? { 1: bodyTrimmed.slice(4) } : null);
             if (ttsMatch) {
                 const isVIPnow = isActiveVIP(sender);
@@ -3316,14 +3442,27 @@ async function processIncomingMessage(adaptedMsg) {
                     }
                 }
                 const ttsText = ttsMatch[1].trim();
+
+                // ✅ لا يوجد حد للنص — جملة أو فقرة أو صفحة كاملة
+                // النص يُقسَّم تلقائياً ويُدمج بملف صوتي واحد
+                if (ttsText.length > 5000) {
+                    await reply('⚠️ النص طويل جداً (أكثر من 5000 حرف). أرسل جزءاً أصغر.');
+                    return;
+                }
+
                 await react('🔊');
+                // إذا النص أكثر من 200 حرف أرسل رسالة انتظار
+                if (ttsText.length > 200) {
+                    await reply('⏳ جاري تحويل النص لصوت، انتظر لحظة...');
+                }
                 try {
                     const lang = /[\u0600-\u06FF]/.test(ttsText) ? 'ar' : 'en';
                     const audio = await generateTTS(ttsText, lang);
                     await sendVoiceNote(jid, audio, msg);
-                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
+                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.();
                     await react('✅');
                 } catch (e) {
+                    console.error('[TTS]', e.message);
                     await react('❌');
                     await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
                 }
