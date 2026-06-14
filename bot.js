@@ -2542,26 +2542,6 @@ async function processIncomingMessage(adaptedMsg) {
                 }
             }
 
-            // ── رسالة الفترة المجانية — تُرسل مرة واحدة فقط لكل مستخدم جديد غير VIP ──
-            if (!isAdmin && !isActiveVIP(sender) && !trialNotified[sender]) {
-                trialNotified[sender] = true;
-                saveData();
-                const rec = getDailyRecord(sender);
-                const msgLimit  = getUserDailyLimit(sender);
-                const imgLimit  = DAILY_IMG_LIMIT;
-                const ttsLimit  = DAILY_TTS_LIMIT;
-                await wa.sendText(jid,
-                        `🎉 *مرحباً بك في MedTerm!*\n\n` +
-                        `أنت الآن في *الفترة التجريبية المجانية* 🆓\n\n` +
-                        `📊 *رصيدك التجريبي:*\n` +
-                        `💬 الرسائل النصية: ${msgLimit - rec.messages} / ${msgLimit}\n` +
-                        `🖼️ الصور: ${imgLimit - rec.images} / ${imgLimit}\n` +
-                        `🔊 الرسائل الصوتية: ${ttsLimit - rec.tts} / ${ttsLimit}\n\n` +
-                        `⚠️ *ملاحظة:* هذا الرصيد للتجربة فقط ولا يتجدد تلقائياً.\n` +
-                        `للاستمرار بعد انتهاء الرصيد، تواصل معنا للاشتراك الشهري 👇\n` +
-                        `📲 wa.me/972593850520`
-                );
-            }
 
             // ============================================================
             // معالجة أنواع الرسائل
@@ -2639,10 +2619,10 @@ async function processIncomingMessage(adaptedMsg) {
                 }
                 await react('⏳');
                 try {
-                    const docMsg = message.documentMessage;
-                    const mime = docMsg?.mimetype || '';
+                    const docMsg   = message.documentMessage;
+                    const mime     = docMsg?.mimetype || '';
                     const fileName = docMsg?.fileName || 'ملف';
-                    const caption = body || '';
+                    const caption  = body || '';
 
                     // فقط PDF مدعوم
                     if (mime !== 'application/pdf') {
@@ -2656,8 +2636,8 @@ async function processIncomingMessage(adaptedMsg) {
                         return;
                     }
 
-                    const isVIPpdf = isAdmin || isActiveVIP(sender);
-                    const pdfMaxSize = isVIPpdf ? 20 * 1024 * 1024 : 1 * 1024 * 1024; // VIP: 20MB، مجاني: 1MB
+                    const isVIPpdf   = isAdmin || isActiveVIP(sender);
+                    const pdfMaxSize = isVIPpdf ? 20 * 1024 * 1024 : 5 * 1024 * 1024;
 
                     // تنزيل الملف
                     let buffer;
@@ -2672,83 +2652,91 @@ async function processIncomingMessage(adaptedMsg) {
                         return;
                     }
 
-                    // فحص الحجم بعد التنزيل (Cloud API لا يرسل الحجم في الـ webhook)
+                    // فحص الحجم بعد التنزيل
                     if (buffer.length > pdfMaxSize) {
                         await react('❌');
                         if (isVIPpdf) {
-                            await reply(`حجم الملف كبير جداً (${(buffer.length/1024/1024).toFixed(1)}MB).\nالحد الأقصى المسموح 20MB. 📄`);
+                            await reply(`حجم الملف كبير جداً (${(buffer.length/1024/1024).toFixed(1)}MB).\nالحد الأقصى 20MB. 📄`);
                         } else {
                             await reply(
                                 `⚠️ حجم الملف كبير جداً (${(buffer.length/1024/1024).toFixed(1)}MB).\n` +
-                                `الحد الأقصى للنسخة المجانية *1MB* فقط.\n\n` +
-                                `📌 للحصول على حد *غير محدود* اشترك بالنسخة المميزة:\n` +
+                                `الحد الأقصى للنسخة المجانية *5MB*.\n\n` +
+                                `📌 للحصول على حد *20MB* اشترك بالنسخة المميزة:\n` +
                                 `👤 wa.me/972593850520`
                             );
                         }
                         return;
                     }
 
-                    // فحص Magic Bytes — التحقق أن الملف PDF حقيقي
-                    if (!buffer || buffer.length < 4 || buffer.slice(0,4).toString('ascii') !== '%PDF') {
+                    // فحص Magic Bytes — PDF حقيقي
+                    if (buffer.length < 4 || buffer.slice(0,4).toString('ascii') !== '%PDF') {
                         await react('❌');
                         await reply('الملف ليس PDF حقيقياً، يرجى إرسال ملف PDF صحيح.');
                         return;
                     }
 
-                    // ── فحص الكاش أولاً (اسم + هاش المحتوى) ──
-                    const cacheKey  = pdfCacheKey(fileName, buffer);
-                    const cacheHit  = await pdfCacheGet(cacheKey);
+                    // ── فحص الكاش المشترك (بين كل المستخدمين) ──
+                    const cacheKey = pdfCacheKey(fileName, buffer);
+                    const cacheHit = await pdfCacheGet(cacheKey);
 
                     if (cacheHit) {
-                        // ✅ الملف موجود في الكاش — تحميل فوري بدون استخراج
-                        console.log(`[PDF] كاش موجود: ${cacheKey}`);
+                        // ✅ موجود في الكاش — تحميل فوري بدون استخراج
+                        console.log(`[PDF] كاش موجود (مشترك): ${cacheKey}`);
                         const { docText, pageCount } = cacheHit;
-                        const pages = []; // الصور غير محفوظة في الكاش، نستخدم النص
 
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
 
-                        userPdfPending[sender] = {
+                        // تفعيل وضع الملف مباشرة + حفظ السياق
+                        userPdfContext[sender] = {
                             fileName,
                             docText,
-                            pages,
-                            expiresAt: Date.now() + 5 * 60_000
+                            pages: null,   // الصور غير محفوظة في الكاش، نعتمد النص
+                            pageCount,
+                            loadedAt: Date.now()
                         };
+                        // مسح سياق المحادثة القديمة وبدء سياق جديد للملف
+                        userChats[sender] = [];
+
                         await react('📄');
                         await reply(
                             `📄 *"${fileName}"*\n` +
-                            `⚡ هذا الملف موجود مسبقاً في النظام (${pageCount} صفحة) — تم تحميله فوراً!\n\n` +
-                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
-                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
-                            `أو *لا* للمتابعة بشكل عادي`
+                            `⚡ هذا الملف محفوظ مسبقاً في النظام (${pageCount} صفحة) — تم تحميله فوراً!\n\n` +
+                            `✅ *وضع الملف مفعّل تلقائياً* — سأجيب على أسئلتك من هذا الملف.\n\n` +
+                            `💡 *يمكنك:*\n` +
+                            `• اسألني أي سؤال من الملف\n` +
+                            `• اكتب *صفحة [رقم]* لشرح صفحة معينة (مثال: صفحة 3)\n` +
+                            `• اكتب *ملخص* للحصول على ملخص الملف\n` +
+                            `• اكتب *خروج* للخروج من وضع الملف`
                         );
                         return;
                     }
 
                     // ── الملف جديد — استخراج كامل ──
-                    console.log(`[PDF] جاري تحويل "${fileName}" بـ mutool...`);
-                    // اسم مجلد عشوائي غير قابل للتنبؤ — لا يعتمد على مدخلات المستخدم (sender/fileName)
+                    await reply('⏳ جاري قراءة الملف واستخراج محتواه، انتظر لحظة...');
+                    console.log(`[PDF] استخراج جديد: "${fileName}"`);
+
                     const tmpDirName = `pdf_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
-                    const tmpDir = path.join(os.tmpdir(), tmpDirName);
+                    const tmpDir     = path.join(os.tmpdir(), tmpDirName);
                     await fs.promises.mkdir(tmpDir, { recursive: true });
+
                     try {
                         const pdfPath = path.join(tmpDir, 'input.pdf');
                         await fs.promises.writeFile(pdfPath, buffer);
 
+                        // تحويل الصفحات لصور بـ mutool
                         await new Promise((resolve, reject) => {
                             execFile('mutool', [
-                                'convert',
-                                '-o', path.join(tmpDir, 'page-%d.jpg'),
-                                '-O', 'resolution=150',
-                                pdfPath
-                            ], { timeout: 30_000 }, (err, _so, se) => {
+                                'convert', '-o', path.join(tmpDir, 'page-%d.jpg'),
+                                '-O', 'resolution=150', pdfPath
+                            ], { timeout: 60_000 }, (err, _so, se) => {
                                 if (err) return reject(new Error(`mutool: ${se || err.message}`));
                                 resolve();
                             });
                         });
 
                         const dirEntries = await fs.promises.readdir(tmpDir);
-                        const pageFiles = dirEntries
+                        const pageFiles  = dirEntries
                             .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
                             .sort();
 
@@ -2759,34 +2747,42 @@ async function processIncomingMessage(adaptedMsg) {
                             pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
                         );
 
-                        // استخراج النص أيضاً كـ fallback للأسئلة النصية
+                        // استخراج النص
                         let docText = '';
                         try {
                             const parsed = await pdfParse(buffer);
                             docText = (parsed.text || '').trim();
                         } catch (_) {}
 
-                        // ── حفظ في الكاش بعد نجاح الاستخراج ──
+                        // ── حفظ في الكاش المشترك ──
                         if (docText) await pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
 
-                        // خصم الحد بعد نجاح التحويل فقط (لا نظلم المستخدم عند الفشل)
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
 
-                        userPdfPending[sender] = {
+                        // تفعيل وضع الملف مباشرة + حفظ السياق
+                        userPdfContext[sender] = {
                             fileName,
                             docText,
                             pages,
-                            expiresAt: Date.now() + 5 * 60_000
+                            pageCount: pageFiles.length,
+                            loadedAt: Date.now()
                         };
+                        // مسح سياق المحادثة القديمة وبدء جديد للملف
+                        userChats[sender] = [];
+
                         await react('📄');
                         await reply(
                             `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
                             `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
-                            `هل تريد أن أجيبك من هذا الملف فقط؟\n` +
-                            `أرسل *نعم* للدخول لوضع الملف 📑\n` +
-                            `أو *لا* للمتابعة بشكل عادي`
+                            `✅ *وضع الملف مفعّل تلقائياً* — سأجيب على أسئلتك من هذا الملف.\n\n` +
+                            `💡 *يمكنك:*\n` +
+                            `• اسألني أي سؤال من الملف\n` +
+                            `• اكتب *صفحة [رقم]* لشرح صفحة معينة (مثال: صفحة 3)\n` +
+                            `• اكتب *ملخص* للحصول على ملخص الملف\n` +
+                            `• اكتب *خروج* للخروج من وضع الملف`
                         );
+
                     } catch (imgErr) {
                         console.error('[PDF]', imgErr.message);
                         await react('❌');
@@ -2899,40 +2895,15 @@ async function processIncomingMessage(adaptedMsg) {
             const bodyTrimmed = body.trim();
 
             // ============================================================
-            // وضع PDF — إذا كان المستخدم في انتظار إذن PDF
-            // ============================================================
-            if (userPdfPending[sender] && Date.now() < userPdfPending[sender].expiresAt) {
-                const isYesPdf = /^(نعم|yes|أيوه|اه|ايوه|yep|yeah)$/i.test(bodyTrimmed);
-                const isNoPdf  = /^(لا|no|لأ)$/i.test(bodyTrimmed);
-                if (isYesPdf) {
-                    userPdfContext[sender] = { fileName: userPdfPending[sender].fileName, docText: userPdfPending[sender].docText, pages: userPdfPending[sender].pages || null, loadedAt: Date.now() };
-                    delete userPdfPending[sender];
-                    await react('📑');
-                    await reply(
-                        `📑 *تم تفعيل وضع الملف*\n"${userPdfContext[sender].fileName}"\n\n` +
-                        `الآن سأجيب على أسئلتك من هذا الملف فقط.\n` +
-                        `اكتب *خروج* للخروج من وضع الملف\n` +
-                        `اكتب *قائمة* للرجوع للقائمة الرئيسية`
-                    );
-                    return;
-                }
-                if (isNoPdf) {
-                    delete userPdfPending[sender];
-                    await react('✅');
-                    await reply('حسناً، سأتابع معك بشكل عادي. 👍');
-                    return;
-                }
-            }
-
-            // ============================================================
-            // وضع PDF النشط — الإجابة من الملف فقط
+            // وضع PDF النشط — الإجابة من الملف مع حفظ السياق
             // ============================================================
             if (userPdfContext[sender]) {
-                const { fileName, docText, pages } = userPdfContext[sender];
+                const { fileName, docText, pages, pageCount } = userPdfContext[sender];
 
                 // خروج من وضع الملف
                 if (/^خروج$/i.test(bodyTrimmed)) {
                     delete userPdfContext[sender];
+                    userChats[sender] = [];
                     await react('✅');
                     await reply('تم الخروج من وضع الملف. يمكنك الآن إرسال أي سؤال بشكل عادي. 👋');
                     return;
@@ -2955,16 +2926,106 @@ async function processIncomingMessage(adaptedMsg) {
 
                 await react('⏳');
                 try {
+                    // ── طلب شرح صفحة معينة — "صفحة 3" أو "page 3" ──
+                    const pageMatch = bodyTrimmed.match(/^(?:صفحة|page)\s*(\d+)$/i);
+                    if (pageMatch) {
+                        const pageNum = parseInt(pageMatch[1], 10);
+                        const totalPages = pageCount || (pages ? pages.length : 0);
+
+                        if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) {
+                            await react('❌');
+                            await reply(`❌ رقم الصفحة غير صحيح.\nالملف يحتوي على ${totalPages} صفحة فقط.`);
+                            return;
+                        }
+
+                        let res;
+                        if (pages && pages[pageNum - 1]) {
+                            // شرح الصفحة بالصورة (أدق)
+                            res = await callMistral({
+                                model: 'pixtral-large-latest',
+                                messages: [
+                                    { role: 'system', content: `أنت مساعد ذكي يشرح محتوى صفحات الملف: "${fileName}".\nاشرح كل ما في الصفحة بشكل واضح ومنظم باللغة العربية.` },
+                                    { role: 'user', content: [
+                                        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${pages[pageNum - 1]}` } },
+                                        { type: 'text', text: `اشرح محتوى هذه الصفحة (${pageNum}) بالتفصيل.` }
+                                    ]}
+                                ],
+                                max_tokens: 2000,
+                                temperature: 0.3
+                            });
+                        } else {
+                            // شرح من النص
+                            const charsPerPage = Math.ceil(docText.length / (totalPages || 1));
+                            const start = (pageNum - 1) * charsPerPage;
+                            const pageText = docText.slice(start, start + charsPerPage);
+                            res = await askAI([
+                                { role: 'system', content: `أنت مساعد ذكي يشرح محتوى صفحات الملف: "${fileName}". اشرح بوضوح باللغة العربية.` },
+                                { role: 'user', content: `اشرح محتوى الصفحة ${pageNum}:\n${pageText}` }
+                            ]);
+                        }
+
+                        // حفظ في سياق المحادثة
+                        if (!userChats[sender]) userChats[sender] = [];
+                        userChats[sender].push({ role: 'user',      content: `[طلب شرح صفحة ${pageNum} من "${fileName}"]` });
+                        userChats[sender].push({ role: 'assistant', content: res });
+                        if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
+
+                        await reply(`📄 *شرح الصفحة ${pageNum} من "${fileName}":*\n\n${res}`);
+                        await react('✅');
+                        return;
+                    }
+
+                    // ── طلب ملخص الملف ──
+                    if (/^ملخص$|^summarize$|^summary$/i.test(bodyTrimmed)) {
+                        let res;
+                        if (pages && pages.length > 0) {
+                            // نأخذ أول 8 صفحات كعينة للملخص
+                            const samplePages = pages.slice(0, 8);
+                            const imageContents = samplePages.map(b64 => ({
+                                type: 'image_url',
+                                image_url: { url: `data:image/jpeg;base64,${b64}` }
+                            }));
+                            res = await callMistral({
+                                model: 'pixtral-large-latest',
+                                messages: [
+                                    { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً ومنظماً للملف: "${fileName}" باللغة العربية.` },
+                                    { role: 'user', content: [...imageContents, { type: 'text', text: `قدّم ملخصاً شاملاً لهذا الملف (${pageCount} صفحة).` }] }
+                                ],
+                                max_tokens: 2500,
+                                temperature: 0.3
+                            });
+                        } else {
+                            res = await askAI([
+                                { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً للملف: "${fileName}" باللغة العربية.` },
+                                { role: 'user', content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nقدّم ملخصاً شاملاً ومنظماً.` }
+                            ]);
+                        }
+
+                        if (!userChats[sender]) userChats[sender] = [];
+                        userChats[sender].push({ role: 'user',      content: `[طلب ملخص الملف: "${fileName}"]` });
+                        userChats[sender].push({ role: 'assistant', content: res });
+                        if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
+
+                        await reply(`📋 *ملخص "${fileName}":*\n\n${res}`);
+                        await react('✅');
+                        return;
+                    }
+
+                    // ── سؤال عام أو طلب حل مسألة من الملف ──
                     const pdfSystemPrompt =
-                        `أنت مساعد ذكي يساعد المستخدم على فهم محتوى الملف: "${fileName}".\n` +
-                        `أسلوبك طبيعي ومرن — اشرح وحلّل وأجب كما يفهم الإنسان، لا تقتبس حرفياً.\n` +
+                        `أنت مساعد ذكي متخصص في تحليل محتوى الملف: "${fileName}".\n` +
+                        `أسلوبك طبيعي ومرن — اشرح وحلّل وأجب كما يفهم الإنسان.\n` +
                         `اللغة: أجب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).\n` +
-                        `السياق: ردودك مبنية على محتوى الملف — النصوص والصور معاً.\n` +
+                        `إذا طُلب منك حل سؤال أو مسألة موجودة في الملف: اشرح الحل خطوة بخطوة.\n` +
                         `إذا سأل عن شيء غير موجود في الملف: أخبره بلطف.`;
+
+                    // بناء سياق المحادثة السابقة مع الملف
+                    if (!userChats[sender]) userChats[sender] = [];
+                    const history = userChats[sender].slice(-10); // آخر 10 رسائل للسياق
 
                     let res;
                     if (pages && pages.length > 0) {
-                        // استخدام الصور للإجابة (يقرأ النص والصور معاً)
+                        // استخدام الصور (يقرأ النص والرسومات معاً)
                         const imageContents = pages.map(b64 => ({
                             type: 'image_url',
                             image_url: { url: `data:image/jpeg;base64,${b64}` }
@@ -2973,6 +3034,9 @@ async function processIncomingMessage(adaptedMsg) {
                             model: 'pixtral-large-latest',
                             messages: [
                                 { role: 'system', content: pdfSystemPrompt },
+                                // إضافة السياق السابق
+                                ...history,
+                                // السؤال الحالي مع صور الملف
                                 { role: 'user', content: [...imageContents, { type: 'text', text: body }] }
                             ],
                             max_tokens: 2500,
@@ -2982,9 +3046,16 @@ async function processIncomingMessage(adaptedMsg) {
                         // fallback: نص فقط
                         res = await askAI([
                             { role: 'system', content: pdfSystemPrompt },
-                            { role: 'user',   content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nسؤال المستخدم: ${body}` }
+                            ...history,
+                            { role: 'user', content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nسؤال المستخدم: ${body}` }
                         ]);
                     }
+
+                    // حفظ في سياق المحادثة
+                    userChats[sender].push({ role: 'user',      content: body });
+                    userChats[sender].push({ role: 'assistant', content: res });
+                    if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
+
                     await reply(res);
                     await react('✅');
                 } catch (e) {
