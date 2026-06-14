@@ -18,7 +18,7 @@ if (!MISTRAL_API_KEY) {
     console.error('❌ خطأ فادح: لم يتم تعيين MISTRAL_API_KEY في .env');
     process.exit(1);
 }
-const ADMIN_NUMBER    = process.env.ADMIN_NUMBER || '972593850520';   // بدون + أو @
+const ADMIN_NUMBER    = (process.env.ADMIN_NUMBER || '972593850520').trim().replace(/\+/g, '');
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
 const WEB_PORT        = process.env.PORT || 8080;
@@ -56,10 +56,17 @@ function isValidSession(req) {
     return true;
 }
 function parseCookie(str) {
-    return Object.fromEntries(
-        str.split(';').map(c => c.trim().split('=').map(p => decodeURIComponent(p.trim())))
-            .filter(p => p.length === 2)
-    );
+    const result = {};
+    for (const part of str.split(';')) {
+        const idx = part.indexOf('=');
+        if (idx < 1) continue;
+        try {
+            const key = decodeURIComponent(part.slice(0, idx).trim());
+            const val = decodeURIComponent(part.slice(idx + 1).trim());
+            if (key) result[key] = val;
+        } catch (_) {}
+    }
+    return result;
 }
 // تنظيف sessions منتهية كل ساعة
 setInterval(() => {
@@ -617,10 +624,11 @@ async function sendVoiceNote(jid, audioBuffer, quotedMsg) {
 setInterval(() => {
     const now = Date.now();
     for (const k of Object.keys(userTTSPending)) {
-        if (now > (userTTSPending[k].expiresAt || 0)) delete userTTSPending[k];
+        if (now > (userTTSPending[k]?.expiresAt || 0)) delete userTTSPending[k];
     }
+    // userPdfPending لا يُستخدم بعد التحسينات (الملف يُفعّل مباشرة) — نظّفه احتياطياً
     for (const k of Object.keys(userPdfPending)) {
-        if (now > (userPdfPending[k].expiresAt || 0)) delete userPdfPending[k];
+        if (now > (userPdfPending[k]?.expiresAt || 0)) delete userPdfPending[k];
     }
 }, 10 * 60_000);
 
@@ -834,36 +842,121 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
     try {
         const mime = mimeType || 'image/jpeg';
         const hasQuestion = userQuestion && userQuestion.trim().length > 0;
+        const q = (userQuestion || '').toLowerCase();
 
-        // السيستم برومت العام — يقبل أي صورة بدون قيود
-        const systemToUse = getSystemPrompt();
+        // ── كشف نوع الطلب لاختيار الـ prompt المناسب ──
+        const wantsTextExtract = !hasQuestion ||
+            /اقرأ|استخرج|انسخ|اكتب|نص|كلام|مكتوب|نصوص|كلمات|read|extract|ocr|text|copy|transcrib/i.test(q);
 
-        // إذا ما في سؤال: وصف عام شامل
-        const questionText = hasQuestion
-            ? userQuestion
-            : `حلل هذه الصورة بالتفصيل الكامل:
-1. اشرح ما تراه في الصورة بدقة
-2. إذا فيها نصوص أو أرقام: اقرأها كاملاً كما هي
-3. إذا فيها جدول أو بيانات: اعرضها منظمة
-4. إذا كانت صورة طبية أو أشعة: حللها طبياً بالتفصيل
-5. أجب على أي سؤال يتعلق بمحتوى الصورة`;
+        const wantsMedical =
+            /أشعة|xray|x-ray|mri|رنين|ct|سكانر|تحليل دم|فحص دم|تقرير طبي|مختبر|lab|blood|صورة طبية|صورة صدر|ecg|ekg|echo|سونار|ultrasound|نتائج|results/i.test(q) ||
+            isMedicalImage(userQuestion || '');
 
-        const prompt = userName ? `اسم المستخدم: ${userName}\n${questionText}` : questionText;
+        const wantsTable =
+            /جدول|table|بيانات|data|إحصاء|احصاء|أرقام|numbers|excel|spreadsheet/i.test(q);
+
+        // ── System Prompt مخصص لكل نوع ──
+        let systemPrompt;
+        let userPrompt;
+        let maxTok;
+
+        if (wantsTextExtract && !hasQuestion) {
+            // صورة بدون سؤال — استخراج شامل ودقيق
+            systemPrompt =
+                `أنت نظام OCR + تحليل صور متخصص وعالي الدقة.\n` +
+                `مهمتك الأساسية: قراءة كل نص في الصورة بدقة 100% كما هو مكتوب.\n` +
+                `قواعد صارمة:\n` +
+                `• اقرأ كل حرف وكلمة ورقم كما هي — لا تغيّر أي شيء\n` +
+                `• اقرأ النصوص العربية من اليمين لليسار بدقة\n` +
+                `• اقرأ الأرقام والتواريخ والرموز كما هي تماماً\n` +
+                `• إذا في جداول: حافظ على هيكلها\n` +
+                `• بعد النص: أضف تحليلاً مختصراً لما تعنيه الصورة`;
+            userPrompt = `اقرأ كل النصوص في هذه الصورة بدقة كاملة ثم حللها.`;
+            maxTok = 2000;
+
+        } else if (wantsMedical) {
+            // صورة طبية — تحليل طبي متخصص
+            systemPrompt =
+                `أنت طبيب متخصص وخبير في تحليل الصور الطبية.\n` +
+                `اتبع هذا الترتيب:\n` +
+                `1. نوع الصورة/الفحص\n` +
+                `2. قراءة كل الأرقام والقيم والنصوص الموجودة بدقة\n` +
+                `3. مقارنة القيم بالمعدلات الطبيعية (اذكر المعدل الطبيعي لكل قيمة)\n` +
+                `4. الملاحظات السريرية المهمة\n` +
+                `5. التوصية المقترحة\n` +
+                `قواعد:\n` +
+                `• اقرأ الأرقام بدقة 100% — خطأ في رقم = خطأ طبي\n` +
+                `• وضّح بوضوح: هل القيمة طبيعية ✅ أم غير طبيعية ⚠️\n` +
+                `• لا جداول، نص طبيعي فقط\n` +
+                `• اختم دائماً بـ: تنبيه: راجع طبيبك للتشخيص النهائي`;
+            userPrompt = hasQuestion
+                ? userQuestion
+                : `حلّل هذه الصورة الطبية بالتفصيل الكامل مع قراءة كل القيم والأرقام بدقة.`;
+            maxTok = 2000;
+
+        } else if (wantsTable) {
+            // جدول أو بيانات — قراءة منظمة
+            systemPrompt =
+                `أنت خبير في قراءة الجداول والبيانات من الصور.\n` +
+                `قواعد:\n` +
+                `• اقرأ كل خلية في الجدول بدقة كاملة\n` +
+                `• حافظ على ترتيب الصفوف والأعمدة\n` +
+                `• اقرأ الأرقام والنصوص كما هي بدون تغيير\n` +
+                `• بعد الجدول: أضف ملاحظة مختصرة عن أهم البيانات`;
+            userPrompt = hasQuestion
+                ? userQuestion
+                : `اقرأ الجدول/البيانات في هذه الصورة بدقة كاملة.`;
+            maxTok = 2000;
+
+        } else if (hasQuestion) {
+            // سؤال محدد على الصورة — أجب على السؤال مع استخراج النص المرتبط
+            systemPrompt =
+                `أنت مساعد ذكي متخصص في تحليل الصور والإجابة على الأسئلة المتعلقة بها.\n` +
+                `قواعد:\n` +
+                `• اقرأ النصوص والأرقام في الصورة بدقة كاملة\n` +
+                `• أجب على سؤال المستخدم مباشرة بناءً على ما تراه\n` +
+                `• إذا السؤال يتعلق بنص في الصورة: اقتبسه بدقة\n` +
+                `• لا تستنتج ما لا تراه فعلاً في الصورة\n` +
+                `• اللغة: نفس لغة السؤال`;
+            userPrompt = hasQuestion ? userQuestion : '';
+            maxTok = 1500;
+
+        } else {
+            // صورة عادية بدون سؤال — وصف شامل
+            systemPrompt =
+                `أنت مساعد ذكي متخصص في وصف وتحليل الصور.\n` +
+                `قواعد:\n` +
+                `• صف ما تراه في الصورة بشكل كامل ودقيق\n` +
+                `• إذا في نصوص أو أرقام: اقرأها بدقة كما هي\n` +
+                `• إذا في أشخاص أو أشياء: صفها\n` +
+                `• إذا في مشهد أو مكان: اشرحه\n` +
+                `• الرد باللغة العربية`;
+            userPrompt = `صف هذه الصورة بالتفصيل الكامل.`;
+            maxTok = 1500;
+        }
+
+        const namePrefix = userName ? `(المستخدم: ${userName})\n` : '';
 
         return await callMistral({
             model: 'pixtral-large-latest',
             messages: [
-                { role: 'system', content: systemToUse },
+                { role: 'system', content: systemPrompt },
                 {
                     role: 'user',
                     content: [
-                        { type: 'image_url', image_url: { url: `data:${mime};base64,${base64Image}` } },
-                        { type: 'text', text: prompt }
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:${mime};base64,${base64Image}`,
+                                detail: 'high'  // ✅ دقة عالية — أهم تعديل لاستخراج النص بدقة
+                            }
+                        },
+                        { type: 'text', text: namePrefix + userPrompt }
                     ]
                 }
             ],
-            max_tokens: 1500, // ✅ تقليص من 2500 → 1500 (كافٍ لتحليل الصور)
-            temperature: 0.3
+            max_tokens: maxTok,
+            temperature: 0.1  // ✅ temperature منخفضة جداً = دقة أعلى في قراءة النصوص
         });
 
     } catch (e) {
@@ -2349,11 +2442,90 @@ setInterval(loadData,30000);
     tryListen(WEB_PORT);
 }
 
-// ============================================================
-// WELCOME MESSAGE
-// ============================================================
+// دالة تقسيم الرسائل الطويلة — معرّفة خارج الـ loop لتجنب إعادة التعريف مع كل رسالة
+const WA_CHUNK_LIMIT = 3800;
+function splitMessage(text) {
+    if (!text || text.length <= WA_CHUNK_LIMIT) return [text || ''];
+    const chunks = [];
+    const lines = text.split('\n');
+    let current = '';
+    for (const line of lines) {
+        const candidate = current ? current + '\n' + line : line;
+        if (candidate.length > WA_CHUNK_LIMIT) {
+            if (current.trim()) chunks.push(current.trim());
+            current = line;
+        } else {
+            current = candidate;
+        }
+    }
+    if (current.trim()) chunks.push(current.trim());
+    return chunks.filter(c => c.length > 0);
+}
+
+
 function buildWelcome(name) {
     return buildModeMenu(name);
+}
+
+// ============================================================
+// TRANSLATION — Google Translate (مجاني) مع Fallback تلقائي لـ Mistral
+// 3 مراحل: Google → MyMemory → Mistral (fallback أخير)
+// ============================================================
+async function smartTranslate(text, targetLangCode) {
+    // ── المرحلة 1: Google Translate ──
+    try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLangCode}&dt=t&q=${encodeURIComponent(text)}`;
+        const res = await fetchWithTimeout(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+        }, 8_000);
+        if (res.ok) {
+            const data = await res.json();
+            const translated = data?.[0]?.filter(Boolean)?.map(item => item?.[0])?.filter(Boolean)?.join('') || '';
+            if (translated.trim()) {
+                console.log('[translate] Google ✅');
+                return { text: translated.trim(), source: 'google' };
+            }
+        }
+        throw new Error(`Google HTTP ${res.status}`);
+    } catch (e) {
+        console.warn('[translate] Google فشل:', e.message, '← جاري تجربة MyMemory...');
+    }
+
+    // ── المرحلة 2: MyMemory API ──
+    try {
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=auto|${targetLangCode}`;
+        const res = await fetchWithTimeout(url, {}, 8_000);
+        if (res.ok) {
+            const data = await res.json();
+            const translated = data?.responseData?.translatedText || '';
+            if (translated && !translated.startsWith('MYMEMORY') && translated.trim()) {
+                console.log('[translate] MyMemory ✅');
+                return { text: translated.trim(), source: 'mymemory' };
+            }
+        }
+        throw new Error(`MyMemory HTTP ${res.status}`);
+    } catch (e) {
+        console.warn('[translate] MyMemory فشل:', e.message, '← رجوع لـ Mistral...');
+    }
+
+    // ── المرحلة 3: Mistral AI (fallback أخير) ──
+    try {
+        const targetLangName = targetLangCode === 'ar' ? 'العربية' : 'English';
+        const translated = await callMistral({
+            model: 'mistral-small-latest',
+            messages: [
+                { role: 'system', content: `أنت مترجم محترف. ترجم النص إلى ${targetLangName}. أرسل الترجمة فقط بدون أي شرح.` },
+                { role: 'user', content: text }
+            ],
+            max_tokens: 500,
+            temperature: 0.3
+        });
+        console.log('[translate] Mistral ✅ (fallback)');
+        return { text: translated.trim(), source: 'mistral' };
+    } catch (e) {
+        console.error('[translate] Mistral فشل أيضاً:', e.message);
+        throw new Error('فشلت كل خدمات الترجمة');
+    }
 }
 
 // ============================================================
@@ -2403,30 +2575,11 @@ async function processIncomingMessage(adaptedMsg) {
             const sender = cleanNumber(
                 msg.key?.participant || (isGroup ? msg.key?.participant : jid)
             );
-            if (!sender) return;
+            if (!sender) continue;
 
             const isAdmin = sender === ADMIN_NUMBER;
             userChatLastSeen[sender] = Date.now(); // تحديث آخر نشاط
 
-            // تعريف reply و react أولاً — قبل أي كود يستخدمهما
-            const WA_CHUNK_LIMIT = 3800;
-            function splitMessage(text) {
-                if (text.length <= WA_CHUNK_LIMIT) return [text];
-                const chunks = [];
-                const lines = text.split('\n');
-                let current = '';
-                for (const line of lines) {
-                    const candidate = current ? current + '\n' + line : line;
-                    if (candidate.length > WA_CHUNK_LIMIT) {
-                        if (current.trim()) chunks.push(current.trim());
-                        current = line;
-                    } else {
-                        current = candidate;
-                    }
-                }
-                if (current.trim()) chunks.push(current.trim());
-                return chunks.filter(c => c.length > 0);
-            }
             const reply = async (text) => {
                 try {
                     const parts = splitMessage(text);
@@ -3176,81 +3329,6 @@ async function processIncomingMessage(adaptedMsg) {
                 }
                 return;
             }
-
-            // ============================================================
-// ============================================================
-// TRANSLATION — Google Translate (مجاني) مع Fallback تلقائي لـ Mistral
-// ============================================================
-// الترجمة تمر بـ 3 مراحل:
-// 1. Google Translate غير رسمي (مجاني — صفر استهلاك)
-// 2. لو فشل → MyMemory API (مجاني رسمي — صفر استهلاك)
-// 3. لو فشل → Mistral AI (استهلاك عادي كـ fallback أخير)
-async function smartTranslate(text, targetLangCode) {
-    // ── المرحلة 1: Google Translate ──
-    try {
-        const sl = 'auto'; // كشف اللغة تلقائياً
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLangCode}&dt=t&q=${encodeURIComponent(text)}`;
-        const res = await fetchWithTimeout(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-        }, 8_000); // timeout 8 ثوانٍ
-        if (res.ok) {
-            const data = await res.json();
-            // استخراج النص من هيكل Google المتداخل [[["translated","original"...]],...]
-            const translated = data?.[0]
-                ?.filter(Boolean)
-                ?.map(item => item?.[0])
-                ?.filter(Boolean)
-                ?.join('') || '';
-            if (translated && translated.trim()) {
-                console.log('[translate] Google ✅');
-                return { text: translated.trim(), source: 'google' };
-            }
-        }
-        throw new Error(`Google HTTP ${res.status}`);
-    } catch (e) {
-        console.warn('[translate] Google فشل:', e.message, '← جاري تجربة MyMemory...');
-    }
-
-    // ── المرحلة 2: MyMemory API (fallback أول) ──
-    try {
-        const langPair = `auto|${targetLangCode}`;
-        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
-        const res = await fetchWithTimeout(url, {}, 8_000);
-        if (res.ok) {
-            const data = await res.json();
-            const translated = data?.responseData?.translatedText || '';
-            // MyMemory يعيد خطأ كنص أحياناً — نتجاهل لو بدأ بـ MYMEMORY
-            if (translated && !translated.startsWith('MYMEMORY') && translated.trim()) {
-                console.log('[translate] MyMemory ✅');
-                return { text: translated.trim(), source: 'mymemory' };
-            }
-        }
-        throw new Error(`MyMemory HTTP ${res.status}`);
-    } catch (e) {
-        console.warn('[translate] MyMemory فشل:', e.message, '← رجوع لـ Mistral...');
-    }
-
-    // ── المرحلة 3: Mistral AI (fallback أخير — استهلاك عادي) ──
-    try {
-        const targetLangName = targetLangCode === 'ar' ? 'العربية' : 'English';
-        const translated = await callMistral({
-            model: 'mistral-small-latest',
-            messages: [
-                { role: 'system', content: `أنت مترجم محترف. ترجم النص إلى ${targetLangName}. أرسل الترجمة فقط بدون أي شرح.` },
-                { role: 'user', content: text }
-            ],
-            max_tokens: 500,
-            temperature: 0.3
-        });
-        console.log('[translate] Mistral ✅ (fallback)');
-        return { text: translated.trim(), source: 'mistral' };
-    } catch (e) {
-        console.error('[translate] Mistral فشل أيضاً:', e.message);
-        throw new Error('فشلت كل خدمات الترجمة');
-    }
-}
 
             // كشف طلب الترجمة: "ترجم [نص]" — يرسل الترجمة + صوت تلقائياً
             // ============================================================
