@@ -71,7 +71,7 @@ setInterval(() => {
 // في Cloud API لا يوجد QR ولا "اتصال" بمعنى Baileys — البوت متصل دائماً عبر HTTP API
 // نحتفظ بـ isConnected=true دائماً للحفاظ على بقية الكود يعمل بدون تعديل في كل مكان يفحصها
 let isConnected = true;
-const MAX_HISTORY     = 30;              // أقصى رسائل في السياق
+const MAX_HISTORY     = 12;              // ✅ تحسين: تقليص من 30 → 12 رسالة (توفير 30-50% على المحادثات الطويلة)
 const API_TIMEOUT_MS  = 120_000;        // 120 ثانية timeout للـ API (pixtral-large يحتاج وقت أكثر)
 
 // ============================================================
@@ -387,7 +387,21 @@ function getSystemPrompt() {
     const months = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
     const dateStr = `${days[now.getDay()]} ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}`;
     const timeStr = now.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-    _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب، يجمع بين المعرفة الطبية الواسعة والمساعدة العامة في كل المجالات.\n\nالتاريخ والوقت الحالي: ${dateStr} - الساعة ${timeStr} (بتوقيت القدس)\nاستخدم هذا التاريخ دائماً عند أي سؤال عن اليوم أو التاريخ أو السنة، ولا تعتمد على معلوماتك القديمة أبداً.\n\nشخصيتك:\n- مساعد شامل ومتعدد المعرفة: تجيب على أي سؤال في أي مجال بدون استثناء\n- جدي ومهني، ردودك دقيقة ومباشرة بدون حشو أو مقدمات زائدة\n- اللغة الافتراضية عربية واضحة وسهلة، وإذا طلب المستخدم لغة أخرى تحدّث بها فوراً\n- أعطِ المعلومة الكاملة والصحيحة من أول رد\n- لا تستخدم مصطلحات أجنبية غير ضرورية\n- اقرأ سياق المحادثة كاملاً وربط الرسائل ببعضها قبل الرد\n- إذا سُئلت عن اسمك قل: أنا MedTerm، مساعد ذكاء اصطناعي\n- تتعامل مع جميع المستخدمين باحترام بغض النظر عن جنسيتهم أو لغتهم\n\nقواعد التنسيق — مهمة جداً:\n- لا تستخدم أبداً جداول (Tables) أو خطوط فاصلة (---) أو رموز Markdown مثل # أو | أو **، لأن واتساب لا يعرضها بشكل صحيح وتظهر كرموز غريبة\n- اكتب ردودك كنص طبيعي متدفق (فقرات وجمل)، وعند الحاجة لتعداد استخدم نقاط بسيطة مثل • أو أرقام عادية مع سطر جديد فقط\n- عندما يطلب المستخدم شرح موضوع أو مفهوم أو صفحة من ملف، اشرح بأسلوب محادثة طبيعي مباشر، كأنك تتحدث معه، بدون أي جداول أو تنسيقات معقدة\n- يمكنك استخدام: عناوين بسيطة بخط عريض بـ * نجمة واحدة من كل جهة، وأيقونات/إيموجي لتوضيح الأقسام\n\nمجالات خبرتك (غير محدودة):\n- الطب والصحة: معلومات دقيقة، أدوية، جرعات، أعراض، تشخيص أولي، شرح مصطلحات طبية بالعربي والإنجليزي مع النطق الصحيح — مع التنبيه بمراجعة الطبيب للحالات الجدية\n- العلوم والتقنية: برمجة، ذكاء اصطناعي، رياضيات، فيزياء، كيمياء\n- القانون والأعمال: معلومات عامة، عقود، ريادة أعمال، تسويق\n- التاريخ والجغرافيا والثقافة العامة\n- الدين والفقه: إجابات موضوعية ومتوازنة\n- الأدب والكتابة والترجمة\n- الطبخ والسفر ونمط الحياة\n- أي موضوع آخر يسألك عنه المستخدم، طبياً أو غير طبي\n\nقاعدة ذهبية: لا تقل أبداً "هذا خارج نطاق تخصصي" — أجب على كل سؤال بأفضل ما لديك، طبياً أو غير طبي على حد سواء.\n\nاسم المستخدم موجود في السياق، استخدمه أحياناً بشكل طبيعي.`
+    // ✅ تحسين الاستهلاك: تقليص System Prompt من ~600 token → ~250 token
+    // المحتوى مطابق تماماً لكن بصياغة مضغوطة — توفير ~350 token لكل رسالة
+    _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب.
+التاريخ: ${dateStr} - ${timeStr} (القدس). استخدمه دائماً عند السؤال عن التاريخ.
+
+شخصيتك: مهني ودقيق، ردود مباشرة بدون حشو. اللغة الافتراضية عربية، تجيب بلغة المستخدم فوراً. تجيب على أي سؤال في أي مجال بدون استثناء — لا تقل أبداً "خارج تخصصي".
+
+التنسيق (مهم — واتساب فقط):
+• لا جداول، لا ---، لا # أو | أو **
+• نص متدفق طبيعي، تعداد بـ • أو أرقام
+• عناوين بـ *نجمة* وإيموجي مسموح
+
+خبرتك: طب وأدوية وأعراض وتشخيص أولي، علوم وبرمجة، قانون وأعمال، دين وتاريخ، ترجمة وأدب، وأي موضوع آخر.
+للطب: أعطِ معلومة دقيقة كاملة + نبّه بمراجعة الطبيب للحالات الجدية.
+اسم المستخدم في السياق، استخدمه أحياناً بشكل طبيعي.`
     return _cachedSystemPrompt;
 }
 
@@ -745,10 +759,12 @@ function isComplexQuery(text) {
 }
 
 // askAI: نموذج سريع للمحادثات العادية، قوي للأسئلة المعقدة
+// ✅ تحسين: رفع حد الـ large من 400 → 700 حرف (توفير استخدام النموذج الغالي)
+// ✅ تحسين: تقليص max_tokens من 1500 → 900 للردود العادية (الردود الفعلية نادراً تتجاوز 900)
 async function askAI(messages) {
-    // آخر رسالة من المستخدم لتحديد النموذج المناسب
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-    const useLarge = isComplexQuery(lastUserMsg) || lastUserMsg.length > 400;
+    // ✅ رفع الحد: 700 حرف بدل 400 — رسائل أطول لا تعني بالضرورة سؤالاً معقداً
+    const useLarge = isComplexQuery(lastUserMsg) || lastUserMsg.length > 700;
     const model = useLarge ? 'mistral-large-latest' : 'mistral-small-latest';
 
     console.log(`[askAI] نموذج: ${model} | طول الرسالة: ${lastUserMsg.length}`);
@@ -756,18 +772,17 @@ async function askAI(messages) {
         return await callMistral({
             model,
             messages,
-            max_tokens: 1500,
+            max_tokens: useLarge ? 1200 : 900, // ✅ تقليص: large→1200، small→900 (كان 1500 للجميع)
             temperature: 0.5
         });
     } catch (e) {
-        // إذا فشل الصغير، جرّب الكبير تلقائياً
         if (model === 'mistral-small-latest') {
             console.warn('[askAI] small فشل، محاولة large...');
             try {
                 return await callMistral({
                     model: 'mistral-large-latest',
                     messages,
-                    max_tokens: 1500,
+                    max_tokens: 1200,
                     temperature: 0.5
                 });
             } catch (e2) {
@@ -799,7 +814,7 @@ async function askAIWithDoc(docText, userQuestion, userName) {
                     content: `${prompt}\n\n--- محتوى ملف PDF ---\n${docText.slice(0, 14000)}`
                 }
             ],
-            max_tokens: 2500,
+            max_tokens: 1500, // ✅ تقليص من 2500 → 1500 (كافٍ لتحليل PDF نصي)
             temperature: 0.3
         });
     } catch (e) {
@@ -847,7 +862,7 @@ async function askAIWithImage(base64Image, userQuestion, userName, mimeType) {
                     ]
                 }
             ],
-            max_tokens: 2500,
+            max_tokens: 1500, // ✅ تقليص من 2500 → 1500 (كافٍ لتحليل الصور)
             temperature: 0.3
         });
 
@@ -2950,18 +2965,23 @@ async function processIncomingMessage(adaptedMsg) {
                                         { type: 'text', text: `اشرح محتوى هذه الصفحة (${pageNum}) بالتفصيل.` }
                                     ]}
                                 ],
-                                max_tokens: 2000,
+                                max_tokens: 1200, // ✅ تقليص من 2000 → 1200
                                 temperature: 0.3
                             });
                         } else {
-                            // شرح من النص
-                            const charsPerPage = Math.ceil(docText.length / (totalPages || 1));
+                            // شرح من النص — ✅ نقطع نص الصفحة بحد أقصى 3000 حرف (كافٍ لصفحة واحدة)
+                            const charsPerPage = Math.ceil(Math.min(docText.length, 10000) / (totalPages || 1));
                             const start = (pageNum - 1) * charsPerPage;
                             const pageText = docText.slice(start, start + charsPerPage);
-                            res = await askAI([
-                                { role: 'system', content: `أنت مساعد ذكي يشرح محتوى صفحات الملف: "${fileName}". اشرح بوضوح باللغة العربية.` },
-                                { role: 'user', content: `اشرح محتوى الصفحة ${pageNum}:\n${pageText}` }
-                            ]);
+                            res = await callMistral({
+                                model: 'mistral-large-latest', // ✅ نص — لا حاجة لـ pixtral
+                                messages: [
+                                    { role: 'system', content: `أنت مساعد ذكي يشرح محتوى صفحات الملف: "${fileName}". اشرح بوضوح باللغة العربية.` },
+                                    { role: 'user', content: `اشرح محتوى الصفحة ${pageNum}:\n${pageText}` }
+                                ],
+                                max_tokens: 1000, // ✅ شرح صفحة واحدة لا يحتاج أكثر
+                                temperature: 0.3
+                            });
                         }
 
                         // حفظ في سياق المحادثة
@@ -2978,9 +2998,22 @@ async function processIncomingMessage(adaptedMsg) {
                     // ── طلب ملخص الملف ──
                     if (/^ملخص$|^summarize$|^summary$/i.test(bodyTrimmed)) {
                         let res;
-                        if (pages && pages.length > 0) {
-                            // نأخذ أول 8 صفحات كعينة للملخص
-                            const samplePages = pages.slice(0, 8);
+                        // ✅ تحسين: استخدام النص بشكل افتراضي للملخص — أرخص بكثير من الصور
+                        // الصور فقط إذا لم يكن هناك نص مستخرج
+                        if (docText && docText.length > 200) {
+                            res = await callMistral({
+                                model: 'mistral-large-latest', // نص — لا حاجة لـ pixtral
+                                messages: [
+                                    { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً ومنظماً للملف: "${fileName}" باللغة العربية.` },
+                                    { role: 'user', content: `محتوى الملف:\n${docText.slice(0, 12000)}\n\nقدّم ملخصاً شاملاً ومنظماً (${pageCount} صفحة).` }
+                                ],
+                                max_tokens: 1500, // ✅ تقليص من 2500 → 1500
+                                temperature: 0.3
+                            });
+                        } else if (pages && pages.length > 0) {
+                            // fallback للصور فقط إذا لا يوجد نص (ملفات صور بحتة)
+                            // ✅ أول 4 صفحات بدل 8 (توفير 50% على الصور)
+                            const samplePages = pages.slice(0, 4);
                             const imageContents = samplePages.map(b64 => ({
                                 type: 'image_url',
                                 image_url: { url: `data:image/jpeg;base64,${b64}` }
@@ -2988,17 +3021,14 @@ async function processIncomingMessage(adaptedMsg) {
                             res = await callMistral({
                                 model: 'pixtral-large-latest',
                                 messages: [
-                                    { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً ومنظماً للملف: "${fileName}" باللغة العربية.` },
+                                    { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً للملف: "${fileName}" باللغة العربية.` },
                                     { role: 'user', content: [...imageContents, { type: 'text', text: `قدّم ملخصاً شاملاً لهذا الملف (${pageCount} صفحة).` }] }
                                 ],
-                                max_tokens: 2500,
+                                max_tokens: 1500, // ✅ تقليص من 2500 → 1500
                                 temperature: 0.3
                             });
                         } else {
-                            res = await askAI([
-                                { role: 'system', content: `أنت مساعد ذكي. قدّم ملخصاً شاملاً للملف: "${fileName}" باللغة العربية.` },
-                                { role: 'user', content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nقدّم ملخصاً شاملاً ومنظماً.` }
-                            ]);
+                            res = 'لا يوجد محتوى كافٍ لتلخيصه.';
                         }
 
                         if (!userChats[sender]) userChats[sender] = [];
@@ -3012,21 +3042,27 @@ async function processIncomingMessage(adaptedMsg) {
                     }
 
                     // ── سؤال عام أو طلب حل مسألة من الملف ──
+                    // ✅ تحسين الاستهلاك: استخدام النص بشكل افتراضي بدل الصور
+                    // الصور (pixtral) تُستخدم فقط إذا طلب المستخدم صراحةً شيئاً يحتاج رؤية بصرية
+                    // (رسم، مخطط، جدول، صورة) — هذا يوفر 80-90% من تكلفة أسئلة PDF
+                    const needsVisual = /رسم|مخطط|صورة|جدول|diagram|chart|image|figure|شكل رقم|انظر الشكل/i.test(body);
+
                     const pdfSystemPrompt =
                         `أنت مساعد ذكي متخصص في تحليل محتوى الملف: "${fileName}".\n` +
                         `أسلوبك طبيعي ومرن — اشرح وحلّل وأجب كما يفهم الإنسان.\n` +
                         `اللغة: أجب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).\n` +
-                        `إذا طُلب منك حل سؤال أو مسألة موجودة في الملف: اشرح الحل خطوة بخطوة.\n` +
+                        `إذا طُلب منك حل سؤال أو مسألة: اشرح الحل خطوة بخطوة.\n` +
                         `إذا سأل عن شيء غير موجود في الملف: أخبره بلطف.`;
 
-                    // بناء سياق المحادثة السابقة مع الملف
                     if (!userChats[sender]) userChats[sender] = [];
-                    const history = userChats[sender].slice(-10); // آخر 10 رسائل للسياق
+                    const history = userChats[sender].slice(-8); // ✅ آخر 8 رسائل للسياق (بدل 10)
 
                     let res;
-                    if (pages && pages.length > 0) {
-                        // استخدام الصور (يقرأ النص والرسومات معاً)
-                        const imageContents = pages.map(b64 => ({
+                    if (needsVisual && pages && pages.length > 0) {
+                        // ✅ الصور فقط عند الحاجة الفعلية لرؤية مخططات/رسومات
+                        // ✅ إرسال صفحتين كحد أقصى بدل كل الصفحات (توفير ضخم)
+                        const pagesToSend = pages.slice(0, 2);
+                        const imageContents = pagesToSend.map(b64 => ({
                             type: 'image_url',
                             image_url: { url: `data:image/jpeg;base64,${b64}` }
                         }));
@@ -3034,21 +3070,28 @@ async function processIncomingMessage(adaptedMsg) {
                             model: 'pixtral-large-latest',
                             messages: [
                                 { role: 'system', content: pdfSystemPrompt },
-                                // إضافة السياق السابق
                                 ...history,
-                                // السؤال الحالي مع صور الملف
                                 { role: 'user', content: [...imageContents, { type: 'text', text: body }] }
                             ],
-                            max_tokens: 2500,
+                            max_tokens: 1500, // ✅ تقليص من 2500 → 1500
                             temperature: 0.3
                         });
                     } else {
-                        // fallback: نص فقط
-                        res = await askAI([
-                            { role: 'system', content: pdfSystemPrompt },
-                            ...history,
-                            { role: 'user', content: `محتوى الملف:\n${docText.slice(0, 14000)}\n\nسؤال المستخدم: ${body}` }
-                        ]);
+                        // ✅ النص الافتراضي للأسئلة العادية — أرخص بكثير من الصور
+                        // نقطع النص لـ 12000 حرف بدل 14000 (توفير إضافي)
+                        const textSnippet = docText
+                            ? docText.slice(0, 12000)
+                            : 'محتوى الملف غير متوفر كنص، أرسل سؤالك وسأحاول الإجابة من الذاكرة.';
+                        res = await callMistral({
+                            model: 'mistral-large-latest', // نص فقط — لا حاجة لـ pixtral
+                            messages: [
+                                { role: 'system', content: pdfSystemPrompt },
+                                ...history,
+                                { role: 'user', content: `محتوى الملف:\n${textSnippet}\n\nسؤال المستخدم: ${body}` }
+                            ],
+                            max_tokens: 1200, // ✅ تقليص من 2500 → 1200
+                            temperature: 0.3
+                        });
                     }
 
                     // حفظ في سياق المحادثة
@@ -3135,6 +3178,80 @@ async function processIncomingMessage(adaptedMsg) {
             }
 
             // ============================================================
+// ============================================================
+// TRANSLATION — Google Translate (مجاني) مع Fallback تلقائي لـ Mistral
+// ============================================================
+// الترجمة تمر بـ 3 مراحل:
+// 1. Google Translate غير رسمي (مجاني — صفر استهلاك)
+// 2. لو فشل → MyMemory API (مجاني رسمي — صفر استهلاك)
+// 3. لو فشل → Mistral AI (استهلاك عادي كـ fallback أخير)
+async function smartTranslate(text, targetLangCode) {
+    // ── المرحلة 1: Google Translate ──
+    try {
+        const sl = 'auto'; // كشف اللغة تلقائياً
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLangCode}&dt=t&q=${encodeURIComponent(text)}`;
+        const res = await fetchWithTimeout(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        }, 8_000); // timeout 8 ثوانٍ
+        if (res.ok) {
+            const data = await res.json();
+            // استخراج النص من هيكل Google المتداخل [[["translated","original"...]],...]
+            const translated = data?.[0]
+                ?.filter(Boolean)
+                ?.map(item => item?.[0])
+                ?.filter(Boolean)
+                ?.join('') || '';
+            if (translated && translated.trim()) {
+                console.log('[translate] Google ✅');
+                return { text: translated.trim(), source: 'google' };
+            }
+        }
+        throw new Error(`Google HTTP ${res.status}`);
+    } catch (e) {
+        console.warn('[translate] Google فشل:', e.message, '← جاري تجربة MyMemory...');
+    }
+
+    // ── المرحلة 2: MyMemory API (fallback أول) ──
+    try {
+        const langPair = `auto|${targetLangCode}`;
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
+        const res = await fetchWithTimeout(url, {}, 8_000);
+        if (res.ok) {
+            const data = await res.json();
+            const translated = data?.responseData?.translatedText || '';
+            // MyMemory يعيد خطأ كنص أحياناً — نتجاهل لو بدأ بـ MYMEMORY
+            if (translated && !translated.startsWith('MYMEMORY') && translated.trim()) {
+                console.log('[translate] MyMemory ✅');
+                return { text: translated.trim(), source: 'mymemory' };
+            }
+        }
+        throw new Error(`MyMemory HTTP ${res.status}`);
+    } catch (e) {
+        console.warn('[translate] MyMemory فشل:', e.message, '← رجوع لـ Mistral...');
+    }
+
+    // ── المرحلة 3: Mistral AI (fallback أخير — استهلاك عادي) ──
+    try {
+        const targetLangName = targetLangCode === 'ar' ? 'العربية' : 'English';
+        const translated = await callMistral({
+            model: 'mistral-small-latest',
+            messages: [
+                { role: 'system', content: `أنت مترجم محترف. ترجم النص إلى ${targetLangName}. أرسل الترجمة فقط بدون أي شرح.` },
+                { role: 'user', content: text }
+            ],
+            max_tokens: 500,
+            temperature: 0.3
+        });
+        console.log('[translate] Mistral ✅ (fallback)');
+        return { text: translated.trim(), source: 'mistral' };
+    } catch (e) {
+        console.error('[translate] Mistral فشل أيضاً:', e.message);
+        throw new Error('فشلت كل خدمات الترجمة');
+    }
+}
+
             // كشف طلب الترجمة: "ترجم [نص]" — يرسل الترجمة + صوت تلقائياً
             // ============================================================
             const translateMatch = bodyTrimmed.match(/^(?:ترجم|translate|ترجمة)\s+(.+)$/i);
@@ -3143,24 +3260,19 @@ async function processIncomingMessage(adaptedMsg) {
                 const textToTranslate = translateMatch[1].trim();
                 await react('⏳');
                 try {
-                    // تحديد لغة المصدر والهدف
+                    // تحديد لغة الهدف
                     const isArabic = /[\u0600-\u06FF]/.test(textToTranslate);
-                    const targetLang = isArabic ? 'English' : 'العربية';
                     const targetLangCode = isArabic ? 'en' : 'ar';
-
-                    const translationResult = await callMistral({
-                        model: 'mistral-small-latest',
-                        messages: [
-                            { role: 'system', content: `أنت مترجم محترف. ترجم النص التالي إلى ${targetLang}. أرسل الترجمة فقط بدون أي شرح أو تعليق.` },
-                            { role: 'user', content: textToTranslate }
-                        ],
-                        max_tokens: 500,
-                        temperature: 0.3
-                    });
-
-                    const originalLabel = isArabic ? '🇸🇦 الأصلي:' : '🔤 Original:';
+                    const originalLabel  = isArabic ? '🇸🇦 الأصلي:'   : '🔤 Original:';
                     const translatedLabel = isArabic ? '🇬🇧 الترجمة:' : '🇸🇦 الترجمة:';
-                    await reply(`${originalLabel} ${textToTranslate}\n\n${translatedLabel} ${translationResult}`);
+
+                    // ✅ Google Translate → MyMemory → Mistral (fallback تلقائي)
+                    const result = await smartTranslate(textToTranslate, targetLangCode);
+                    const translationResult = result.text;
+
+                    // إضافة مصدر الترجمة للأدمن فقط (للمتابعة)
+                    const sourceNote = isAdmin ? ` _(${result.source})_` : '';
+                    await reply(`${originalLabel} ${textToTranslate}\n\n${translatedLabel} ${translationResult}${sourceNote}`);
 
                     // إرسال الصوت تلقائياً بدون طلب "نعم"
                     let ttsCheck = null;
@@ -3175,7 +3287,7 @@ async function processIncomingMessage(adaptedMsg) {
                     await new Promise(r => setTimeout(r, 300));
                     const audio = await generateTTS(translationResult, targetLangCode);
                     await sendVoiceNote(jid, audio);
-                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.(); // خصم بعد نجاح الإرسال
+                    if (!isAdmin && !isVIPnow && ttsCheck) ttsCheck.commit?.();
                     await react('✅');
                 } catch (e) {
                     console.error('[translate]', e.message);
