@@ -80,14 +80,37 @@ async function sendReaction(to, messageId, emoji) {
 }
 
 // ------------------------------------------------------------
+// كشف نوع الصورة من الـ magic bytes
+// ------------------------------------------------------------
+function detectImageMime(buffer) {
+    if (!buffer || buffer.length < 4) return 'image/jpeg';
+    const head = buffer.slice(0, 4);
+    if (head[0] === 0xFF && head[1] === 0xD8) return 'image/jpeg';
+    if (head[0] === 0x89 && head[1] === 0x50) return 'image/png';
+    if (head[0] === 0x47 && head[1] === 0x49) return 'image/gif';
+    if (head[0] === 0x52 && head[1] === 0x49) return 'image/webp';
+    return 'image/jpeg'; // افتراضي
+}
+
+// ------------------------------------------------------------
 // إرسال صورة (image)
 // imageBuffer: Buffer للصورة | caption: نص اختياري
 // ------------------------------------------------------------
 async function sendImage(to, imageBuffer, caption = '') {
-    // الخطوة 1: رفع الصورة للحصول على media_id
-    const mediaId = await uploadMedia(imageBuffer, 'image/jpeg', 'image.jpg');
+    if (!imageBuffer || imageBuffer.length < 100) {
+        throw new Error('الصورة فارغة أو صغيرة جداً');
+    }
 
-    // الخطوة 2: إرسال الصورة بالـ media_id
+    // كشف نوع الصورة الفعلي
+    const mime = detectImageMime(imageBuffer);
+    const ext  = mime === 'image/png' ? 'png' : mime === 'image/gif' ? 'gif' : 'jpg';
+
+    console.log(`[sendImage] حجم: ${imageBuffer.length} bytes | نوع: ${mime}`);
+
+    // رفع الصورة للحصول على media_id
+    const mediaId = await uploadMedia(imageBuffer, mime, `image.${ext}`);
+
+    // إرسال الصورة بالـ media_id
     const res = await fetch(`${BASE_URL}/messages`, {
         method: 'POST',
         headers: authHeaders(),
