@@ -3836,28 +3836,32 @@ async function processIncomingMessage(adaptedMsg) {
 
             // ── جلب صورة Wikipedia تلقائياً — يعمل في الخلفية بدون تأخير الرد ──
             if (needsVisualContext(body, res)) {
-                // ✅ تشغيل في الخلفية — المستخدم يحصل الرد فوراً والصورة تصله بعد ثوانٍ
                 (async () => {
                     try {
+                        console.log('[wiki] 1️⃣ بدء البحث...');
+
                         const searchTerm = await getWikiSearchTerm(body, res);
-                        if (!searchTerm) return;
+                        console.log(`[wiki] 2️⃣ مصطلح البحث: "${searchTerm}"`);
+                        if (!searchTerm) { console.warn('[wiki] ❌ لم يُستخرج مصطلح'); return; }
 
                         const imgResult = await fetchWikipediaImage(searchTerm);
-                        if (!imgResult) return;
+                        console.log(`[wiki] 3️⃣ نتيجة Wikipedia:`, imgResult ? `"${imgResult.title}" — ${imgResult.url}` : 'null');
+                        if (!imgResult) { console.warn('[wiki] ❌ لم تُجد صورة في Wikipedia'); return; }
 
-                        // تنزيل الصورة كـ buffer ثم رفعها لـ Meta
                         const imgBuffer = await downloadImageBuffer(imgResult.url);
-                        if (!imgBuffer || imgBuffer.length < 5000) return;
+                        console.log(`[wiki] 4️⃣ تنزيل الصورة: ${imgBuffer?.length} bytes`);
+                        if (!imgBuffer || imgBuffer.length < 5000) { console.warn('[wiki] ❌ الصورة فارغة أو صغيرة'); return; }
 
-                        await wa.sendImage(
-                            sender,
-                            imgBuffer,
-                            `📸 ${imgResult.title} — Wikipedia`
-                        );
-                        console.log(`[wiki] ✅ أُرسلت صورة: ${imgResult.title}`);
+                        console.log('[wiki] 5️⃣ جاري رفع الصورة لـ Meta...');
+                        await wa.sendImage(sender, imgBuffer, `📸 ${imgResult.title} — Wikipedia`);
+                        console.log(`[wiki] ✅ أُرسلت صورة بنجاح: ${imgResult.title}`);
 
                     } catch(e) {
-                        console.warn('[wiki] فشل جلب الصورة:', e.message);
+                        console.error('[wiki] ❌ فشل:', e.message);
+                        // لو كان خطأ من uploadMedia اطبع التفاصيل
+                        if (e.message.includes('uploadMedia')) {
+                            console.error('[wiki] تفاصيل خطأ رفع الصورة:', e.message);
+                        }
                     }
                 })();
             }
