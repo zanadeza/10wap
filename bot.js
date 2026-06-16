@@ -3973,18 +3973,16 @@ async function fetchWikipediaImage(searchTerm) {
     try {
         if (!searchTerm) return null;
 
-        // دالة للتحقق إن الرابط صورة حقيقية (ليست SVG محوّلة)
         function isValidImgUrl(url) {
             if (!url) return false;
             const u = url.toLowerCase();
-            // ارفض أي رابط فيه .svg في المسار حتى لو ينتهي بـ .png
             if (u.includes('.svg')) return false;
             if (u.includes('.gif')) return false;
-            // قبل فقط JPEG و PNG حقيقية
+            if (u.includes('.webp')) return false;
             return /\.(jpg|jpeg|png)(\?.*)?$/i.test(u);
         }
 
-        // الخطوة 1: البحث
+        // الخطوة 1: البحث عن الصفحة
         const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(searchTerm)}&srlimit=5&format=json&origin=*`;
         const searchRes = await fetchWithTimeout(searchUrl, {}, 8_000);
         if (!searchRes.ok) return null;
@@ -3992,37 +3990,44 @@ async function fetchWikipediaImage(searchTerm) {
         const results = searchData?.query?.search || [];
         if (!results.length) return null;
 
+        // اختيار الصفحة الأدق
         let pageTitle = results[0].title;
         const termLower = searchTerm.toLowerCase();
-        // نفضّل الصفحة التي عنوانها يطابق المصطلح بشكل أدق
         for (const r of results) {
-            const titleLower = r.title.toLowerCase();
-            // مطابقة كاملة أولاً
-            if (titleLower === termLower) { pageTitle = r.title; break; }
-            // مطابقة جزئية — عنوان يبدأ بنفس الكلمة الأولى
-            if (titleLower.startsWith(termLower.split(' ')[0])) { pageTitle = r.title; break; }
+            const t = r.title.toLowerCase();
+            if (t === termLower) { pageTitle = r.title; break; }
+            if (t.startsWith(termLower.split(' ')[0])) { pageTitle = r.title; break; }
         }
-        console.log(`[wiki] صفحة Wikipedia: "${pageTitle}"`);
+        console.log(`[wiki] صفحة: "${pageTitle}"`);
 
-        // الخطوة 2: جلب thumbnail — مع فحص إنها ليست SVG
-        const imgUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=pageimages&pithumbsize=800&format=json&origin=*`;
-        const imgRes = await fetchWithTimeout(imgUrl, {}, 8_000);
-        if (imgRes.ok) {
-            const imgData = await imgRes.json();
-            const pages   = imgData?.query?.pages || {};
-            const page    = Object.values(pages)[0];
-            let imgSrc    = page?.thumbnail?.source;
-            if (imgSrc && isValidImgUrl(imgSrc)) {
-                // نستخدم 800px بدل 1200px — أسرع في الرفع
-                imgSrc = imgSrc.replace(/\/\d+px-/, '/800px-');
-                console.log(`[wiki] ✅ thumbnail صالح: ${imgSrc}`);
-                return { url: imgSrc, title: pageTitle };
-            } else if (imgSrc) {
-                console.warn(`[wiki] ⚠️ thumbnail مرفوض (SVG أو غير مدعوم): ${imgSrc}`);
+        // الخطوة 2: Wikimedia REST API — يعطي صورة الصفحة الرئيسية مباشرة بـ JPEG
+        const restUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(pageTitle.replace(/ /g,'_'))}`;
+        const restRes = await fetchWithTimeout(restUrl, {
+            headers: { 'User-Agent': 'MedTermBot/1.0 (Educational)' }
+        }, 8_000);
+
+        if (restRes.ok) {
+            const restData = await restRes.json();
+            // originalimage = الصورة الأصلية بدون تحويل
+            const original = restData?.originalimage?.source;
+            const thumb    = restData?.thumbnail?.source;
+
+            if (original && isValidImgUrl(original)) {
+                console.log(`[wiki] ✅ originalimage: ${original}`);
+                return { url: original, title: pageTitle };
             }
+            if (thumb && isValidImgUrl(thumb)) {
+                // نطلب أكبر حجم ممكن
+                const bigThumb = thumb.replace(/\/\d+px-/, '/800px-');
+                if (isValidImgUrl(bigThumb)) {
+                    console.log(`[wiki] ✅ thumbnail: ${bigThumb}`);
+                    return { url: bigThumb, title: pageTitle };
+                }
+            }
+            console.warn(`[wiki] ⚠️ REST API أعطى صورة غير صالحة: original=${original} thumb=${thumb}`);
         }
 
-        // الخطوة 3: قائمة الصور — نجرب واحدة واحدة حتى نجد صورة صالحة
+        // الخطوة 3 (fallback): قائمة الصور — نجرب واحدة واحدة
         const listUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=images&imlimit=20&format=json&origin=*`;
         const listRes = await fetchWithTimeout(listUrl, {}, 8_000);
         if (!listRes.ok) return null;
@@ -4031,7 +4036,6 @@ async function fetchWikipediaImage(searchTerm) {
 
         const candidates = (listPage?.images || []).filter(i => {
             const name = i.title.toLowerCase();
-            // ✅ رفض SVG وكل المحوّلات منه
             return /\.(jpg|jpeg|png)$/i.test(name) &&
                    !name.includes('.svg') &&
                    !name.includes('icon') && !name.includes('logo') &&
@@ -4040,10 +4044,9 @@ async function fetchWikipediaImage(searchTerm) {
                    !name.includes('signature') && !name.includes('commons-logo');
         });
 
-        console.log(`[wiki] ${candidates.length} صورة مرشحة من ${listPage?.images?.length||0}`);
+        console.log(`[wiki] ${candidates.length} صورة مرشحة`);
 
-        // نجرب أول 5 صور ونتوقف عند أول صالحة
-        for (const candidate of candidates.slice(0, 5)) {
+        for (const candidate of candidates.slice(0, 8)) {
             const fileUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(candidate.title)}&prop=imageinfo&iiprop=url|mime|size&iiurlwidth=800&format=json&origin=*`;
             const fileRes = await fetchWithTimeout(fileUrl, {}, 6_000);
             if (!fileRes.ok) continue;
@@ -4053,22 +4056,20 @@ async function fetchWikipediaImage(searchTerm) {
             const url  = info?.thumburl || info?.url;
             const mime = info?.mime || '';
 
-            // تحقق من النوع والرابط
             if (!url) continue;
-            if (mime.includes('svg') || mime.includes('gif')) {
+            if (mime.includes('svg') || mime.includes('gif') || mime.includes('webp')) {
                 console.warn(`[wiki] تجاوز ${candidate.title} (${mime})`);
                 continue;
             }
             if (!isValidImgUrl(url)) {
-                console.warn(`[wiki] تجاوز رابط غير صالح: ${url}`);
+                console.warn(`[wiki] رابط غير صالح: ${url}`);
                 continue;
             }
-
-            console.log(`[wiki] ✅ صورة صالحة: ${url}`);
+            console.log(`[wiki] ✅ fallback: ${url}`);
             return { url, title: pageTitle };
         }
 
-        console.warn(`[wiki] ❌ لم تُجد صورة JPEG/PNG صالحة لـ "${pageTitle}"`);
+        console.warn(`[wiki] ❌ لم تُجد صورة صالحة لـ "${pageTitle}"`);
         return null;
 
     } catch(e) {
