@@ -3906,33 +3906,66 @@ function needsVisualContext(body, aiReply) {
 // الذكاء الاصطناعي يستخرج اسم Wikipedia الدقيق بالإنجليزي
 async function getWikiSearchTerm(userQuery, aiReply) {
     try {
+        // أولاً: استخراج ذكي من سؤال المستخدم مباشرة (أسرع وأدق)
+        // نحذف أفعال السؤال ونبقي الموضوع
+        const cleaned = userQuery
+            .replace(/^(?:ما هو|ما هي|اشرح لي|اشرح|شرح|عرف|عرّف|تعريف|معلومات عن|اخبرني عن|حدثني عن|من هو|من هي|أين|متى|كيف|لماذا|ما هي أعراض|ما هو علاج|كيف يعمل|كيف تعمل|ما هي وظيفة)\s+/i, '')
+            .replace(/[؟?!،,.:]/g, '')
+            .trim();
+
+        // لو السؤال قصير وواضح (أقل من 5 كلمات) — أرسله للـ AI مباشرة
+        const wordCount = cleaned.split(/\s+/).length;
+
         const prompt =
-            `المستخدم سأل: "${userQuery}"\n` +
-            `الرد كان عن: "${aiReply.slice(0, 300)}"\n\n` +
-            `اكتب اسم صفحة Wikipedia الإنجليزية الأدق لهذا الموضوع.\n` +
-            `القواعد:\n` +
+            `سؤال المستخدم: "${userQuery}"\n` +
+            `ملخص الرد: "${aiReply.slice(0, 500)}"\n\n` +
+            `المطلوب: اكتب اسم صفحة Wikipedia الإنجليزية الأدق لهذا الموضوع تحديداً.\n\n` +
+            `أمثلة صحيحة:\n` +
+            `- "اشرح القلب" → Human heart\n` +
+            `- "من هو نيوتن" → Isaac Newton\n` +
+            `- "برج إيفل" → Eiffel Tower\n` +
+            `- "ما هو الباراسيتامول" → Paracetamol\n` +
+            `- "الجهاز الهضمي" → Human digestive system\n` +
+            `- "كوكب المريخ" → Mars\n` +
+            `- "الجهاز البولي" → Urinary system\n` +
+            `- "الدماغ البشري" → Human brain\n` +
+            `- "النهر الأردن" → Jordan River\n` +
+            `- "ألبرت أينشتاين" → Albert Einstein\n\n` +
+            `قواعد صارمة:\n` +
             `- اسم واحد فقط بالإنجليزي\n` +
-            `- الاسم الرسمي الدقيق (مثال: Human heart, Albert Einstein, Eiffel Tower)\n` +
-            `- إذا عالم أو شخصية: اسمه الكامل بالإنجليزي\n` +
-            `- إذا عضو أو جهاز: اسمه الطبي الدقيق\n` +
-            `- إذا مكان: اسمه الرسمي\n` +
-            `- لا تضيف أي كلمة أخرى\n` +
-            `الجواب (اسم واحد فقط):`;
+            `- الاسم الدقيق كما يظهر في Wikipedia\n` +
+            `- لا تضف أي كلمة أخرى أو شرح\n\n` +
+            `الجواب:`;
 
         const term = await callMistral({
             model: 'mistral-small-latest',
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: 20,
-            temperature: 0.1
+            max_tokens: 15,  // اسم Wikipedia لا يتجاوز 10 كلمات عادة
+            temperature: 0   // صفر = أدق إجابة ممكنة بدون إبداع
         });
 
-        const clean = term.trim().replace(/^["'\-*•]+|["'\-*•]+$/g, '').trim();
+        const clean = term
+            .trim()
+            .replace(/^["'\-*•→\s]+|["'\-*•→\s]+$/g, '')
+            .replace(/\n.*/s, '')  // حذف أي سطر ثانٍ
+            .trim();
+
+        if (!clean || clean.length < 2) {
+            // fallback: استخدم السؤال المنظف مباشرة
+            console.warn(`[wiki] AI أعطى إجابة فارغة — استخدام fallback: "${cleaned}"`);
+            return cleaned.slice(0, 50) || null;
+        }
+
         console.log(`[wiki] مصطلح البحث: "${clean}"`);
-        return clean || null;
+        return clean;
 
     } catch(e) {
         console.warn('[wiki] فشل استخراج المصطلح:', e.message);
-        return null;
+        // fallback بدون AI
+        const fallback = userQuery
+            .replace(/^(?:ما هو|ما هي|اشرح|من هو|من هي|كيف|أين)\s+/i, '')
+            .replace(/[؟?!]/g, '').trim().slice(0, 50);
+        return fallback || null;
     }
 }
 
@@ -3960,10 +3993,14 @@ async function fetchWikipediaImage(searchTerm) {
         if (!results.length) return null;
 
         let pageTitle = results[0].title;
+        const termLower = searchTerm.toLowerCase();
+        // نفضّل الصفحة التي عنوانها يطابق المصطلح بشكل أدق
         for (const r of results) {
-            if (r.title.toLowerCase().includes(searchTerm.toLowerCase().split(' ')[0])) {
-                pageTitle = r.title; break;
-            }
+            const titleLower = r.title.toLowerCase();
+            // مطابقة كاملة أولاً
+            if (titleLower === termLower) { pageTitle = r.title; break; }
+            // مطابقة جزئية — عنوان يبدأ بنفس الكلمة الأولى
+            if (titleLower.startsWith(termLower.split(' ')[0])) { pageTitle = r.title; break; }
         }
         console.log(`[wiki] صفحة Wikipedia: "${pageTitle}"`);
 
