@@ -3834,6 +3834,38 @@ async function processIncomingMessage(adaptedMsg) {
             await reply(finalRes);
             await react('✅');
 
+            // ── جلب صورة Wikipedia تلقائياً إذا الموضوع مرئي ──
+            if (needsVisualContext(body, res)) {
+                try {
+                    const searchTerm = extractSearchTerm(body, res);
+                    const imgResult  = await fetchWikipediaImage(searchTerm);
+                    if (imgResult) {
+                        const imgBuffer = await downloadImageBuffer(imgResult.url);
+                        if (imgBuffer && imgBuffer.length > 5000) {
+                            // رفع الصورة وإرسالها
+                            const mediaId = await wa.uploadMedia(imgBuffer, 'image/jpeg', 'wiki.jpg');
+                            await fetchWithTimeout(`https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({
+                                    messaging_product: 'whatsapp',
+                                    to: sender,
+                                    type: 'image',
+                                    image: { id: mediaId, caption: `📸 ${imgResult.title} — Wikipedia` }
+                                })
+                            }, 30_000);
+                            console.log(`[wiki] ✅ أُرسلت صورة: ${imgResult.title}`);
+                        }
+                    }
+                } catch(e) {
+                    console.warn('[wiki] فشل جلب الصورة:', e.message);
+                    // فشل الصورة لا يوقف البوت
+                }
+            }
+
             // ── عرض النطق الصوتي للمصطلحات الطبية والأدوية تلقائياً ──
             if (isMedicalQuery(body)) {
                 const termEn = extractTermForTTS(res);
@@ -3863,10 +3895,114 @@ async function processIncomingMessage(adaptedMsg) {
 }
 
 // ============================================================
-// START
+// WIKIPEDIA IMAGE — جلب صورة تلقائي لأي موضوع مرئي
 // ============================================================
-// تنظيف الذاكرة كل ساعة
-setInterval(cleanMemory, 60 * 60_000);
+
+// كشف إذا كان الموضوع يحتاج صورة (عضو، جهاز، حيوان، مكان، دواء، إلخ)
+function needsVisualContext(body, aiReply) {
+    const combined = (body + ' ' + aiReply).toLowerCase();
+    return /عضو|جهاز|حيوان|طائر|سمكة|نبات|شجرة|زهرة|عظمة|عضلة|وريد|شريان|خلية|بكتيريا|فيروس|دواء|علاج|آلة|معدة|كبد|قلب|رئة|كلية|دماغ|مخ|عصب|جلد|غدة|هرمون|بروتين|ذرة|كيمياء|فيزياء|هندسة|حشرة|زواحف|ثدييات|قارة|مدينة|دولة|برج|جسر|معلم|شخصية|عالم|مخترع|رياضي|نجم|كوكب|مجرة|جبل|نهر|بحيرة|محيط|صحراء|غابة|حاسوب|ديناصور|كائن|organism|animal|organ|muscle|bone|cell|bacteria|virus|drug|medicine|plant|flower|tree|bird|fish|insect|reptile|mammal|planet|star|galaxy|city|country|tower|bridge|mountain|river|lake|ocean|forest|computer|fossil|anatomy|chemistry|physics|engineering|scientist|inventor|monument|landmark/i.test(combined);
+}
+
+// استخراج أفضل كلمة بحث من الرسالة والرد
+function extractSearchTerm(body, aiReply) {
+    // محاولة استخراج الموضوع الرئيسي من رسالة المستخدم أولاً
+    const bodyClean = body
+        .replace(/^(?:ما هو|ما هي|ما هي|اشرح|شرح|عرف|عرّف|تعريف|معلومات عن|معلومات|كيف|لماذا|متى|أين|من هو|من هي)\s+/i, '')
+        .replace(/[؟?!.،,]/g, '')
+        .trim();
+
+    if (bodyClean.length >= 3 && bodyClean.length <= 60) return bodyClean;
+
+    // استخراج من أول جملة الرد
+    const firstLine = aiReply.split('\n')[0]
+        .replace(/^(?:هو|هي|يُعرَّف|يعرف)\s+/i, '')
+        .slice(0, 50)
+        .trim();
+
+    return firstLine || bodyClean;
+}
+
+// ترجمة مصطلح عربي للإنجليزي لـ Wikipedia
+async function translateForWiki(term) {
+    // لو النص إنجليزي بالفعل
+    if (!/[\u0600-\u06FF]/.test(term)) return term;
+    try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=ar&tl=en&dt=t&q=${encodeURIComponent(term)}`;
+        const res = await fetchWithTimeout(url, { headers:{'User-Agent':'Mozilla/5.0'} }, 6_000);
+        if (res.ok) {
+            const data = await res.json();
+            const translated = data?.[0]?.filter(Boolean)?.map(i=>i?.[0])?.filter(Boolean)?.join('')||'';
+            if (translated.trim()) return translated.trim();
+        }
+    } catch {}
+    return term;
+}
+
+// جلب أفضل صورة من Wikipedia
+async function fetchWikipediaImage(searchTerm) {
+    try {
+        // الخطوة 1: ترجمة إذا عربي
+        const enTerm = await translateForWiki(searchTerm);
+        if (!enTerm) return null;
+
+        // الخطوة 2: البحث في Wikipedia للحصول على اسم الصفحة
+        const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(enTerm)}&srlimit=1&format=json&origin=*`;
+        const searchRes = await fetchWithTimeout(searchUrl, {}, 8_000);
+        if (!searchRes.ok) return null;
+        const searchData = await searchRes.json();
+        const pageTitle  = searchData?.query?.search?.[0]?.title;
+        if (!pageTitle) return null;
+
+        // الخطوة 3: جلب الصورة الرئيسية للصفحة
+        const imgUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=pageimages&pithumbsize=800&format=json&origin=*`;
+        const imgRes = await fetchWithTimeout(imgUrl, {}, 8_000);
+        if (!imgRes.ok) return null;
+        const imgData = await imgRes.json();
+        const pages   = imgData?.query?.pages || {};
+        const page    = Object.values(pages)[0];
+        const imgSrc  = page?.thumbnail?.source;
+
+        if (!imgSrc) {
+            // الخطوة 4 (fallback): جرب Wikimedia Commons
+            const commonsUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=images&imlimit=5&format=json&origin=*`;
+            const commonsRes = await fetchWithTimeout(commonsUrl, {}, 8_000);
+            if (!commonsRes.ok) return null;
+            const commonsData = await commonsRes.json();
+            const commonsPage = Object.values(commonsData?.query?.pages||{})[0];
+            const imgFile = commonsPage?.images?.find(i => /\.(jpg|jpeg|png)/i.test(i.title))?.title;
+            if (!imgFile) return null;
+
+            // جلب رابط الصورة الفعلي
+            const fileUrl = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(imgFile)}&prop=imageinfo&iiprop=url&format=json&origin=*`;
+            const fileRes = await fetchWithTimeout(fileUrl, {}, 8_000);
+            if (!fileRes.ok) return null;
+            const fileData = await fileRes.json();
+            const filePages = fileData?.query?.pages || {};
+            const url = Object.values(filePages)[0]?.imageinfo?.[0]?.url;
+            if (!url) return null;
+            return { url, title: pageTitle };
+        }
+
+        return { url: imgSrc, title: pageTitle };
+
+    } catch(e) {
+        console.error('[fetchWikipediaImage]', e.message);
+        return null;
+    }
+}
+
+// تنزيل الصورة كـ Buffer
+async function downloadImageBuffer(url) {
+    const res = await fetchWithTimeout(url, {
+        headers: { 'User-Agent': 'MedTermBot/1.0 (Educational Bot)' }
+    }, 15_000);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const arr = await res.arrayBuffer();
+    return Buffer.from(arr);
+}
+
+
 
 // فحص انتهاء VIP كل ساعة
 setInterval(checkVIPExpiry, 60 * 60_000);
