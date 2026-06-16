@@ -21,6 +21,7 @@ if (!MISTRAL_API_KEY) {
 const ADMIN_NUMBER    = (process.env.ADMIN_NUMBER || '972593850520').trim().replace(/\+/g, '');
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
+const CHAT_HIST_FILE  = './chat_history.json'; // ملف حفظ المحادثات دائمياً
 const WEB_PORT        = process.env.PORT || 8080;
 const PDF_CACHE_DIR   = './pdf_cache';  // مجلد حفظ كاش ملفات PDF
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
@@ -416,6 +417,47 @@ function getSystemPrompt() {
 للطب: أعطِ معلومة دقيقة كاملة + نبّه بمراجعة الطبيب للحالات الجدية.
 اسم المستخدم في السياق، استخدمه أحياناً بشكل طبيعي.`
     return _cachedSystemPrompt;
+}
+
+// ============================================================
+// نظام حفظ المحادثات دائمياً (Chat History)
+// ============================================================
+let _chatHistory = {};
+let _chatHistSaveTimer = null;
+
+function loadChatHistory() {
+    try {
+        if (fs.existsSync(CHAT_HIST_FILE))
+            _chatHistory = JSON.parse(fs.readFileSync(CHAT_HIST_FILE, 'utf-8')) || {};
+    } catch(e) { _chatHistory = {}; }
+}
+loadChatHistory();
+
+function saveChatHistory() {
+    if (_chatHistSaveTimer) return;
+    _chatHistSaveTimer = setTimeout(() => {
+        _chatHistSaveTimer = null;
+        try { fs.writeFileSync(CHAT_HIST_FILE, JSON.stringify(_chatHistory, null, 2), 'utf-8'); }
+        catch(e) { console.error('[chatHistory]', e.message); }
+    }, 2000);
+}
+
+function addToChatHistory(sender, role, content, type = 'text') {
+    if (!_chatHistory[sender]) _chatHistory[sender] = [];
+    _chatHistory[sender].push({
+        role,
+        content: (content || '').slice(0, 2000),
+        ts: Date.now(),
+        type
+    });
+    if (_chatHistory[sender].length > 200)
+        _chatHistory[sender] = _chatHistory[sender].slice(-200);
+    saveChatHistory();
+}
+
+function clearUserChatHistory(sender) {
+    delete _chatHistory[sender];
+    saveChatHistory();
 }
 
 // رسالة الترحيب للمستخدمين الجدد
@@ -1808,6 +1850,14 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                             }
                         }
                     }
+                    else if (action === 'clearChat') {
+                        const num = body2.num || '';
+                        if (num) {
+                            clearUserChatHistory(num);
+                            userChats[num] = [];
+                            result.msg = `✅ تم مسح محادثات ${num}`;
+                        }
+                    }
                     else if (action === 'stats') {
                         result.data = {
                             connected: isConnected,
@@ -1826,6 +1876,41 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     res.end(JSON.stringify({ ok: false, msg: e.message }));
                 }
             });
+            return;
+        }
+
+        // ===== CONVERSATIONS API =====
+        if (url === '/conversations') {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            // قائمة المستخدمين مع عدد رسائلهم وآخر نشاط
+            const list = Object.entries(_chatHistory).map(([sender, msgs]) => {
+                const last = msgs[msgs.length - 1];
+                const name = userNames[sender] || sender;
+                return {
+                    sender,
+                    name,
+                    isVIP: vipNumbers.includes(sender),
+                    isBlocked: blacklist.includes(sender),
+                    msgCount: msgs.length,
+                    lastTs: last?.ts || 0,
+                    lastMsg: last?.content?.slice(0, 80) || ''
+                };
+            }).sort((a, b) => b.lastTs - a.lastTs);
+            res.end(JSON.stringify({ ok: true, users: list }));
+            return;
+        }
+
+        if (url.startsWith('/conversations/')) {
+            const sender = url.slice('/conversations/'.length).split('?')[0];
+            const msgs = _chatHistory[sender] || [];
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                ok: true,
+                sender,
+                name: userNames[sender] || sender,
+                isVIP: vipNumbers.includes(sender),
+                messages: msgs
+            }));
             return;
         }
 
@@ -1997,6 +2082,42 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
 .prog-fill.high{background:var(--red)}
 .prog-text{font-size:11px;color:var(--muted);white-space:nowrap;min-width:50px;text-align:left}
 
+.prog-text{font-size:11px;color:var(--muted);white-space:nowrap;min-width:50px;text-align:left}
+
+/* ── CONVERSATIONS ── */
+.conv-layout{display:flex;height:calc(100vh - 130px);gap:0;border-radius:14px;overflow:hidden;border:1px solid var(--border)}
+.conv-sidebar{width:290px;min-width:240px;border-left:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;flex-shrink:0}
+.conv-search-wrap{padding:12px;border-bottom:1px solid var(--border)}
+.conv-search-wrap input{width:100%;background:#0b0f1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none}
+.conv-search-wrap input:focus{border-color:var(--accent)}
+.conv-user-list{flex:1;overflow-y:auto}
+.conv-user-item{padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;transition:.15s}
+.conv-user-item:hover{background:rgba(56,189,248,.07)}
+.conv-user-item.active{background:rgba(56,189,248,.13);border-right:3px solid var(--accent)}
+.conv-user-name{font-size:13px;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:6px}
+.conv-user-last{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:230px}
+.conv-badge-vip{background:rgba(234,179,8,.2);color:#eab308;font-size:10px;padding:1px 6px;border-radius:50px}
+.conv-badge-blocked{background:rgba(248,113,113,.2);color:#f87171;font-size:10px;padding:1px 6px;border-radius:50px}
+.conv-main{flex:1;display:flex;flex-direction:column;background:#0b0f1a;overflow:hidden}
+.conv-header{padding:13px 18px;border-bottom:1px solid var(--border);background:var(--surface);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.conv-name{font-size:15px;font-weight:700}
+.conv-meta{font-size:11px;color:var(--muted);margin-top:2px}
+.conv-actions{display:flex;gap:8px}
+.btn-sm{padding:6px 12px!important;font-size:12px!important}
+.conv-messages{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:8px}
+.conv-empty-main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);font-size:14px;text-align:center;padding:40px}
+.conv-empty{padding:24px;text-align:center;color:var(--muted);font-size:13px}
+.conv-msg-wrap{display:flex;flex-direction:column;gap:2px}
+.conv-msg-wrap.user{align-items:flex-start}
+.conv-msg-wrap.bot{align-items:flex-end}
+.conv-msg{max-width:72%;border-radius:14px;padding:9px 13px;font-size:13px;line-height:1.6;word-break:break-word;white-space:pre-wrap}
+.conv-msg.user{background:rgba(56,189,248,.13);border-bottom-right-radius:3px}
+.conv-msg.bot{background:rgba(99,102,241,.18);border-bottom-left-radius:3px}
+.conv-msg-time{font-size:10px;color:var(--muted);padding:1px 4px}
+.conv-day-sep{text-align:center;font-size:11px;color:var(--muted);margin:10px 0;opacity:.7}
+.conv-type-icon{font-size:10px;color:var(--muted);padding:0 4px}
+@media(max-width:768px){.conv-sidebar{width:200px}.conv-msg{max-width:88%}}
+
 /* ── TOAST ── */
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 22px;border-radius:12px;font-size:13px;opacity:0;transition:.3s;pointer-events:none;z-index:9999;font-weight:600;box-shadow:0 8px 32px rgba(0,0,0,.4)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
@@ -2054,6 +2175,7 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     <div class="nav-item active" data-tab="overview" onclick="showTab('overview')"><span class="icon">📊</span> نظرة عامة</div>
     <div class="nav-item" data-tab="qr" onclick="showTab('qr')"><span class="icon">📱</span> ربط واتساب</div>
     <div class="nav-item" data-tab="users" onclick="showTab('users')"><span class="icon">👥</span> المستخدمون</div>
+    <div class="nav-item" data-tab="conversations" onclick="showTab('conversations');loadConversations()"><span class="icon">💬</span> المحادثات</div>
     <div class="nav-item" data-tab="usage" onclick="showTab('usage')"><span class="icon">📈</span> الاستهلاك</div>
     <div class="nav-item" data-tab="limits" onclick="showTab('limits')"><span class="icon">🔢</span> حدود الرسائل</div>
     <div class="nav-item" data-tab="vip" onclick="showTab('vip')"><span class="icon">⭐</span> VIP</div>
@@ -2258,6 +2380,40 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
       </div>
     </div>
 
+    <!-- ══ المحادثات ══ -->
+    <div class="panel" id="panel-conversations">
+      <div class="conv-layout">
+        <!-- قائمة المستخدمين -->
+        <div class="conv-sidebar">
+          <div class="conv-search-wrap">
+            <input type="text" id="conv-search" placeholder="🔍 بحث عن مستخدم..." oninput="filterConvUsers(this.value)">
+          </div>
+          <div class="conv-user-list" id="conv-user-list">
+            <div class="conv-empty">جاري التحميل...</div>
+          </div>
+        </div>
+        <!-- عرض المحادثة -->
+        <div class="conv-main">
+          <div class="conv-header" id="conv-header" style="display:none">
+            <div>
+              <div class="conv-name" id="conv-name"></div>
+              <div class="conv-meta" id="conv-meta"></div>
+            </div>
+            <div class="conv-actions">
+              <button class="btn btn-sm" onclick="refreshConvChat()">🔄 تحديث</button>
+              <button class="btn btn-danger btn-sm" onclick="clearConvChat()">🗑️ مسح</button>
+            </div>
+          </div>
+          <div class="conv-messages" id="conv-messages">
+            <div class="conv-empty-main">
+              <div style="font-size:3rem;margin-bottom:12px">💬</div>
+              <div>اختر مستخدماً من القائمة لعرض محادثاته</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- ══ البلاغات ══ -->
     <div class="panel" id="panel-reports">
       <div class="card">
@@ -2289,6 +2445,7 @@ const PAGE_META={
   overview:{title:'نظرة عامة',sub:'إحصائيات البوت الكاملة'},
   qr:{title:'ربط واتساب',sub:'امسح رمز QR لربط الجهاز'},
   users:{title:'المستخدمون',sub:'إدارة وصلاحيات كل مستخدم'},
+  conversations:{title:'المحادثات',sub:'عرض كل المحادثات بين المستخدمين والبوت'},
   usage:{title:'الاستهلاك اليومي',sub:'تقرير استهلاك الرسائل والصور والملفات'},
   limits:{title:'حدود الرسائل',sub:'تخصيص الحد اليومي لكل مستخدم'},
   vip:{title:'أعضاء VIP',sub:'مستخدمون بصلاحيات غير محدودة'},
@@ -2659,6 +2816,141 @@ async function resetUserLimitNum(num){
   else toast(r.msg||'فشل','#dc2626');
 }
 
+// ══════════════════════════════════════════
+// CONVERSATIONS — تبويب المحادثات
+// ══════════════════════════════════════════
+let _convUsers = [];        // قائمة المستخدمين
+let _convActive = null;     // المستخدم المحدد حالياً
+let _convMessages = [];     // رسائل المستخدم المحدد
+
+async function loadConversations() {
+    const list = document.getElementById('conv-user-list');
+    list.innerHTML = '<div class="conv-empty">جاري التحميل...</div>';
+    try {
+        const r = await fetch('/conversations');
+        const d = await r.json();
+        if (!d.ok) { list.innerHTML = '<div class="conv-empty">فشل التحميل</div>'; return; }
+        _convUsers = d.users || [];
+        renderConvUserList(_convUsers);
+    } catch(e) {
+        list.innerHTML = '<div class="conv-empty">خطأ في الاتصال</div>';
+    }
+}
+
+function renderConvUserList(users) {
+    const list = document.getElementById('conv-user-list');
+    if (!users.length) {
+        list.innerHTML = '<div class="conv-empty">لا توجد محادثات محفوظة بعد</div>';
+        return;
+    }
+    list.innerHTML = users.map(u => {
+        const active = _convActive === u.sender ? 'active' : '';
+        const vipBadge = u.isVIP ? '<span class="conv-badge-vip">VIP</span>' : '';
+        const blBadge  = u.isBlocked ? '<span class="conv-badge-blocked">محظور</span>' : '';
+        const lastTime = u.lastTs ? new Date(u.lastTs).toLocaleString('ar-SA',{timeZone:'Asia/Jerusalem',hour:'2-digit',minute:'2-digit',month:'short',day:'numeric'}) : '';
+        return \`<div class="conv-user-item \${active}" onclick="openConvChat('\${esc(u.sender)}')">
+          <div class="conv-user-name">
+            \${esc(u.name)} \${vipBadge}\${blBadge}
+            <span class="conv-user-count">\${u.msgCount} رسالة</span>
+          </div>
+          <div class="conv-user-last">\${esc(u.lastMsg || '—')}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:3px">\${lastTime}</div>
+        </div>\`;
+    }).join('');
+}
+
+function filterConvUsers(q) {
+    const filtered = _convUsers.filter(u =>
+        u.name.includes(q) || u.sender.includes(q) || u.lastMsg.includes(q)
+    );
+    renderConvUserList(filtered);
+}
+
+async function openConvChat(sender) {
+    _convActive = sender;
+    // تمييز المستخدم المحدد
+    document.querySelectorAll('.conv-user-item').forEach(el => el.classList.remove('active'));
+    event?.currentTarget?.classList.add('active');
+
+    const messages = document.getElementById('conv-messages');
+    const header   = document.getElementById('conv-header');
+    messages.innerHTML = '<div class="conv-empty-main"><div>⏳</div><div>جاري تحميل المحادثة...</div></div>';
+    header.style.display = 'flex';
+
+    try {
+        const r = await fetch(\`/conversations/\${encodeURIComponent(sender)}\`);
+        const d = await r.json();
+        if (!d.ok) { messages.innerHTML = '<div class="conv-empty-main"><div>❌</div><div>فشل التحميل</div></div>'; return; }
+
+        _convMessages = d.messages || [];
+
+        // تحديث الهيدر
+        document.getElementById('conv-name').textContent = d.name || sender;
+        document.getElementById('conv-meta').textContent =
+            \`\${sender} • \${_convMessages.length} رسالة\${d.isVIP ? ' • ⭐ VIP' : ''}\`;
+
+        renderConvMessages(_convMessages);
+    } catch(e) {
+        messages.innerHTML = '<div class="conv-empty-main"><div>❌</div><div>خطأ في الاتصال</div></div>';
+    }
+}
+
+function renderConvMessages(msgs) {
+    const container = document.getElementById('conv-messages');
+    if (!msgs.length) {
+        container.innerHTML = '<div class="conv-empty-main"><div>💬</div><div>لا توجد رسائل</div></div>';
+        return;
+    }
+
+    let html = '';
+    let lastDay = '';
+
+    for (const msg of msgs) {
+        const isUser = msg.role === 'user';
+        const d = new Date(msg.ts);
+        const dayStr = d.toLocaleDateString('ar-SA', { timeZone:'Asia/Jerusalem', weekday:'long', day:'numeric', month:'long' });
+        const timeStr = d.toLocaleTimeString('ar-SA', { timeZone:'Asia/Jerusalem', hour:'2-digit', minute:'2-digit' });
+
+        // فاصل اليوم
+        if (dayStr !== lastDay) {
+            html += \`<div class="conv-day-sep">── \${dayStr} ──</div>\`;
+            lastDay = dayStr;
+        }
+
+        const typeIcon = msg.type === 'image' ? '🖼️' : msg.type === 'audio' ? '🎙️' : msg.type === 'pdf' ? '📄' : msg.type === 'translation' ? '🌐' : '';
+        const wrapClass = isUser ? 'user' : 'bot';
+        const msgClass  = isUser ? 'user' : 'bot';
+        const label     = isUser ? '👤 المستخدم' : '🤖 البوت';
+
+        html += \`<div class="conv-msg-wrap \${wrapClass}">
+          <div class="conv-msg \${msgClass}">\${typeIcon ? typeIcon + ' ' : ''}\${esc(msg.content)}</div>
+          <div class="conv-msg-time">\${label} • \${timeStr}</div>
+        </div>\`;
+    }
+
+    container.innerHTML = html;
+    // تمرير للأسفل تلقائياً
+    container.scrollTop = container.scrollHeight;
+}
+
+async function refreshConvChat() {
+    if (_convActive) await openConvChat(_convActive);
+}
+
+async function clearConvChat() {
+    if (!_convActive) return;
+    if (!confirm('هل تريد مسح كل محادثات هذا المستخدم؟')) return;
+    const r = await api({ action:'clearChat', num:_convActive });
+    if (r.ok) {
+        toast('✅ تم مسح المحادثات');
+        _convMessages = [];
+        renderConvMessages([]);
+        await loadConversations();
+    } else {
+        toast(r.msg || 'فشل المسح', '#dc2626');
+    }
+}
+
 loadData();
 setInterval(loadData,30000);
 </script>
@@ -3003,6 +3295,9 @@ async function processIncomingMessage(adaptedMsg) {
                     if (!userChats[sender]) userChats[sender] = [];
                     userChats[sender].push({ role: 'user',      content: body ? `[أرسل صورة مع رسالة: ${body}]` : '[أرسل صورة]' });
                     userChats[sender].push({ role: 'assistant', content: res });
+                    // ✅ حفظ في تاريخ المحادثات
+                    addToChatHistory(sender, 'user', body ? `📷 صورة: ${body}` : '📷 أرسل صورة', 'image');
+                    addToChatHistory(sender, 'assistant', res, 'text');
                     // إضافة رصيد متبقي للمستخدم العادي
                     let imgFinalRes = res;
                     if (!isVIPimg) {
@@ -3298,6 +3593,9 @@ async function processIncomingMessage(adaptedMsg) {
                         if (!userChats[sender]) userChats[sender] = [];
                         userChats[sender].push({ role: 'user',      content: '[طلب استخراج نص من رسالة صوتية]' });
                         userChats[sender].push({ role: 'assistant', content: transcribed });
+                        // ✅ حفظ في التاريخ
+                        addToChatHistory(sender, 'user', '🎙️ طلب استخراج نص من صوت', 'audio');
+                        addToChatHistory(sender, 'assistant', transcribed, 'text');
 
                     } else {
                         // ── الوضع العادي: Voxtral يفهم ويرد ──
@@ -3309,6 +3607,9 @@ async function processIncomingMessage(adaptedMsg) {
                         // حفظ في السياق
                         userChats[sender].push({ role: 'user',      content: body ? `[رسالة صوتية + نص: ${body}]` : '[رسالة صوتية]' });
                         userChats[sender].push({ role: 'assistant', content: res });
+                        // ✅ حفظ في التاريخ
+                        addToChatHistory(sender, 'user', body ? `🎙️ صوت: ${body}` : '🎙️ رسالة صوتية', 'audio');
+                        addToChatHistory(sender, 'assistant', res, 'text');
 
                         stats.totalMessages++;
                         saveData();
@@ -3806,6 +4107,10 @@ async function processIncomingMessage(adaptedMsg) {
 
             // ── 1. حفظ الجواب في الكاش ──
             qaSet(body, res);
+
+            // ✅ حفظ في تاريخ المحادثات الدائم
+            addToChatHistory(sender, 'user', body, 'text');
+            addToChatHistory(sender, 'assistant', res, 'text');
 
             // إضافة رصيد المتبقي في نهاية الرد (للمستخدم العادي فقط)
             let finalRes = res;
