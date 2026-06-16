@@ -3836,8 +3836,7 @@ async function processIncomingMessage(adaptedMsg) {
 
             // ── جلب صورة Wikipedia تلقائياً — يعمل في الخلفية بدون تأخير الرد ──
             if (needsVisualContext(body, res)) {
-                // ✅ تشغيل في الخلفية بدون await — المستخدم يحصل الرد فوراً
-                // الصورة تصله بعد ثوانٍ قليلة
+                // ✅ تشغيل في الخلفية — المستخدم يحصل الرد فوراً والصورة تصله بعد ثوانٍ
                 (async () => {
                     try {
                         const searchTerm = await getWikiSearchTerm(body, res);
@@ -3846,23 +3845,15 @@ async function processIncomingMessage(adaptedMsg) {
                         const imgResult = await fetchWikipediaImage(searchTerm);
                         if (!imgResult) return;
 
-                        // ✅ إرسال بـ URL مباشرة بدون رفع (أسرع بكثير)
-                        await fetchWithTimeout(`https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`, {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                messaging_product: 'whatsapp',
-                                to: sender,
-                                type: 'image',
-                                image: {
-                                    link: imgResult.url,
-                                    caption: `📸 ${imgResult.title} — Wikipedia`
-                                }
-                            })
-                        }, 30_000);
+                        // تنزيل الصورة كـ buffer ثم رفعها لـ Meta
+                        const imgBuffer = await downloadImageBuffer(imgResult.url);
+                        if (!imgBuffer || imgBuffer.length < 5000) return;
+
+                        await wa.sendImage(
+                            sender,
+                            imgBuffer,
+                            `📸 ${imgResult.title} — Wikipedia`
+                        );
                         console.log(`[wiki] ✅ أُرسلت صورة: ${imgResult.title}`);
 
                     } catch(e) {
