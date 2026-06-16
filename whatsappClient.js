@@ -80,9 +80,28 @@ async function sendReaction(to, messageId, emoji) {
 }
 
 // ------------------------------------------------------------
-// إرسال ملف صوتي (Voice Note)
-// audioBuffer: Buffer لملف OGG/Opus
+// إرسال صورة (image)
+// imageBuffer: Buffer للصورة | caption: نص اختياري
 // ------------------------------------------------------------
+async function sendImage(to, imageBuffer, caption = '') {
+    // الخطوة 1: رفع الصورة للحصول على media_id
+    const mediaId = await uploadMedia(imageBuffer, 'image/jpeg', 'image.jpg');
+
+    // الخطوة 2: إرسال الصورة بالـ media_id
+    const res = await fetch(`${BASE_URL}/messages`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to,
+            type: 'image',
+            image: { id: mediaId, caption }
+        })
+    });
+    return handleResponse(res, 'sendImage');
+}
+
+
 async function sendVoiceNote(to, audioBuffer) {
     const mediaId = await uploadMedia(audioBuffer, 'audio/ogg; codecs=opus', 'voice.ogg');
     const res = await fetch(`${BASE_URL}/messages`, {
@@ -176,6 +195,7 @@ module.exports = {
     sendText,
     sendReply,
     sendReaction,
+    sendImage,
     sendVoiceNote,
     uploadMedia,
     downloadMedia,
