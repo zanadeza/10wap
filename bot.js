@@ -3834,37 +3834,41 @@ async function processIncomingMessage(adaptedMsg) {
             await reply(finalRes);
             await react('✅');
 
-            // ── جلب صورة Wikipedia تلقائياً إذا الموضوع مرئي ──
+            // ── جلب صورة Wikipedia تلقائياً — يعمل في الخلفية بدون تأخير الرد ──
             if (needsVisualContext(body, res)) {
-                try {
-                    // ✅ الذكاء الاصطناعي يستخرج الاسم الدقيق بالإنجليزي
-                    const searchTerm = await getWikiSearchTerm(body, res);
-                    if (searchTerm) {
+                // ✅ تشغيل في الخلفية بدون await — المستخدم يحصل الرد فوراً
+                // الصورة تصله بعد ثوانٍ قليلة
+                (async () => {
+                    try {
+                        const searchTerm = await getWikiSearchTerm(body, res);
+                        if (!searchTerm) return;
+
                         const imgResult = await fetchWikipediaImage(searchTerm);
-                        if (imgResult) {
-                            const imgBuffer = await downloadImageBuffer(imgResult.url);
-                            if (imgBuffer && imgBuffer.length > 5000) {
-                                const mediaId = await wa.uploadMedia(imgBuffer, 'image/jpeg', 'wiki.jpg');
-                                await fetchWithTimeout(`https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`, {
-                                    method: 'POST',
-                                    headers: {
-                                        'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
-                                        'Content-Type': 'application/json'
-                                    },
-                                    body: JSON.stringify({
-                                        messaging_product: 'whatsapp',
-                                        to: sender,
-                                        type: 'image',
-                                        image: { id: mediaId, caption: `📸 ${imgResult.title} — Wikipedia` }
-                                    })
-                                }, 30_000);
-                                console.log(`[wiki] ✅ أُرسلت صورة: ${imgResult.title}`);
-                            }
-                        }
+                        if (!imgResult) return;
+
+                        // ✅ إرسال بـ URL مباشرة بدون رفع (أسرع بكثير)
+                        await fetchWithTimeout(`https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                messaging_product: 'whatsapp',
+                                to: sender,
+                                type: 'image',
+                                image: {
+                                    link: imgResult.url,
+                                    caption: `📸 ${imgResult.title} — Wikipedia`
+                                }
+                            })
+                        }, 30_000);
+                        console.log(`[wiki] ✅ أُرسلت صورة: ${imgResult.title}`);
+
+                    } catch(e) {
+                        console.warn('[wiki] فشل جلب الصورة:', e.message);
                     }
-                } catch(e) {
-                    console.warn('[wiki] فشل جلب الصورة:', e.message);
-                }
+                })();
             }
 
             // ── عرض النطق الصوتي للمصطلحات الطبية والأدوية تلقائياً ──
