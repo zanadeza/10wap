@@ -3973,10 +3973,12 @@ async function fetchWikipediaImage(searchTerm) {
         const imgFiles = (listPage?.images || [])
             .filter(i => {
                 const name = i.title.toLowerCase();
-                return /\.(jpg|jpeg|png)/i.test(name) &&
+                // ✅ $ للتأكد من الامتداد في النهاية — نرفض SVG وWebP
+                return /\.(jpg|jpeg|png)$/i.test(name) &&
                        !name.includes('icon') && !name.includes('logo') &&
                        !name.includes('flag') && !name.includes('map') &&
-                       !name.includes('symbol') && !name.includes('wikimedia');
+                       !name.includes('symbol') && !name.includes('wikimedia') &&
+                       !name.includes('signature') && !name.includes('edit-');
             });
 
         if (!imgFiles.length) return null;
@@ -3999,11 +4001,30 @@ async function fetchWikipediaImage(searchTerm) {
 
 async function downloadImageBuffer(url) {
     const res = await fetchWithTimeout(url, {
-        headers: { 'User-Agent': 'MedTermBot/1.0 (Educational Bot)' }
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; MedTermBot/1.0)',
+            'Accept': 'image/jpeg,image/png,image/gif,image/webp,*/*'
+        }
     }, 15_000);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const contentType = res.headers.get('content-type') || '';
+    // Meta لا تقبل SVG
+    if (contentType.includes('svg') || contentType.includes('pdf')) {
+        throw new Error(`نوع غير مدعوم: ${contentType}`);
+    }
+
     const arr = await res.arrayBuffer();
-    return Buffer.from(arr);
+    const buffer = Buffer.from(arr);
+
+    // فحص SVG من المحتوى
+    const preview = buffer.slice(0, 60).toString('utf8');
+    if (preview.includes('<svg') || preview.includes('<?xml')) {
+        throw new Error('صورة SVG غير مدعومة في واتساب');
+    }
+
+    console.log(`[downloadImg] ${buffer.length} bytes | ${contentType}`);
+    return buffer;
 }
 
 
