@@ -155,7 +155,11 @@ async function uploadMedia(buffer, mime, filename = 'file') {
         body: form
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(`[uploadMedia] ${JSON.stringify(data)}`);
+    if (!res.ok) {
+        console.error(`[uploadMedia] HTTP ${res.status} | mime: ${mime} | size: ${buffer.length} | رد Meta:`, JSON.stringify(data));
+        throw new Error(`[uploadMedia] HTTP ${res.status}: ${JSON.stringify(data)}`);
+    }
+    console.log(`[uploadMedia] ✅ media_id: ${data.id} | mime: ${mime} | size: ${buffer.length}`);
     return data.id;
 }
 
