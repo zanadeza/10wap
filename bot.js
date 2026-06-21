@@ -24,25 +24,56 @@ const DATA_FILE       = './bot_data.json';
 const CHAT_HIST_FILE  = './chat_history.json'; // ملف حفظ المحادثات دائمياً
 const WEB_PORT        = process.env.PORT || 8080;
 const PDF_CACHE_DIR   = './pdf_cache';  // مجلد حفظ كاش ملفات PDF
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+// PIN إضافي لأوامر الأدمن الحساسة عبر واتساب (!addvip, !removevip, !resetlimit)
+// طبقة حماية إضافية فوق تطابق رقم الهاتف — اختياري، يُفعَّل تلقائياً إذا عُيّن في .env
+const ADMIN_CMD_PIN = process.env.ADMIN_CMD_PIN || '';
+if (!ADMIN_CMD_PIN) {
+    console.warn('⚠️ تنبيه: ADMIN_CMD_PIN غير معيّن — أوامر الأدمن عبر واتساب تعتمد فقط على تطابق رقم الهاتف.');
+}
 
 if (!VERIFY_TOKEN) {
     console.error('❌ خطأ فادح: لم يتم تعيين VERIFY_TOKEN في .env (مطلوب لإعداد Webhook في لوحة Meta)');
     process.exit(1);
 }
 
+// App Secret من Meta for Developers → App settings → Basic → App Secret
+// يُستخدم للتحقق من توقيع كل طلب webhook (X-Hub-Signature-256) لمنع انتحال الرسائل.
+// اختياري: لو غير موجود، البوت يعمل لكن بدون هذا التحقق (تحذير في الـ log عند البدء).
+const META_APP_SECRET = process.env.META_APP_SECRET || '';
+if (!META_APP_SECRET) {
+    console.warn('⚠️ تحذير أمني: META_APP_SECRET غير معيّن في .env — لن يتم التحقق من توقيع طلبات Webhook.');
+    console.warn('   أي طرف يعرف رابط الـ webhook يمكنه إرسال رسائل وهمية. أضف META_APP_SECRET من Meta for Developers > App settings > Basic.');
+}
+
 // ============================================================
 // DASHBOARD AUTH
 // ============================================================
-const DASHBOARD_USER  = '1122134';
-const DASHBOARD_PASS  = '1125567';
+const DASHBOARD_USER  = process.env.DASHBOARD_USER;
+const DASHBOARD_PASS  = process.env.DASHBOARD_PASS;
 const crypto          = require('crypto');
+
+if (!DASHBOARD_USER || !DASHBOARD_PASS) {
+    console.error('❌ خطأ فادح: لم يتم تعيين DASHBOARD_USER و DASHBOARD_PASS في .env (بيانات دخول لوحة التحكم)');
+    process.exit(1);
+}
 // sessions: { token: { ip, createdAt } }
 const _sessions       = {};
 const SESSION_TTL_MS  = 12 * 60 * 60_000; // 12 ساعة
 
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
+}
+// مقارنة آمنة من ناحية التوقيت (timing-safe) — تمنع استنتاج كلمة السر عبر قياس زمن الاستجابة
+function safeCompare(a, b) {
+    const bufA = Buffer.from(String(a ?? ''), 'utf8');
+    const bufB = Buffer.from(String(b ?? ''), 'utf8');
+    // timingSafeEqual يتطلب نفس الطول — لو الطول مختلف نقارن مع buffer وهمي بنفس طول bufA
+    // حتى لا "نخسر" بسرعة وقت اختلاف الطول (وهذا بحد ذاته تسريب توقيتي بسيط)
+    if (bufA.length !== bufB.length) {
+        crypto.timingSafeEqual(bufA, Buffer.alloc(bufA.length));
+        return false;
+    }
+    return crypto.timingSafeEqual(bufA, bufB);
 }
 function isValidSession(req) {
     const token = parseCookie(req.headers['cookie'] || '')['adm_tok'];
@@ -52,8 +83,16 @@ function isValidSession(req) {
         delete _sessions[token];
         return false;
     }
+    // ملاحظة: لا نفحص IP لأن Ngrok يغير الـ IP بين الطلبات بشكل طبيعي.
+    // كبديل عملي ضد سرقة الكوكي: نربط الجلسة بـ User-Agent وقت تسجيل الدخول.
+    // متصفح مختلف تماماً (= جهاز/برنامج مختلف يستخدم الكوكي المسروق) يُرفض،
+    // لكن هذا ليس حماية كاملة (الـ User-Agent قابل للتزوير من مهاجم متمرس).
+    const ua = req.headers['user-agent'] || '';
+    if (s.ua && s.ua !== ua) {
+        console.warn('⚠️ جلسة admin مرفوضة: User-Agent مختلف عن وقت تسجيل الدخول (احتمال سرقة كوكي)');
+        return false;
+    }
     s.createdAt = Date.now(); // تجديد تلقائي عند كل طلب
-    // ملاحظة: لا نفحص IP لأن Ngrok يغير الـ IP
     return true;
 }
 function parseCookie(str) {
@@ -1110,6 +1149,42 @@ async function askAIWithDoc(docText, userQuestion, userName) {
     }
 }
 
+// ============================================================
+// تصنيف سريع وخفيف: هل سؤال المستخدم (وهو بوضع PDF نشط) متعلق فعلاً بالملف؟
+// يُستخدم لتجنّب إرسال محتوى الملف للـ AI عندما يكون السؤال عاماً (طقس، حساب، دردشة...)
+// نموذج صغير + توكنز قليلة جداً → تكلفة شبه معدومة مقارنة بسؤال كامل عن الملف
+// ============================================================
+async function isQuestionAboutPdf(fileName, docTextSnippet, userQuestion) {
+    // heuristic سريع بدون AI: لو السؤال يذكر اسم الملف صراحة أو كلمة "الملف/المستند/الوثيقة"
+    if (/الملف|المستند|الوثيقة|file|document|pdf/i.test(userQuestion)) return true;
+
+    try {
+        const result = await callMistral({
+            model: 'mistral-small-latest', // أرخص نموذج متاح — كافٍ لقرار نعم/لا
+            messages: [
+                {
+                    role: 'system',
+                    content: `مهمتك تصنيف فقط: هل سؤال المستخدم متعلق بمحتوى الملف المرفق أم سؤال عام لا علاقة له بالملف؟\nأجب بكلمة واحدة فقط: نعم أو لا. لا تشرح، لا تضف أي شيء آخر.`
+                },
+                {
+                    role: 'user',
+                    content: `اسم الملف: "${fileName}"\nمقتطف من بداية الملف:\n${docTextSnippet.slice(0, 800)}\n\nسؤال المستخدم: "${userQuestion}"\n\nهل هذا السؤال متعلق بمحتوى الملف؟ (نعم/لا فقط)`
+                }
+            ],
+            max_tokens: 4,
+            temperature: 0
+        }, 1); // محاولة إعادة واحدة فقط — قرار بسيط لا يستحق إعادة محاولات كثيرة
+
+        const answer = (result || '').trim().toLowerCase();
+        // الافتراضي الآمن عند الشك: نعتبره متعلقاً بالملف (نفس السلوك القديم) لتفادي إجابات ناقصة
+        if (/^لا|^no/i.test(answer)) return false;
+        return true;
+    } catch (e) {
+        console.error('[isQuestionAboutPdf]', e.message);
+        return true; // فشل التصنيف — نتصرف بأمان كأن السؤال متعلق بالملف (السلوك الأصلي)
+    }
+}
+
 function isMedicalImage(text) {
     return /أشعة|xray|x-ray|mri|رنين|ct scan|تحليل دم|فحص دم|صورة طبية|تقرير طبي|مختبر|مخبر|lab|blood test|صورة صدر|قلب|كلية|كبد|دماغ|brain|lung|kidney|liver|heart|ultrasound|سونار|إيكو|echo|ecg|ekg|نتائج|results|تقرير|فحص/i
         .test(text || '');
@@ -1579,6 +1654,29 @@ button:hover{opacity:.9;transform:translateY(-1px)}
             let rawBody = '';
             req.on('data', d => rawBody += d);
             req.on('end', async () => {
+                // ===== التحقق من توقيع Meta (X-Hub-Signature-256) =====
+                // يضمن أن الطلب صادر فعلاً من Meta ولم يُزوَّر من طرف يعرف رابط الـ webhook فقط.
+                // يُفعَّل تلقائياً إذا كان META_APP_SECRET معيّناً في .env.
+                if (META_APP_SECRET) {
+                    const sigHeader = req.headers['x-hub-signature-256'] || '';
+                    const expected  = 'sha256=' + crypto
+                        .createHmac('sha256', META_APP_SECRET)
+                        .update(rawBody, 'utf8')
+                        .digest('hex');
+
+                    const sigBuf = Buffer.from(sigHeader);
+                    const expBuf = Buffer.from(expected);
+                    const validSig = sigBuf.length === expBuf.length &&
+                        crypto.timingSafeEqual(sigBuf, expBuf);
+
+                    if (!validSig) {
+                        console.warn('⚠️ webhook مرفوض: توقيع X-Hub-Signature-256 غير صالح أو مفقود');
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        res.end('{"status":"invalid signature"}');
+                        return;
+                    }
+                }
+
                 // الرد فوراً بـ 200 — وإلا تعيد Meta إرسال نفس الحدث
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end('{"status":"ok"}');
@@ -1638,9 +1736,9 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     const params = Object.fromEntries(
                         body.split('&').map(p => p.split('=').map(v => decodeURIComponent(v.replace(/\+/g, ' '))))
                     );
-                    if (params.username === DASHBOARD_USER && params.password === DASHBOARD_PASS) {
+                    if (safeCompare(params.username, DASHBOARD_USER) && safeCompare(params.password, DASHBOARD_PASS)) {
                         const token = generateToken();
-                        _sessions[token] = { ip, createdAt: Date.now() };
+                        _sessions[token] = { ip, createdAt: Date.now(), ua: req.headers['user-agent'] || '' };
                         res.writeHead(302, {
                             'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Lax`,
                             'Location': '/'
@@ -1837,6 +1935,72 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                         }
                         result.msg = 'تم إعادة الحد للافتراضي';
                     }
+                    else if (action === 'setVipExpiry') {
+                        // تعديل يدوي لتاريخ انتهاء VIP — { num, mode: 'days'|'date', days, dateStr }
+                        // mode='days': إضافة/طرح عدد أيام من تاريخ الانتهاء الحالي (days يمكن أن تكون سالبة)
+                        // mode='date': تعيين تاريخ انتهاء محدد مباشرة (dateStr بصيغة YYYY-MM-DD)
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else if (!vipNumbers.includes(num)) { result = { ok: false, msg: `المستخدم ${num} ليس VIP أصلاً — فعّل VIP أولاً` }; }
+                        else {
+                            let newExpiry = null;
+                            if (data.mode === 'date') {
+                                const parsed = new Date(`${data.dateStr}T23:59:59`);
+                                if (isNaN(parsed.getTime())) { result = { ok: false, msg: 'تاريخ غير صحيح' }; }
+                                else newExpiry = parsed.getTime();
+                            } else {
+                                const days = parseInt(data.days, 10);
+                                if (isNaN(days)) { result = { ok: false, msg: 'عدد أيام غير صحيح' }; }
+                                else {
+                                    const base = vipExpiry[num] || Date.now();
+                                    newExpiry = base + days * 24 * 60 * 60_000;
+                                }
+                            }
+
+                            if (newExpiry !== null) {
+                                if (newExpiry <= Date.now()) {
+                                    // التاريخ الجديد بالماضي — يُعامل كإلغاء فوري لـ VIP
+                                    vipNumbers = vipNumbers.filter(n => n !== num);
+                                    delete vipExpiry[num];
+                                    saveData();
+                                    if (isConnected) {
+                                        try { await wa.sendText(num, `⚠️ تم إنهاء اشتراكك المميز (VIP) من قبل الإدارة.\nللاستفسار: wa.me/972593850520`); } catch (_) {}
+                                    }
+                                    result.msg = `⚠️ التاريخ الجديد بالماضي — تم إلغاء VIP عن ${num} فوراً`;
+                                } else {
+                                    vipExpiry[num] = newExpiry;
+                                    saveData();
+                                    if (isConnected) {
+                                        try {
+                                            const expDate = new Date(newExpiry).toLocaleDateString('ar-SA');
+                                            await wa.sendText(num, `🔄 *تم تعديل تاريخ انتهاء اشتراكك المميز (VIP)*\n📅 الانتهاء الجديد: ${expDate}`);
+                                        } catch (_) {}
+                                    }
+                                    const expDateStr = new Date(newExpiry).toLocaleDateString('ar-SA');
+                                    result.msg = `✅ تم تحديث انتهاء VIP لـ ${num} إلى ${expDateStr}`;
+                                }
+                            }
+                        }
+                    }
+                    else if (action === 'sendCustomMessage') {
+                        // إرسال رسالة مخصصة لرقم واحد محدد من الداشبورد
+                        const num = String(data.num || '').replace(/\D/g, '').trim();
+                        const txt = (data.text || '').trim();
+                        if (!num) { result = { ok: false, msg: 'رقم الهاتف غير صحيح' }; }
+                        else if (!txt) { result = { ok: false, msg: 'الرسالة فارغة' }; }
+                        else if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
+                        else {
+                            try {
+                                await wa.sendText(num, txt);
+                                // تسجيل الرسالة في سجل المحادثة الدائم حتى تظهر في تبويب المحادثات
+                                addToChatHistory(num, 'assistant', txt, 'text');
+                                result.msg = `✅ تم إرسال الرسالة إلى ${num}`;
+                            } catch (e) {
+                                console.error('[sendCustomMessage]', e.message);
+                                result = { ok: false, msg: 'فشل الإرسال: ' + e.message };
+                            }
+                        }
+                    }
                     else if (action === 'broadcast') {
                         if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
                         else {
@@ -1851,7 +2015,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                         }
                     }
                     else if (action === 'clearChat') {
-                        const num = body2.num || '';
+                        const num = data.num || '';
                         if (num) {
                             clearUserChatHistory(num);
                             userChats[num] = [];
@@ -2179,6 +2343,7 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     <div class="nav-item" data-tab="usage" onclick="showTab('usage')"><span class="icon">📈</span> الاستهلاك</div>
     <div class="nav-item" data-tab="limits" onclick="showTab('limits')"><span class="icon">🔢</span> حدود الرسائل</div>
     <div class="nav-item" data-tab="vip" onclick="showTab('vip')"><span class="icon">⭐</span> VIP</div>
+    <div class="nav-item" data-tab="customsend" onclick="showTab('customsend')"><span class="icon">✉️</span> رسالة مخصصة</div>
     <div class="nav-item" data-tab="blacklist" onclick="showTab('blacklist')"><span class="icon">⛔</span> المحظورون</div>
     <div class="nav-item" data-tab="broadcast" onclick="showTab('broadcast')"><span class="icon">📢</span> البث</div>
     <div class="nav-item" data-tab="reports" onclick="showTab('reports')"><span class="icon">🚨</span> البلاغات <span class="nav-badge" id="reports-badge" style="display:none">0</span></div>
@@ -2344,6 +2509,38 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
           <input class="inp" id="new-vip" placeholder="رقم الهاتف مع كود الدولة" dir="ltr" style="flex:1;min-width:200px">
           <button class="btn btn-success" onclick="addVip()">⭐ تفعيل VIP (شهر)</button>
         </div>
+        <div class="card-header" style="margin-top:24px;padding-top:18px;border-top:1px solid var(--border)">
+          <div class="card-title" style="font-size:14px">🛠️ تعديل مدة VIP يدوياً</div>
+        </div>
+        <div class="form-row">
+          <input class="inp" id="vip-edit-num" placeholder="رقم الهاتف (يجب أن يكون VIP)" dir="ltr" style="width:200px">
+        </div>
+        <div class="form-row" style="margin-top:8px;align-items:center">
+          <label style="white-space:nowrap">إضافة/طرح أيام:</label>
+          <input class="inp" id="vip-edit-days" type="number" placeholder="مثال: 7 أو -7" style="width:110px" dir="ltr">
+          <button class="btn btn-primary" onclick="adjustVipDays()">⏱️ تطبيق</button>
+        </div>
+        <div class="form-row" style="margin-top:8px;align-items:center">
+          <label style="white-space:nowrap">أو تاريخ انتهاء محدد:</label>
+          <input class="inp" id="vip-edit-date" type="date" style="width:160px" dir="ltr">
+          <button class="btn btn-primary" onclick="setVipDate()">📅 تطبيق</button>
+        </div>
+        <div class="info-box" style="margin-top:10px">💡 إدخال أيام سالبة (مثل -5) يُقصّر الاشتراك. لو صار التاريخ الناتج بالماضي، يُلغى VIP فوراً ويُشعر المستخدم.</div>
+      </div>
+    </div>
+
+    <!-- ══ إرسال رسالة مخصصة ══ -->
+    <div class="panel" id="panel-customsend">
+      <div class="card">
+        <div class="card-header"><div class="card-title">✉️ إرسال رسالة مخصصة لمستخدم محدد</div></div>
+        <div style="padding:18px;display:flex;flex-direction:column;gap:12px">
+          <input class="inp" id="custom-msg-num" placeholder="رقم الهاتف مع كود الدولة" dir="ltr" style="max-width:260px">
+          <textarea class="inp" id="custom-msg-text" placeholder="اكتب الرسالة هنا..."></textarea>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="sendCustomMessage()">✉️ إرسال</button>
+          </div>
+          <div class="info-box">💡 الرسالة تُرسل فوراً لهذا الرقم فقط، وتُسجَّل في سجل محادثاته الظاهر بتبويب "المحادثات".</div>
+        </div>
       </div>
     </div>
 
@@ -2449,6 +2646,7 @@ const PAGE_META={
   usage:{title:'الاستهلاك اليومي',sub:'تقرير استهلاك الرسائل والصور والملفات'},
   limits:{title:'حدود الرسائل',sub:'تخصيص الحد اليومي لكل مستخدم'},
   vip:{title:'أعضاء VIP',sub:'مستخدمون بصلاحيات غير محدودة'},
+  customsend:{title:'رسالة مخصصة',sub:'إرسال رسالة مباشرة لمستخدم محدد'},
   blacklist:{title:'المحظورون',sub:'قائمة المحظورين من استخدام البوت'},
   broadcast:{title:'البث الجماعي',sub:'إرسال رسالة لجميع المستخدمين'},
   reports:{title:'البلاغات',sub:'البلاغات المرسلة من المستخدمين'}
@@ -2580,6 +2778,7 @@ function filterUsers(){
       <td><div class="action-row">
         \${!u.isBlocked?vipBtn:''}
         <button class="btn btn-warn" onclick="quickSetLimit(\${JSON.stringify(u.num)})">🔢 حد</button>
+        <button class="btn btn-primary" onclick="quickSendMessage(\${JSON.stringify(u.num)})">✉️ رسالة</button>
         \${!u.isBlocked?blockBtn:blockBtn}
         <button class="btn btn-danger" onclick="deleteUser(\${JSON.stringify(u.num)})">🗑️</button>
       </div></td>
@@ -2674,6 +2873,7 @@ function renderVip(d){
       <td>
         <div class="action-row">
           <button class="btn btn-primary" onclick="renewVip(\${JSON.stringify(num)})">🔄 تجديد</button>
+          <button class="btn btn-primary" onclick="quickSendMessage(\${JSON.stringify(num)})">✉️</button>
           <button class="btn btn-danger" onclick="removeVipNum(\${JSON.stringify(num)})">❌ إزالة</button>
         </div>
       </td>
@@ -2798,6 +2998,42 @@ async function renewVip(num){
   const r=await api('addVip',{num:String(num)});
   if(r.ok){toast('✅ '+r.msg);loadData();}
   else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+async function adjustVipDays(){
+  const num=document.getElementById('vip-edit-num').value.replace(/\D/g,'');
+  const daysRaw=document.getElementById('vip-edit-days').value.trim();
+  if(!num){toast('أدخل رقم الهاتف','#f59e0b');return;}
+  if(daysRaw===''){toast('أدخل عدد الأيام (موجب أو سالب)','#f59e0b');return;}
+  const days=parseInt(daysRaw,10);
+  if(isNaN(days)){toast('عدد أيام غير صحيح','#f59e0b');return;}
+  const r=await api('setVipExpiry',{num,mode:'days',days});
+  if(r.ok){toast('✅ '+r.msg);document.getElementById('vip-edit-days').value='';loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+async function setVipDate(){
+  const num=document.getElementById('vip-edit-num').value.replace(/\D/g,'');
+  const dateStr=document.getElementById('vip-edit-date').value;
+  if(!num){toast('أدخل رقم الهاتف','#f59e0b');return;}
+  if(!dateStr){toast('اختر تاريخ الانتهاء','#f59e0b');return;}
+  if(!confirm('تعيين تاريخ انتهاء VIP لـ '+num+' إلى '+dateStr+'؟'))return;
+  const r=await api('setVipExpiry',{num,mode:'date',dateStr});
+  if(r.ok){toast('✅ '+r.msg);loadData();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+async function sendCustomMessage(){
+  const num=document.getElementById('custom-msg-num').value.replace(/\D/g,'');
+  const text=document.getElementById('custom-msg-text').value.trim();
+  if(!num){toast('أدخل رقم الهاتف','#f59e0b');return;}
+  if(!text){toast('أدخل نص الرسالة','#f59e0b');return;}
+  const r=await api('sendCustomMessage',{num,text});
+  if(r.ok){toast('✅ '+r.msg);document.getElementById('custom-msg-text').value='';}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+// فتح تبويب الرسالة المخصصة مع تعبئة رقم مستخدم محدد مسبقاً (من زر سريع بجانب أي مستخدم)
+function quickSendMessage(num){
+  showTab('customsend');
+  document.getElementById('custom-msg-num').value=num;
+  document.getElementById('custom-msg-text').focus();
 }
 
 async function quickSetLimit(num){
@@ -2940,7 +3176,7 @@ async function refreshConvChat() {
 async function clearConvChat() {
     if (!_convActive) return;
     if (!confirm('هل تريد مسح كل محادثات هذا المستخدم؟')) return;
-    const r = await api({ action:'clearChat', num:_convActive });
+    const r = await api('clearChat', { num:_convActive });
     if (r.ok) {
         toast('✅ تم مسح المحادثات');
         _convMessages = [];
@@ -3173,11 +3409,24 @@ async function processIncomingMessage(adaptedMsg) {
             // ============================================================
             // ============================================================
     // أوامر الأدمن عبر واتساب (تعمل من رقم الأدمن فقط)
+    // الصيغة مع PIN (إن كان مفعّلاً): !addvip [رقم] [PIN]
     // ============================================================
     if (isAdmin) {
-        // !removevip [رقم]
-        const removeVipMatch = body.match(/^!removevip\s+(\d+)/i);
+        // فحص PIN موحّد — طبقة حماية إضافية فوق تطابق رقم الهاتف
+        function checkAdminPin(restOfCommand) {
+            if (!ADMIN_CMD_PIN) return true; // PIN غير مفعّل — لا فحص إضافي
+            const parts = restOfCommand.trim().split(/\s+/);
+            const providedPin = parts[parts.length - 1] || '';
+            return safeCompare(providedPin, ADMIN_CMD_PIN);
+        }
+
+        // !removevip [رقم] [PIN]
+        const removeVipMatch = body.match(/^!removevip\s+(\d+)(.*)$/i);
         if (removeVipMatch) {
+            if (!checkAdminPin(removeVipMatch[2] || '')) {
+                await reply('⛔ PIN غير صحيح أو مفقود. الصيغة: !removevip [رقم] [PIN]');
+                return true;
+            }
             const num = removeVipMatch[1].trim();
             const wasVip = vipNumbers.includes(num);
             vipNumbers = vipNumbers.filter(n => n !== num);
@@ -3189,9 +3438,13 @@ async function processIncomingMessage(adaptedMsg) {
             await reply(wasVip ? `✅ تم إزالة VIP عن ${num} وتم إشعاره.` : `⚠️ الرقم ${num} لم يكن VIP أصلاً.`);
             return true;
         }
-        // !addvip [رقم]
-        const addVipMatch = body.match(/^!addvip\s+(\d+)/i);
+        // !addvip [رقم] [PIN]
+        const addVipMatch = body.match(/^!addvip\s+(\d+)(.*)$/i);
         if (addVipMatch) {
+            if (!checkAdminPin(addVipMatch[2] || '')) {
+                await reply('⛔ PIN غير صحيح أو مفقود. الصيغة: !addvip [رقم] [PIN]');
+                return true;
+            }
             const num = addVipMatch[1].trim();
             if (!vipNumbers.includes(num)) {
                 vipNumbers.push(num);
@@ -3205,9 +3458,13 @@ async function processIncomingMessage(adaptedMsg) {
             }
             return true;
         }
-        // !resetlimit [رقم]
-        const resetLimitMatch = body.match(/^!resetlimit\s+(\d+)/i);
+        // !resetlimit [رقم] [PIN]
+        const resetLimitMatch = body.match(/^!resetlimit\s+(\d+)(.*)$/i);
         if (resetLimitMatch) {
+            if (!checkAdminPin(resetLimitMatch[2] || '')) {
+                await reply('⛔ PIN غير صحيح أو مفقود. الصيغة: !resetlimit [رقم] [PIN]');
+                return true;
+            }
             const num = resetLimitMatch[1].trim();
             resetUserUsage(num);
             await reply(`✅ تم تصفير استهلاك ${num}.`);
@@ -3403,7 +3660,8 @@ async function processIncomingMessage(adaptedMsg) {
                             docText,
                             pages: null,   // الصور غير محفوظة في الكاش، نعتمد النص
                             pageCount,
-                            loadedAt: Date.now()
+                            loadedAt: Date.now(),
+                            offTopicCount: 0 // عداد الرسائل المتتالية غير المتعلقة بالملف
                         };
                         // مسح سياق المحادثة القديمة وبدء سياق جديد للملف
                         userChats[sender] = [];
@@ -3476,7 +3734,8 @@ async function processIncomingMessage(adaptedMsg) {
                             docText,
                             pages,
                             pageCount: pageFiles.length,
-                            loadedAt: Date.now()
+                            loadedAt: Date.now(),
+                            offTopicCount: 0 // عداد الرسائل المتتالية غير المتعلقة بالملف
                         };
                         // مسح سياق المحادثة القديمة وبدء جديد للملف
                         userChats[sender] = [];
@@ -3747,6 +4006,9 @@ async function processIncomingMessage(adaptedMsg) {
                         userChats[sender].push({ role: 'assistant', content: res });
                         if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
 
+                        // طلب صريح متعلق بالملف — نصفّر عداد الرسائل غير المتعلقة
+                        if (userPdfContext[sender]) userPdfContext[sender].offTopicCount = 0;
+
                         await reply(`📄 *شرح الصفحة ${pageNum} من "${fileName}":*\n\n${res}`);
                         await react('✅');
                         return;
@@ -3793,12 +4055,66 @@ async function processIncomingMessage(adaptedMsg) {
                         userChats[sender].push({ role: 'assistant', content: res });
                         if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
 
+                        // طلب صريح متعلق بالملف — نصفّر عداد الرسائل غير المتعلقة
+                        if (userPdfContext[sender]) userPdfContext[sender].offTopicCount = 0;
+
                         await reply(`📋 *ملخص "${fileName}":*\n\n${res}`);
                         await react('✅');
                         return;
                     }
 
                     // ── سؤال عام أو طلب حل مسألة من الملف ──
+                    // ✅ تصنيف أولاً: هل السؤال متعلق بالملف فعلاً؟
+                    // لو غير متعلق (طقس، حساب، دردشة عامة...) → نجاوب من المعرفة العامة
+                    // بدون إرسال محتوى الملف، ونبقى بوضع الملف لو رجع يسأل عنه لاحقاً.
+                    const aboutPdf = await isQuestionAboutPdf(fileName, docText || '', body);
+
+                    if (!aboutPdf) {
+                        // ── رد عادي تماماً، بدون أي علاقة بمحتوى الملف ──
+                        if (!userChats[sender]) userChats[sender] = [];
+                        const smartPrompt = getSmartSystemPrompt(body, userLanguages[sender]);
+                        const normalHistory = userChats[sender].slice(-8);
+
+                        const normalRes = await askAI([
+                            { role: 'system', content: smartPrompt },
+                            ...normalHistory,
+                            { role: 'user', content: body }
+                        ]);
+
+                        userChats[sender].push({ role: 'user',      content: body });
+                        userChats[sender].push({ role: 'assistant', content: normalRes });
+                        if (userChats[sender].length > MAX_HISTORY) userChats[sender] = userChats[sender].slice(-MAX_HISTORY);
+                        addToChatHistory(sender, 'user', body, 'text');
+                        addToChatHistory(sender, 'assistant', normalRes, 'text');
+
+                        // زيادة عداد الرسائل غير المتعلقة بالملف
+                        const ctx = userPdfContext[sender];
+                        if (ctx) {
+                            ctx.offTopicCount = (ctx.offTopicCount || 0) + 1;
+                            const OFF_TOPIC_LIMIT = 10;
+                            if (ctx.offTopicCount >= OFF_TOPIC_LIMIT) {
+                                // 10 رسائل متتالية بدون علاقة بالملف — خروج تلقائي من وضع الملف
+                                delete userPdfContext[sender];
+                                await reply(
+                                    `${normalRes}\n\n` +
+                                    `─────────────\n` +
+                                    `ℹ️ لاحظت إنك بترسل أسئلة مالها علاقة بـ"${fileName}" منذ فترة، فخرّجتك تلقائياً من وضع الملف. ` +
+                                    `لو حبيت ترجع تسأل عنه أرسله مرة ثانية. 😊`
+                                );
+                                await react('✅');
+                                return;
+                            }
+                        }
+
+                        await reply(normalRes);
+                        await react('✅');
+                        return;
+                    }
+
+                    // ── السؤال متعلق بالملف — نفس المسار السابق ──
+                    // طلب صريح متعلق بالملف — نصفّر عداد الرسائل غير المتعلقة
+                    if (userPdfContext[sender]) userPdfContext[sender].offTopicCount = 0;
+
                     // ✅ تحسين الاستهلاك: استخدام النص بشكل افتراضي بدل الصور
                     // الصور (pixtral) تُستخدم فقط إذا طلب المستخدم صراحةً شيئاً يحتاج رؤية بصرية
                     // (رسم، مخطط، جدول، صورة) — هذا يوفر 80-90% من تكلفة أسئلة PDF
