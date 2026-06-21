@@ -24,6 +24,8 @@ const DATA_FILE       = './bot_data.json';
 const CHAT_HIST_FILE  = './chat_history.json'; // ملف حفظ المحادثات دائمياً
 const WEB_PORT        = process.env.PORT || 8080;
 const PDF_CACHE_DIR   = './pdf_cache';  // مجلد حفظ كاش ملفات PDF
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+
 // PIN إضافي لأوامر الأدمن الحساسة عبر واتساب (!addvip, !removevip, !resetlimit)
 // طبقة حماية إضافية فوق تطابق رقم الهاتف — اختياري، يُفعَّل تلقائياً إذا عُيّن في .env
 const ADMIN_CMD_PIN = process.env.ADMIN_CMD_PIN || '';
