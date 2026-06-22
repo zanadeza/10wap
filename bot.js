@@ -3304,8 +3304,484 @@ async function smartTranslate(text, targetLangCode) {
 }
 
 // ============================================================
-// MAIN BOT
+// لوحة تحكم الأدمن عبر واتساب — Interactive Messages + أوامر نصية
 // ============================================================
+
+// حالة انتظار الإدخال من الأدمن (لأوامر تحتاج input من خطوتين)
+const adminPendingState = {};
+// { [sender]: { action: 'addvip'|'removevip'|'ban'|'unban'|'send'|'broadcast'|'resetlimit'|'setvipdays', step: 1|2, data: {} } }
+
+// إرسال Interactive Message عبر WhatsApp Cloud API مباشرة
+async function sendWhatsAppInteractive(to, payload) {
+    try {
+        const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+        const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
+        if (!PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
+            console.warn('[Interactive] PHONE_NUMBER_ID أو WHATSAPP_TOKEN غير معيّنين — تراجع لرسالة نصية');
+            return false;
+        }
+        const res = await fetch(
+            `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ messaging_product: 'whatsapp', to, ...payload })
+            }
+        );
+        const data = await res.json();
+        if (!res.ok) {
+            console.error('[Interactive] فشل الإرسال:', JSON.stringify(data));
+            return false;
+        }
+        return true;
+    } catch (e) {
+        console.error('[Interactive]', e.message);
+        return false;
+    }
+}
+
+// القائمة الرئيسية لوحة تحكم الأدمن
+async function sendAdminMainMenu(to) {
+    const sent = await sendWhatsAppInteractive(to, {
+        type: 'interactive',
+        interactive: {
+            type: 'list',
+            header: { type: 'text', text: '🛠️ لوحة تحكم الأدمن' },
+            body: { text: 'اختر القسم الذي تريد إدارته:' },
+            footer: { text: 'MedTerm Admin Panel' },
+            action: {
+                button: '📋 القائمة',
+                sections: [
+                    {
+                        title: '📊 المعلومات',
+                        rows: [
+                            { id: 'admin_stats',    title: '📊 الإحصائيات',       description: 'عدد المستخدمين والرسائل والحالة' },
+                            { id: 'admin_users',    title: '👥 قائمة المستخدمين', description: 'عرض أحدث 10 مستخدمين نشطين' },
+                            { id: 'admin_viplist',  title: '⭐ قائمة VIP',         description: 'عرض كل أعضاء VIP وتواريخ انتهائهم' },
+                        ]
+                    },
+                    {
+                        title: '⭐ إدارة VIP',
+                        rows: [
+                            { id: 'admin_addvip',    title: '➕ إضافة VIP',    description: 'تفعيل اشتراك VIP لمستخدم' },
+                            { id: 'admin_removevip', title: '➖ إزالة VIP',    description: 'إلغاء اشتراك VIP لمستخدم' },
+                            { id: 'admin_vipdays',   title: '📅 تعديل مدة VIP', description: 'إضافة أو طرح أيام من اشتراك VIP' },
+                        ]
+                    },
+                    {
+                        title: '🚫 إدارة المستخدمين',
+                        rows: [
+                            { id: 'admin_ban',       title: '⛔ حظر مستخدم',    description: 'إضافة رقم لقائمة الحظر' },
+                            { id: 'admin_unban',     title: '✅ رفع حظر',        description: 'إزالة رقم من قائمة الحظر' },
+                            { id: 'admin_resetlimit',title: '🔄 تصفير الاستهلاك', description: 'إعادة ضبط حدود مستخدم' },
+                        ]
+                    },
+                    {
+                        title: '✉️ الرسائل',
+                        rows: [
+                            { id: 'admin_send',      title: '✉️ رسالة مخصصة',   description: 'إرسال رسالة لرقم محدد' },
+                            { id: 'admin_broadcast', title: '📢 بث جماعي',       description: 'إرسال رسالة لكل المستخدمين' },
+                        ]
+                    },
+                ]
+            }
+        }
+    });
+    // fallback نصي لو فشل الإرسال التفاعلي
+    if (!sent) {
+        await sendWhatsAppInteractive(to, {
+            type: 'text',
+            text: { body:
+                `🛠️ *لوحة تحكم الأدمن*\n\n` +
+                `📊 الإحصائيات: !stats\n` +
+                `👥 المستخدمون: !users\n` +
+                `⭐ قائمة VIP: !viplist\n` +
+                `➕ إضافة VIP: !addvip [رقم]\n` +
+                `➖ إزالة VIP: !removevip [رقم]\n` +
+                `📅 تعديل مدة VIP: !vipdays [رقم] [أيام]\n` +
+                `⛔ حظر: !ban [رقم]\n` +
+                `✅ رفع حظر: !unban [رقم]\n` +
+                `🔄 تصفير استهلاك: !resetlimit [رقم]\n` +
+                `✉️ رسالة مخصصة: !send [رقم] [نص]\n` +
+                `📢 بث جماعي: !broadcast [نص]`
+            }
+        });
+    }
+}
+
+// ردود تأكيد بأزرار (Yes/No)
+async function sendConfirmButtons(to, text, yesId, noId = 'admin_cancel') {
+    const sent = await sendWhatsAppInteractive(to, {
+        type: 'interactive',
+        interactive: {
+            type: 'button',
+            body: { text },
+            action: {
+                buttons: [
+                    { type: 'reply', reply: { id: yesId,    title: '✅ نعم، تأكيد' } },
+                    { type: 'reply', reply: { id: noId,     title: '❌ إلغاء' } },
+                ]
+            }
+        }
+    });
+    return sent;
+}
+
+// بناء رسالة الإحصائيات
+function buildStatsMessage() {
+    const totalUsers   = Object.keys(welcomedUsers).length;
+    const activeToday  = Object.values(userDailyUsage).filter(u => u.msgs > 0).length;
+    const vipCount     = vipNumbers.length;
+    const bannedCount  = (blacklist || []).length;
+    const activeSess   = Object.keys(userChats).length;
+    return (
+        `📊 *إحصائيات البوت*\n\n` +
+        `👥 إجمالي المستخدمين: ${totalUsers}\n` +
+        `✅ نشطون اليوم: ${activeToday}\n` +
+        `⭐ أعضاء VIP: ${vipCount}\n` +
+        `⛔ محظورون: ${bannedCount}\n` +
+        `💬 جلسات نشطة بالذاكرة: ${activeSess}\n` +
+        `🤖 حالة البوت: ${isConnected ? '🟢 متصل' : '🔴 غير متصل'}`
+    );
+}
+
+// معالجة رد الأدمن على قائمة/زر تفاعلي
+async function handleAdminInteractiveReply(replyId, sender, reply) {
+    // ───── إلغاء ─────
+    if (replyId === 'admin_cancel') {
+        delete adminPendingState[sender];
+        await reply('❌ تم إلغاء العملية.');
+        return true;
+    }
+
+    // ───── إحصائيات ─────
+    if (replyId === 'admin_stats') {
+        await reply(buildStatsMessage());
+        return true;
+    }
+
+    // ───── قائمة المستخدمين ─────
+    if (replyId === 'admin_users') {
+        const recent = Object.entries(userChatLastSeen)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10);
+        if (!recent.length) { await reply('لا يوجد مستخدمون نشطون بعد.'); return true; }
+        let msg = `👥 *أحدث 10 مستخدمين نشطين:*\n\n`;
+        recent.forEach(([num, ts], i) => {
+            const name   = userNames[num] || '—';
+            const isVip  = vipNumbers.includes(num) ? '⭐' : '';
+            const isBan  = (blacklist||[]).includes(num) ? '⛔' : '';
+            const ago    = Math.round((Date.now() - ts) / 60000);
+            msg += `${i+1}. ${isVip}${isBan} ${num}\n   الاسم: ${name} | منذ ${ago} دقيقة\n`;
+        });
+        await reply(msg);
+        return true;
+    }
+
+    // ───── قائمة VIP ─────
+    if (replyId === 'admin_viplist') {
+        if (!vipNumbers.length) { await reply('⭐ لا يوجد أعضاء VIP حالياً.'); return true; }
+        let msg = `⭐ *أعضاء VIP (${vipNumbers.length}):*\n\n`;
+        vipNumbers.forEach((num, i) => {
+            const exp  = vipExpiry[num];
+            const days = exp ? Math.ceil((exp - Date.now()) / 86400000) : '؟';
+            const name = userNames[num] || '—';
+            msg += `${i+1}. ${num}\n   ${name} | ينتهي بعد ${days} يوم\n`;
+        });
+        await reply(msg);
+        return true;
+    }
+
+    // ───── إضافة VIP ─────
+    if (replyId === 'admin_addvip') {
+        adminPendingState[sender] = { action: 'addvip', step: 1 };
+        await reply('➕ *إضافة VIP*\nأرسل رقم الهاتف مع كود الدولة (مثال: 972591234567):');
+        return true;
+    }
+
+    // ───── إزالة VIP ─────
+    if (replyId === 'admin_removevip') {
+        adminPendingState[sender] = { action: 'removevip', step: 1 };
+        await reply('➖ *إزالة VIP*\nأرسل رقم الهاتف الذي تريد إزالة VIP منه:');
+        return true;
+    }
+
+    // ───── تعديل مدة VIP ─────
+    if (replyId === 'admin_vipdays') {
+        adminPendingState[sender] = { action: 'vipdays', step: 1 };
+        await reply('📅 *تعديل مدة VIP*\nأرسل رقم الهاتف أولاً:');
+        return true;
+    }
+
+    // ───── حظر ─────
+    if (replyId === 'admin_ban') {
+        adminPendingState[sender] = { action: 'ban', step: 1 };
+        await reply('⛔ *حظر مستخدم*\nأرسل رقم الهاتف الذي تريد حظره:');
+        return true;
+    }
+
+    // ───── رفع حظر ─────
+    if (replyId === 'admin_unban') {
+        adminPendingState[sender] = { action: 'unban', step: 1 };
+        await reply('✅ *رفع حظر*\nأرسل رقم الهاتف الذي تريد رفع الحظر عنه:');
+        return true;
+    }
+
+    // ───── تصفير الاستهلاك ─────
+    if (replyId === 'admin_resetlimit') {
+        adminPendingState[sender] = { action: 'resetlimit', step: 1 };
+        await reply('🔄 *تصفير الاستهلاك*\nأرسل رقم الهاتف:');
+        return true;
+    }
+
+    // ───── رسالة مخصصة ─────
+    if (replyId === 'admin_send') {
+        adminPendingState[sender] = { action: 'send', step: 1 };
+        await reply('✉️ *رسالة مخصصة*\nأرسل رقم الهاتف الذي تريد مراسلته:');
+        return true;
+    }
+
+    // ───── بث جماعي ─────
+    if (replyId === 'admin_broadcast') {
+        adminPendingState[sender] = { action: 'broadcast', step: 1 };
+        await reply(`📢 *بث جماعي*\nأرسل نص الرسالة التي تريد إرسالها لجميع المستخدمين (${Object.keys(welcomedUsers).length} مستخدم):`);
+        return true;
+    }
+
+    // ───── تأكيد تنفيذ عمليات ─────
+    if (replyId.startsWith('confirm_')) {
+        const st = adminPendingState[sender];
+        if (!st) { await reply('⚠️ انتهت مهلة العملية، ابدأ من جديد.'); return true; }
+
+        if (replyId === 'confirm_addvip') {
+            const num = st.data.num;
+            if (!vipNumbers.includes(num)) {
+                vipNumbers.push(num);
+                vipExpiry[num] = Date.now() + 30 * 24 * 60 * 60_000;
+                resetUserUsage(num);
+                saveData();
+                try { await wa.sendText(num, `🌟 *تهانينا! تم تفعيل اشتراكك المميز (VIP)*\nرسائل وصور وصوت غير محدودة ✨`); } catch (_) {}
+                await reply(`✅ تم تفعيل VIP للرقم ${num} لمدة شهر وتم إشعاره.`);
+            } else {
+                await reply(`⚠️ الرقم ${num} VIP أصلاً.`);
+            }
+        }
+
+        else if (replyId === 'confirm_removevip') {
+            const num = st.data.num;
+            vipNumbers = vipNumbers.filter(n => n !== num);
+            delete vipExpiry[num];
+            saveData();
+            try { await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: wa.me/972593850520`); } catch (_) {}
+            await reply(`✅ تم إزالة VIP عن ${num} وتم إشعاره.`);
+        }
+
+        else if (replyId === 'confirm_vipdays') {
+            const { num, days } = st.data;
+            const base = vipExpiry[num] || Date.now();
+            const newExp = base + days * 24 * 60 * 60_000;
+            if (newExp <= Date.now()) {
+                vipNumbers = vipNumbers.filter(n => n !== num);
+                delete vipExpiry[num];
+                saveData();
+                await reply(`⚠️ التاريخ الجديد بالماضي — تم إلغاء VIP عن ${num}.`);
+            } else {
+                vipExpiry[num] = newExp;
+                saveData();
+                const dateStr = new Date(newExp).toLocaleDateString('ar-SA');
+                try { await wa.sendText(num, `🔄 تم تعديل انتهاء VIP الخاص بك إلى ${dateStr}`); } catch (_) {}
+                await reply(`✅ تم تعديل VIP للرقم ${num} — ينتهي: ${dateStr}`);
+            }
+        }
+
+        else if (replyId === 'confirm_ban') {
+            const num = st.data.num;
+            if (!blacklist.includes(num)) blacklist.push(num);
+            saveData();
+            try { await wa.sendText(num, BLACKLIST_MSG); } catch (_) {}
+            await reply(`⛔ تم حظر ${num} وإشعاره.`);
+        }
+
+        else if (replyId === 'confirm_unban') {
+            const num = st.data.num;
+            blacklist = blacklist.filter(n => n !== num);
+            saveData();
+            await reply(`✅ تم رفع الحظر عن ${num}.`);
+        }
+
+        else if (replyId === 'confirm_resetlimit') {
+            const num = st.data.num;
+            resetUserUsage(num);
+            await reply(`✅ تم تصفير استهلاك ${num}.`);
+        }
+
+        else if (replyId === 'confirm_broadcast') {
+            const text = st.data.text;
+            const allUsers = Object.keys(welcomedUsers).filter(n => !blacklist.includes(n));
+            await reply(`📢 بدأ الإرسال لـ ${allUsers.length} مستخدم...`);
+            let ok = 0, fail = 0;
+            for (const num of allUsers) {
+                try { await wa.sendText(num, text); ok++; } catch (_) { fail++; }
+                await new Promise(r => setTimeout(r, 300));
+            }
+            await reply(`✅ اكتمل البث:\n✔️ نجح: ${ok}\n❌ فشل: ${fail}`);
+        }
+
+        delete adminPendingState[sender];
+        return true;
+    }
+
+    return false; // لم يُعالَج
+}
+
+// معالجة إدخال الأدمن النصي عندما يكون في حالة انتظار
+async function handleAdminPendingInput(body, sender, reply) {
+    const st = adminPendingState[sender];
+    if (!st) return false;
+
+    const num = body.replace(/\D/g, '').trim();
+
+    // ─── addvip step 1: رقم ───
+    if (st.action === 'addvip' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        const name = userNames[num] || 'غير معروف';
+        const alreadyVip = vipNumbers.includes(num);
+        const confirmed = await sendConfirmButtons(
+            sender,
+            `➕ تفعيل VIP للرقم:\n${num}\nالاسم: ${name}\n${alreadyVip ? '⚠️ هذا الرقم VIP أصلاً، سيتم تجديد مدته.' : ''}`,
+            'confirm_addvip'
+        );
+        if (!confirmed) {
+            // fallback نصي
+            st.step = 2;
+            await reply(`تأكيد تفعيل VIP للرقم ${num}؟\nأرسل "نعم" للتأكيد أو "لا" للإلغاء:`);
+        }
+        return true;
+    }
+
+    // ─── removevip step 1: رقم ───
+    if (st.action === 'removevip' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        const confirmed = await sendConfirmButtons(
+            sender,
+            `➖ إزالة VIP من الرقم ${num}؟`,
+            'confirm_removevip'
+        );
+        if (!confirmed) { st.step = 2; await reply(`تأكيد إزالة VIP من ${num}؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── vipdays step 1: رقم ───
+    if (st.action === 'vipdays' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        if (!vipNumbers.includes(num)) { await reply(`⚠️ الرقم ${num} ليس VIP أصلاً.\nأرسل رقماً آخر أو أرسل !menu للإلغاء:`); return true; }
+        st.data = { num };
+        st.step = 2;
+        await reply(`📅 الرقم ${num} VIP.\nأرسل عدد الأيام للإضافة أو الطرح (مثال: 30 أو -7):`);
+        return true;
+    }
+
+    // ─── vipdays step 2: أيام ───
+    if (st.action === 'vipdays' && st.step === 2) {
+        const days = parseInt(body.trim(), 10);
+        if (isNaN(days)) { await reply('⚠️ أرسل رقماً صحيحاً للأيام (مثال: 30 أو -7):'); return true; }
+        st.data.days = days;
+        const base   = vipExpiry[st.data.num] || Date.now();
+        const newExp = new Date(base + days * 86400000).toLocaleDateString('ar-SA');
+        const confirmed = await sendConfirmButtons(
+            sender,
+            `📅 ${days > 0 ? 'إضافة' : 'طرح'} ${Math.abs(days)} يوم من VIP الرقم ${st.data.num}\nتاريخ الانتهاء الجديد: ${newExp}`,
+            'confirm_vipdays'
+        );
+        if (!confirmed) { st.step = 3; await reply(`تأكيد؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── ban step 1: رقم ───
+    if (st.action === 'ban' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        const confirmed = await sendConfirmButtons(sender, `⛔ حظر الرقم ${num}؟`, 'confirm_ban');
+        if (!confirmed) { st.step = 2; await reply(`تأكيد حظر ${num}؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── unban step 1: رقم ───
+    if (st.action === 'unban' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        const confirmed = await sendConfirmButtons(sender, `✅ رفع الحظر عن ${num}؟`, 'confirm_unban');
+        if (!confirmed) { st.step = 2; await reply(`تأكيد رفع الحظر عن ${num}؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── resetlimit step 1: رقم ───
+    if (st.action === 'resetlimit' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        const confirmed = await sendConfirmButtons(sender, `🔄 تصفير استهلاك ${num}؟`, 'confirm_resetlimit');
+        if (!confirmed) { st.step = 2; await reply(`تأكيد؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── send step 1: رقم ───
+    if (st.action === 'send' && st.step === 1) {
+        if (!num) { await reply('⚠️ رقم غير صحيح، حاول مرة أخرى:'); return true; }
+        st.data = { num };
+        st.step = 2;
+        await reply(`✉️ أرسل الآن نص الرسالة للرقم ${num}:`);
+        return true;
+    }
+
+    // ─── send step 2: نص ───
+    if (st.action === 'send' && st.step === 2) {
+        const text = body.trim();
+        if (!text) { await reply('⚠️ الرسالة فارغة، أرسل نص الرسالة:'); return true; }
+        try {
+            await wa.sendText(st.data.num, text);
+            addToChatHistory(st.data.num, 'assistant', text, 'text');
+            await reply(`✅ تم إرسال الرسالة للرقم ${st.data.num}`);
+        } catch (e) {
+            await reply(`❌ فشل الإرسال: ${e.message}`);
+        }
+        delete adminPendingState[sender];
+        return true;
+    }
+
+    // ─── broadcast step 1: نص ───
+    if (st.action === 'broadcast' && st.step === 1) {
+        const text = body.trim();
+        if (!text) { await reply('⚠️ النص فارغ، أرسل نص البث:'); return true; }
+        st.data = { text };
+        const count = Object.keys(welcomedUsers).filter(n => !blacklist.includes(n)).length;
+        const confirmed = await sendConfirmButtons(
+            sender,
+            `📢 إرسال البث لـ ${count} مستخدم:\n\n"${text.slice(0, 100)}${text.length > 100 ? '...' : ''}"`,
+            'confirm_broadcast'
+        );
+        if (!confirmed) { st.step = 2; await reply(`تأكيد إرسال البث لـ ${count} مستخدم؟ (نعم/لا):`); }
+        return true;
+    }
+
+    // ─── fallback نصي لتأكيد بـ نعم/لا ───
+    const lc = body.trim().toLowerCase();
+    if (['نعم', 'yes', 'y', 'أكد', 'تأكيد'].includes(lc)) {
+        const confirmId = `confirm_${st.action}`;
+        return await handleAdminInteractiveReply(confirmId, sender, reply);
+    }
+    if (['لا', 'no', 'n', 'إلغاء', 'الغاء', 'كنسل'].includes(lc)) {
+        delete adminPendingState[sender];
+        await reply('❌ تم إلغاء العملية.');
+        return true;
+    }
+
+    return false;
+}
 // ============================================================
 // تشغيل البوت — WhatsApp Cloud API (Webhook)
 // كل رسالة واردة من Express webhook تُمرَّر هنا بصيغة Baileys-like
@@ -3409,11 +3885,93 @@ async function processIncomingMessage(adaptedMsg) {
             console.log(`📨 [${isAdmin ? 'ADMIN' : 'USER'}] ${sender} | ${msgType} | "${body.slice(0, 50)}"`);
 
             // ============================================================
+            // معالجة ردود الأزرار والقوائم التفاعلية (Interactive Messages)
+            // ============================================================
+            if (isAdmin && msgType === 'interactiveResponseMessage') {
+                const interactive = message.interactiveResponseMessage;
+                const replyId =
+                    interactive?.nativeFlowResponseMessage?.paramsJson
+                        ? JSON.parse(interactive.nativeFlowResponseMessage.paramsJson)?.id
+                        : interactive?.listReply?.id
+                        || interactive?.buttonsReply?.id
+                        || interactive?.buttonReply?.id
+                        || '';
+                if (replyId) {
+                    await handleAdminInteractiveReply(replyId, sender, reply);
+                    return;
+                }
+            }
+
+            // ============================================================
             // ============================================================
     // أوامر الأدمن عبر واتساب (تعمل من رقم الأدمن فقط)
     // الصيغة مع PIN (إن كان مفعّلاً): !addvip [رقم] [PIN]
     // ============================================================
     if (isAdmin) {
+        // ─── حالة انتظار إدخال (من قائمة تفاعلية أو أمر سابق) ───
+        if (adminPendingState[sender]) {
+            const handled = await handleAdminPendingInput(body, sender, reply);
+            if (handled) return;
+        }
+
+        // ─── أوامر القائمة التفاعلية ───
+        if (/^!menu$/i.test(body)) {
+            await sendAdminMainMenu(sender);
+            return;
+        }
+        if (/^!stats$/i.test(body)) {
+            await reply(buildStatsMessage());
+            return;
+        }
+        if (/^!users$/i.test(body)) {
+            await handleAdminInteractiveReply('admin_users', sender, reply);
+            return;
+        }
+        if (/^!viplist$/i.test(body)) {
+            await handleAdminInteractiveReply('admin_viplist', sender, reply);
+            return;
+        }
+        if (/^!ban\s+(\d+)$/i.test(body)) {
+            const num = body.match(/^!ban\s+(\d+)$/i)[1];
+            adminPendingState[sender] = { action: 'ban', step: 1, data: { num } };
+            await handleAdminPendingInput(num, sender, reply);
+            return;
+        }
+        if (/^!unban\s+(\d+)$/i.test(body)) {
+            const num = body.match(/^!unban\s+(\d+)$/i)[1];
+            adminPendingState[sender] = { action: 'unban', step: 1, data: { num } };
+            await handleAdminPendingInput(num, sender, reply);
+            return;
+        }
+        if (/^!vipdays\s+(\d+)\s+(-?\d+)$/i.test(body)) {
+            const [, num, daysStr] = body.match(/^!vipdays\s+(\d+)\s+(-?\d+)$/i);
+            const days = parseInt(daysStr, 10);
+            if (!vipNumbers.includes(num)) { await reply(`⚠️ الرقم ${num} ليس VIP.`); return; }
+            adminPendingState[sender] = { action: 'vipdays', step: 2, data: { num, days } };
+            const base = vipExpiry[num] || Date.now();
+            const newExp = new Date(base + days * 86400000).toLocaleDateString('ar-SA');
+            await sendConfirmButtons(sender, `📅 ${days > 0 ? 'إضافة' : 'طرح'} ${Math.abs(days)} يوم من VIP الرقم ${num}\nتاريخ الانتهاء الجديد: ${newExp}`, 'confirm_vipdays') ||
+                await reply(`تأكيد؟ (نعم/لا):`);
+            return;
+        }
+        if (/^!send\s+(\d+)\s+(.+)$/is.test(body)) {
+            const [, num, text] = body.match(/^!send\s+(\d+)\s+(.+)$/is);
+            try {
+                await wa.sendText(num, text.trim());
+                addToChatHistory(num, 'assistant', text.trim(), 'text');
+                await reply(`✅ تم الإرسال للرقم ${num}`);
+            } catch (e) { await reply(`❌ فشل الإرسال: ${e.message}`); }
+            return;
+        }
+        if (/^!broadcast\s+(.+)$/is.test(body)) {
+            const text = body.match(/^!broadcast\s+(.+)$/is)[1].trim();
+            adminPendingState[sender] = { action: 'broadcast', step: 1, data: { text } };
+            const count = Object.keys(welcomedUsers).filter(n => !blacklist.includes(n)).length;
+            await sendConfirmButtons(sender, `📢 إرسال لـ ${count} مستخدم:\n"${text.slice(0,100)}${text.length>100?'...':''}"`, 'confirm_broadcast') ||
+                await reply(`تأكيد إرسال البث لـ ${count} مستخدم؟ (نعم/لا):`);
+            return;
+        }
+
         // فحص PIN موحّد — طبقة حماية إضافية فوق تطابق رقم الهاتف
         function checkAdminPin(restOfCommand) {
             if (!ADMIN_CMD_PIN) return true; // PIN غير مفعّل — لا فحص إضافي
