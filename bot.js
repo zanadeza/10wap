@@ -138,19 +138,22 @@ async function connectMongo() {
         return false;
     }
     try {
+        // حل مشكلة SSL مع Node.js 26 و MongoDB Atlas
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
         const { MongoClient } = require('mongodb');
         _mongoClient = new MongoClient(process.env.MONGODB_URI, {
-            tls: true,
-            tlsAllowInvalidCertificates: false,
             serverSelectionTimeoutMS: 10000,
             connectTimeoutMS: 10000,
         });
         await _mongoClient.connect();
-        _mongoDB   = _mongoClient.db('medterm');
+        // إعادة تفعيل TLS بعد الاتصال
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
+        _mongoDB    = _mongoClient.db('medterm');
         _mongoReady = true;
         console.log('✅ MongoDB Atlas متصل وجاهز!');
         return true;
     } catch (e) {
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
         console.error('❌ فشل الاتصال بـ MongoDB:', e.message);
         console.warn('⚠️ سيتم الحفظ على ملفات JSON كـ fallback.');
         return false;
