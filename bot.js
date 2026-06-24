@@ -19,6 +19,8 @@ if (!MISTRAL_API_KEY) {
     process.exit(1);
 }
 const ADMIN_NUMBER    = (process.env.ADMIN_NUMBER || '972593850520').trim().replace(/\+/g, '');
+const SUPPORT_NUMBER  = (process.env.SUPPORT_NUMBER || process.env.ADMIN_NUMBER || '972593850520').trim().replace(/\+/g, '');
+const SUPPORT_LINK    = `wa.me/${SUPPORT_NUMBER}`; // رابط التواصل مع الدعم — يُستخدم بكل رسائل الإشعار للمستخدمين
 const BOT_NAME        = 'MedTerm';
 const DATA_FILE       = './bot_data.json';
 const CHAT_HIST_FILE  = './chat_history.json'; // ملف حفظ المحادثات دائمياً
@@ -289,7 +291,7 @@ function checkVIPExpiry() {
             changed = true;
             console.log(`[VIP] انتهى اشتراك المستخدم ${num}`);
             if (isConnected) {
-                wa.sendText(num, '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 wa.me/972593850520').catch(() => {});
+                wa.sendText(num, '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 ${SUPPORT_LINK}').catch(() => {});
             }
         }
     }
@@ -336,7 +338,7 @@ const DAILY_TTS_LIMIT   = 10; // مرات استخدام الصوت/الترجم
 // ✅ حد مدة الرسائل الصوتية الواردة (Voxtral + استخراج النص)
 const AUDIO_MAX_SECONDS_FREE = 5 * 60;  // 5 دقائق للمجاني
 const AUDIO_MAX_SECONDS_VIP  = 15 * 60; // 15 دقيقة للـ VIP
-const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع المهندس نادر:\n👤 wa.me/972593850520'; // رسالة للمحظورين
+const BLACKLIST_MSG   = '⛔ عذراً، تم حظرك من استخدام هذا البوت.\nللاستفسار تواصل مع المهندس نادر:\n👤 ${SUPPORT_LINK}'; // رسالة للمحظورين
 // ============================================================
 // نظام الحدود الدائمة — لا تتجدد تلقائياً، تُحفظ في bot_data.json
 // التجديد فقط: الأدمن يعطي VIP أو يرفع الحد يدوياً
@@ -399,7 +401,7 @@ function isActiveVIP(sender) {
         saveData();
         // إشعار المستخدم
         if (isConnected) {
-            wa.sendText(sender, '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 wa.me/972593850520').catch(() => {});
+            wa.sendText(sender, '⚠️ انتهت صلاحية اشتراكك المميز (VIP).\n\nللتجديد تواصل مع المهندس نادر:\n👤 ${SUPPORT_LINK}').catch(() => {});
         }
         return false;
     }
@@ -657,6 +659,9 @@ function splitTextForTTS(text, maxLen = 190) {
 }
 
 async function generateTTS(text, lang = 'en') {
+    // فحص توفر ffmpeg — لو مش موجود على السيرفر، نرجع خطأ واضح
+    if (!FFMPEG_PATH) throw new Error('TTS_UNAVAILABLE');
+
     const ttsLang = lang === 'ar' ? 'ar' : 'en';
     const chunks  = splitTextForTTS(text);
     if (!chunks.length) throw new Error('نص فارغ بعد التنظيف');
@@ -677,16 +682,14 @@ async function generateTTS(text, lang = 'en') {
             const mp3File = require('path').join(os.tmpdir(), `tts_${tmpId}_${i}.mp3`);
             await require('fs').promises.writeFile(mp3File, mp3Buffer);
             mp3Files.push(mp3File);
-            // تأخير بسيط بين الطلبات لتجنب الحجب
             if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 150));
         }
 
         const oggFile = require('path').join(os.tmpdir(), `tts_${tmpId}_out.ogg`);
 
         if (mp3Files.length === 1) {
-            // جزء واحد فقط — تحويل مباشر
             await new Promise((resolve, reject) => {
-                execFile('ffmpeg', [
+                execFile(FFMPEG_PATH, [
                     '-y', '-i', mp3Files[0],
                     '-c:a', 'libopus',
                     '-b:a', '32k',
@@ -698,21 +701,20 @@ async function generateTTS(text, lang = 'en') {
                 });
             });
         } else {
-            // أكثر من جزء — دمج عبر concat filter
             const inputArgs = [];
             mp3Files.forEach(f => { inputArgs.push('-i', f); });
             const filterInputs = mp3Files.map((_, i) => `[${i}:a]`).join('');
             const filter = `${filterInputs}concat=n=${mp3Files.length}:v=0:a=1[out]`;
 
             await new Promise((resolve, reject) => {
-                execFile('ffmpeg', [
+                execFile(FFMPEG_PATH, [
                     '-y', ...inputArgs,
                     '-filter_complex', filter,
                     '-map', '[out]',
                     '-c:a', 'libopus',
                     '-b:a', '32k',
                     oggFile
-                ], { timeout: 120_000 }, (err) => { // ✅ رفع timeout لـ 120 ثانية للنصوص الطويلة
+                ], { timeout: 120_000 }, (err) => {
                     if (err) return reject(new Error(`ffmpeg concat فشل: ${err.message}`));
                     resolve();
                 });
@@ -1463,7 +1465,7 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
                 `💎 *النسخة المميزة (VIP):*\n` +
                 `✅ رسائل + صور + صوت: ♾️ غير محدود\n` +
                 `✅ PDF: بدون حد للحجم\n` +
-                `👤 wa.me/972593850520`
+                `👤 ${SUPPORT_LINK}`
             );
         }
         return true;
@@ -1840,7 +1842,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                             saveData();
                             if (wasVip && isConnected) {
                                 try {
-                                    await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nيمكنك التجديد عبر التواصل معنا:\n👤 wa.me/972593850520`);
+                                    await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nيمكنك التجديد عبر التواصل معنا:\n👤 ${SUPPORT_LINK}`);
                                 } catch (_) {}
                             }
                             result.msg = wasVip ? `✅ تم إزالة VIP عن ${num}` : `المستخدم ${num} لم يكن VIP`;
@@ -1966,7 +1968,7 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                                     delete vipExpiry[num];
                                     saveData();
                                     if (isConnected) {
-                                        try { await wa.sendText(num, `⚠️ تم إنهاء اشتراكك المميز (VIP) من قبل الإدارة.\nللاستفسار: wa.me/972593850520`); } catch (_) {}
+                                        try { await wa.sendText(num, `⚠️ تم إنهاء اشتراكك المميز (VIP) من قبل الإدارة.\nللاستفسار: ${SUPPORT_LINK}`); } catch (_) {}
                                     }
                                     result.msg = `⚠️ التاريخ الجديد بالماضي — تم إلغاء VIP عن ${num} فوراً`;
                                 } else {
@@ -3575,7 +3577,7 @@ async function handleAdminInteractiveReply(replyId, sender, reply) {
             vipNumbers = vipNumbers.filter(n => n !== num);
             delete vipExpiry[num];
             saveData();
-            try { await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: wa.me/972593850520`); } catch (_) {}
+            try { await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: ${SUPPORT_LINK}`); } catch (_) {}
             await reply(`✅ تم إزالة VIP عن ${num} وتم إشعاره.`);
         }
 
@@ -3993,7 +3995,7 @@ async function processIncomingMessage(adaptedMsg) {
             delete vipExpiry[num];
             saveData();
             if (wasVip && isConnected) {
-                try { await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: wa.me/972593850520`); } catch (_) {}
+                try { await wa.sendText(num, `ℹ️ تم إلغاء اشتراكك المميز (VIP).\nللتجديد: ${SUPPORT_LINK}`); } catch (_) {}
             }
             await reply(wasVip ? `✅ تم إزالة VIP عن ${num} وتم إشعاره.` : `⚠️ الرقم ${num} لم يكن VIP أصلاً.`);
             return true;
@@ -4081,7 +4083,7 @@ async function processIncomingMessage(adaptedMsg) {
                 if (!isVIPimg && !checkDailyLimit(sender, 'image')) {
                     await reply(
                         `⚠️ *وصلت للحد اليومي للصور* (${DAILY_IMG_LIMIT} صور/يوم)\n\n` +
-                        `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
+                        `للاشتراك المميز (غير محدود):\n👤 ${SUPPORT_LINK}`
                     );
                     return;
                 }
@@ -4189,7 +4191,7 @@ async function processIncomingMessage(adaptedMsg) {
                                 `⚠️ حجم الملف كبير جداً (${(buffer.length/1024/1024).toFixed(1)}MB).\n` +
                                 `الحد الأقصى للنسخة المجانية *5MB*.\n\n` +
                                 `📌 للحصول على حد *20MB* اشترك بالنسخة المميزة:\n` +
-                                `👤 wa.me/972593850520`
+                                `👤 ${SUPPORT_LINK}`
                             );
                         }
                         return;
@@ -4252,28 +4254,33 @@ async function processIncomingMessage(adaptedMsg) {
                         const pdfPath = path.join(tmpDir, 'input.pdf');
                         await fs.promises.writeFile(pdfPath, buffer);
 
-                        // تحويل الصفحات لصور بـ mutool
-                        await new Promise((resolve, reject) => {
-                            execFile('mutool', [
-                                'convert', '-o', path.join(tmpDir, 'page-%d.jpg'),
-                                '-O', 'resolution=150', pdfPath
-                            ], { timeout: 60_000 }, (err, _so, se) => {
-                                if (err) return reject(new Error(`mutool: ${se || err.message}`));
-                                resolve();
+                        // تحويل الصفحات لصور بـ mutool (لو متاح)
+                        let pages = [];
+                        if (MUTOOL_PATH) {
+                            await new Promise((resolve, reject) => {
+                                execFile(MUTOOL_PATH, [
+                                    'convert', '-o', path.join(tmpDir, 'page-%d.jpg'),
+                                    '-O', 'resolution=150', pdfPath
+                                ], { timeout: 60_000 }, (err, _so, se) => {
+                                    if (err) return reject(new Error(`mutool: ${se || err.message}`));
+                                    resolve();
+                                });
                             });
-                        });
 
-                        const dirEntries = await fs.promises.readdir(tmpDir);
-                        const pageFiles  = dirEntries
-                            .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
-                            .sort();
+                            const dirEntries = await fs.promises.readdir(tmpDir);
+                            const pageFiles  = dirEntries
+                                .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
+                                .sort();
 
-                        if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
-                        console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
+                            if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
+                            console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
 
-                        const pages = await Promise.all(
-                            pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
-                        );
+                            pages = await Promise.all(
+                                pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
+                            );
+                        } else {
+                            console.log(`[PDF] mutool غير متاح — سيتم الاعتماد على النص فقط لـ "${fileName}"`);
+                        }
 
                         // استخراج النص
                         let docText = '';
@@ -4340,6 +4347,11 @@ async function processIncomingMessage(adaptedMsg) {
 
             // --- صوت (Voxtral by Mistral) ---
             if (msgType === 'audioMessage' || msgType === 'pttMessage') {
+                if (!FFMPEG_PATH) {
+                    await react('❌');
+                    await reply('⚠️ ميزة الرسائل الصوتية غير متاحة على هذا السيرفر حالياً.\nللاستخدام الكامل مع الصوت، شغّل البوت على Termux مباشرة.');
+                    return;
+                }
                 if (!checkSpam(sender)) {
                     await reply('⚠️ أرسلت رسائل بشكل متسارع، انتظر ثوانٍ ثم أعد المحاولة.');
                     return;
@@ -4375,7 +4387,7 @@ async function processIncomingMessage(adaptedMsg) {
                             `الحد الأقصى: *${maxMin} دقيقة* ${isVIPaudio ? '(VIP)' : '(مجاني)'}\n\n` +
                             (isVIPaudio ? '' :
                                 `💎 *النسخة المميزة VIP:* حتى 15 دقيقة\n` +
-                                `👤 wa.me/972593850520`)
+                                `👤 ${SUPPORT_LINK}`)
                         );
                         return;
                     }
@@ -4386,7 +4398,7 @@ async function processIncomingMessage(adaptedMsg) {
                         ttsQuota = checkDailyTTS(sender);
                         if (!ttsQuota.allowed) {
                             await react('⛔');
-                            await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`);
+                            await reply(`⚠️ *وصلت للحد اليومي للرسائل الصوتية* (${DAILY_TTS_LIMIT} مرات)\n\nللاشتراك المميز (غير محدود):\n👤 ${SUPPORT_LINK}`);
                             return;
                         }
                     }
@@ -4764,7 +4776,11 @@ async function processIncomingMessage(adaptedMsg) {
                 } catch (ttsErr) {
                     console.error('[TTS] ❌ خطأ كامل:', ttsErr);
                     await react('❌');
-                    await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
+                    if (ttsErr.message === 'TTS_UNAVAILABLE') {
+                        await reply('⚠️ ميزة الصوت غير متاحة على هذا السيرفر حالياً.\nللاستخدام الكامل مع الصوت، شغّل البوت على Termux مباشرة. 🔇');
+                    } else {
+                        await reply('عذراً، لم أتمكن من توليد الصوت حالياً. حاول مرة أخرى لاحقاً. 🔇');
+                    }
                 }
                 return;
             }
@@ -4789,7 +4805,7 @@ async function processIncomingMessage(adaptedMsg) {
                     if (!ttsCheck.allowed) {
                         await reply(
                             `⚠️ *وصلت للحد اليومي للصوت* (${DAILY_TTS_LIMIT} مرات)\n\n` +
-                            `للاشتراك المميز (غير محدود):\n👤 wa.me/972593850520`
+                            `للاشتراك المميز (غير محدود):\n👤 ${SUPPORT_LINK}`
                         );
                         return;
                     }
@@ -4915,7 +4931,7 @@ async function processIncomingMessage(adaptedMsg) {
                         `باسم : *إياد معروف*\n\n` +
                         `بعد تحويل المبلغ الذي قدره 5 شيكل قم بمراسلة المهندس نادر\n\n` +
                         `*المهندس نادر* : +972 59-385-0520\n\n` +
-                        `*أو عن طريق الرابط* : https://wa.me/972593850520`
+                        `*أو عن طريق الرابط* : https://${SUPPORT_LINK}`
                     );
                     const uName = userNames[sender] ? `${userNames[sender]} (${sender})` : sender;
                     notifyAdmin(`⚠️ المستخدم ${uName} انتهت فترته التجريبية (${DAILY_MSG_LIMIT} رسالة).`);
@@ -5003,7 +5019,7 @@ async function processIncomingMessage(adaptedMsg) {
                         `💬 رسائل: *${msgLeft}* متبقية\n` +
                         `🖼️ صور: *${imgLeft}* متبقية\n` +
                         `🔊 صوت/ترجمة: *${ttsLeft}* متبقية\n` +
-                        `_للاشتراك المميز (غير محدود): wa.me/972593850520_`;
+                        `_للاشتراك المميز (غير محدود): ${SUPPORT_LINK}_`;
                 } else {
                     finalRes += `\n\n─────────────\n` +
                         `_💬 رسائل: ${msgLeft} | 🖼️ صور: ${imgLeft} | 🔊 صوت: ${ttsLeft}_`;
@@ -5301,43 +5317,45 @@ setInterval(checkVIPExpiry, 60 * 60_000);
 // ============================================================
 // فحص التبعيات عند البدء
 // ============================================================
-(function checkDependencies() {
-    const { execSync, spawnSync } = require('child_process');
-    const path = require('path');
+// فحص التبعيات الخارجية — مع graceful degradation لبيئات السيرفر (Render, Railway...)
+// لو الأدوات مش موجودة: البوت يشتغل بدونها مع تعطيل الميزات المعتمدة عليها فقط
+// ============================================================
+let MUTOOL_PATH  = null; // null = ميزة PDF معطّلة
+let FFMPEG_PATH  = null; // null = ميزة صوت/TTS معطّلة
 
-    // دالة مرنة: تبحث عن الأداة في كل المسارات المحتملة
+(function checkDependencies() {
+    const { spawnSync } = require('child_process');
+
     function findTool(name) {
-        // 1) which / where (Linux/Mac/Termux) — timeout قصير لمنع التعليق
+        // 1) which — يشتغل على Linux/Mac/Termux/Render
         try {
             const r = spawnSync('which', [name], { encoding: 'utf8', timeout: 3000 });
             if (!r.error && r.status === 0 && r.stdout.trim()) return r.stdout.trim();
         } catch (_) {}
 
-        // 2) مسارات Termux الشائعة (بدون spawnSync — فحص وجود الملف فقط)
-        const termuxPaths = [
-            `/data/data/com.termux/files/usr/bin/${name}`,
-            `/data/data/com.termux/files/usr/local/bin/${name}`,
+        // 2) مسارات شائعة (Linux سيرفر + Termux)
+        const paths = [
             `/usr/bin/${name}`,
             `/usr/local/bin/${name}`,
             `/bin/${name}`,
+            `/data/data/com.termux/files/usr/bin/${name}`,
+            `/data/data/com.termux/files/usr/local/bin/${name}`,
         ];
-        for (const p of termuxPaths) {
-            try {
-                if (require('fs').existsSync(p)) return p;
-            } catch (_) {}
+        for (const p of paths) {
+            try { if (require('fs').existsSync(p)) return p; } catch (_) {}
         }
 
-        // 3) محاولة تشغيل مباشرة — timeout صارم لمنع التعليق
+        // 3) تجربة مباشرة
         try {
             const r = spawnSync(name, ['--version'], { encoding: 'utf8', timeout: 2000 });
             if (!r.error && (r.status === 0 || (r.stderr && r.stderr.length > 0))) return name;
         } catch (_) {}
 
-        // 4) للـ mutool تحديداً — تجربة اسم بديل
+        // 4) بديل mutool → mupdf
         if (name === 'mutool') {
             try {
                 const r = spawnSync('mupdf', ['--version'], { encoding: 'utf8', timeout: 2000 });
-                if (!r.error && (r.status === 0 || (r.stderr && r.stderr.length > 0))) return 'mupdf';
+                if (!r.error && (r.status === 0 || r.stderr?.length > 0)) return 'mupdf';
             } catch (_) {}
         }
 
@@ -5345,25 +5363,32 @@ setInterval(checkVIPExpiry, 60 * 60_000);
     }
 
     // فحص mutool
-    const mutoolPath = findTool('mutool');
-    if (!mutoolPath) {
-        console.error('❌ mutool غير مثبت أو غير موجود في PATH.');
-        console.error('   ثبّته بـ:  pkg install mupdf-tools');
-        console.error('   أو تأكد من: echo $PATH');
-        process.exit(1);
+    MUTOOL_PATH = findTool('mutool');
+    if (!MUTOOL_PATH) {
+        console.warn('⚠️ mutool غير موجود — ميزة معالجة PDF (تحويل لصور) معطّلة.');
+        console.warn('   على Termux: pkg install mupdf-tools');
+        console.warn('   على Render: أضف apt-get install -y mupdf-tools بالـ Build Command');
+        // لا نوقف البوت — نكمل بدون معالجة صور PDF
+    } else {
+        console.log(`✅ mutool: ${MUTOOL_PATH}`);
     }
-    console.log(`✅ mutool: ${mutoolPath}`);
 
     // فحص ffmpeg
-    const ffmpegPath = findTool('ffmpeg');
-    if (!ffmpegPath) {
-        console.error('❌ ffmpeg غير مثبت أو غير موجود في PATH.');
-        console.error('   ثبّته بـ:  pkg install ffmpeg');
-        process.exit(1);
+    FFMPEG_PATH = findTool('ffmpeg');
+    if (!FFMPEG_PATH) {
+        console.warn('⚠️ ffmpeg غير موجود — ميزات الصوت والـ TTS معطّلة.');
+        console.warn('   على Termux: pkg install ffmpeg');
+        console.warn('   على Render: أضف apt-get install -y ffmpeg بالـ Build Command');
+        // لا نوقف البوت — نكمل بدون معالجة صوت
+    } else {
+        console.log(`✅ ffmpeg: ${FFMPEG_PATH}`);
     }
-    console.log(`✅ ffmpeg: ${ffmpegPath}`);
 
-    console.log('✅ جميع التبعيات موجودة وجاهزة.');
+    if (MUTOOL_PATH && FFMPEG_PATH) {
+        console.log('✅ جميع التبعيات موجودة وجاهزة.');
+    } else {
+        console.log('ℹ️ البوت يعمل بوضع محدود — الميزات النصية والـ AI كاملة ✅');
+    }
 })();
 
 cleanPdfCache(); // تنظيف كاش PDF القديمة عند البدء
