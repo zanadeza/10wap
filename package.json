@@ -1,13 +1,16 @@
 {
-  "name": "medterm-whatsapp-cloud-bot",
+  "name": "medterm-bot",
   "version": "1.0.0",
-  "description": "MedTerm WhatsApp Bot - WhatsApp Cloud API الرسمي (بدون Baileys)",
+  "description": "MedTerm WhatsApp AI Bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
+    "dotenv": "^16.3.1",
     "pdf-parse": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
