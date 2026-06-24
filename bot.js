@@ -1721,6 +1721,12 @@ button:hover{opacity:.9;transform:translateY(-1px)}
         // ============================================================
         // ===== WEBHOOK (Meta) — معالجة فورية، بدون rate-limit أو جلسة =====
         // ============================================================
+        if (url === '/health' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok', bot: isConnected ? 'connected' : 'disconnected', ts: Date.now() }));
+            return;
+        }
+
         if (url === '/webhook' && req.method === 'GET') {
             const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
             const mode      = parsedUrl.searchParams.get('hub.mode');
