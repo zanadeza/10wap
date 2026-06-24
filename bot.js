@@ -139,7 +139,12 @@ async function connectMongo() {
     }
     try {
         const { MongoClient } = require('mongodb');
-        _mongoClient = new MongoClient(process.env.MONGODB_URI);
+        _mongoClient = new MongoClient(process.env.MONGODB_URI, {
+            tls: true,
+            tlsAllowInvalidCertificates: false,
+            serverSelectionTimeoutMS: 10000,
+            connectTimeoutMS: 10000,
+        });
         await _mongoClient.connect();
         _mongoDB   = _mongoClient.db('medterm');
         _mongoReady = true;
