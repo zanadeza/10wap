@@ -3,15 +3,14 @@
   "version": "1.0.0",
   "description": "MedTerm WhatsApp AI Bot",
   "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
+  "scripts": { "start": "node bot.js" },
   "dependencies": {
     "dotenv": "^16.3.1",
     "pdf-parse": "^1.1.1",
-    "mongodb": "^6.3.0"
+    "mongodb": "^6.3.0",
+    "pdfkit": "^0.19.1",
+    "@fontsource/amiri": "latest",
+    "fonteditor-core": "latest"
   },
-  "engines": {
-    "node": ">=20.0.0"
-  }
+  "engines": { "node": ">=20.0.0" }
 }
