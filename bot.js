@@ -2400,24 +2400,10 @@ button:hover{opacity:.9;transform:translateY(-1px)}
 
         // ===== DATA API =====
         if (url === '/data') {
-            // بناء بيانات الاستهلاك لكل مستخدم
-            const userUsage = {};
-            for (const num of Object.keys(welcomedUsers)) {
-                const cleanNum = cleanNumber(num);
-                const rec = userLimitsUsage[cleanNum];
-                const limit = getUserDailyLimit(cleanNum);
-                userUsage[cleanNum] = {
-                    used: rec ? rec.messages : 0,
-                    images: rec ? rec.images : 0,
-                    docs: rec ? rec.docs : 0,
-                    limit,
-                    remaining: Math.max(0, limit - (rec ? rec.messages : 0)),
-                    resetAt: rec ? rec.activatedAt : null
-                };
-            }
+            // نسخة خفيفة وسريعة — بدون loop على كل المستخدمين
             const d = {
                 connected: isConnected,
-                hasQR: false, // لا يوجد مفهوم QR في WhatsApp Cloud API — البوت متصل دائماً عبر HTTP
+                hasQR: false,
                 botName: BOT_NAME,
                 defaultLimit: DAILY_MSG_LIMIT,
                 stats: {
@@ -2434,13 +2420,33 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                 vipExpiry,
                 userLimits,
                 userNames,
-                userUsage,
                 blacklist: blacklist || [],
                 welcomedUsers: Object.keys(welcomedUsers).map(n => cleanNumber(n)).filter(Boolean),
                 reports: reports.slice(-50).reverse()
             };
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify(d));
+            return;
+        }
+
+        // بيانات الاستهلاك التفصيلية — تُطلب فقط عند فتح تبويب الاستهلاك
+        if (url === '/data/usage') {
+            const userUsage = {};
+            for (const num of Object.keys(welcomedUsers)) {
+                const cleanNum = cleanNumber(num);
+                const rec = userLimitsUsage[cleanNum];
+                const limit = getUserDailyLimit(cleanNum);
+                userUsage[cleanNum] = {
+                    used: rec ? rec.messages : 0,
+                    images: rec ? rec.images : 0,
+                    docs: rec ? rec.docs : 0,
+                    limit,
+                    remaining: Math.max(0, limit - (rec ? rec.messages : 0)),
+                    resetAt: rec ? rec.activatedAt : null
+                };
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ userUsage }));
             return;
         }
 
@@ -3064,6 +3070,12 @@ function showTab(name){
   document.getElementById('page-title').textContent=m.title;
   document.getElementById('page-sub').textContent=m.sub;
   if(_data)updateUI();
+  // جلب بيانات الاستهلاك التفصيلية فقط عند فتح تبويب الاستهلاك (لتسريع التحميل الأولي)
+  if(name==='usage' && _data && !_data.userUsage){
+    fetch('/data/usage',{credentials:'include'}).then(r=>r.json()).then(u=>{
+      if(u.userUsage){_data.userUsage=u.userUsage;renderUsage(_data);}
+    }).catch(()=>{});
+  }
 }
 
 function toast(msg,color){
@@ -3152,7 +3164,7 @@ function renderUsers(d){
     name:d.userNames[num]||'—',
     isVip:(d.vipNumbers||[]).includes(num),
     isBlocked:(d.blacklist||[]).includes(num),
-    usage:d.userUsage?d.userUsage[num]:null,
+    usage:null, // لا نحمّل الاستهلاك هنا — يُحمّل فقط عند فتح تبويب الاستهلاك
     customLimit:d.userLimits?d.userLimits[num]:null
   }));
   filterUsers();
@@ -3191,11 +3203,17 @@ function filterUsers(){
 // ── USAGE ──
 let _allUsage=[];
 function renderUsage(d){
+  if(!d.userUsage){
+    // بيانات الاستهلاك لم تُحمّل بعد — تُطلب عند فتح التبويب
+    const tb=document.getElementById('usage-table');
+    if(tb)tb.innerHTML='<tr><td colspan="9" class="empty">افتح تبويب الاستهلاك لتحميل البيانات</td></tr>';
+    return;
+  }
   _allUsage=d.welcomedUsers.map(num=>({
     num,name:d.userNames[num]||'—',
     isVip:(d.vipNumbers||[]).includes(num),
     isBlocked:(d.blacklist||[]).includes(num),
-    ...(d.userUsage?d.userUsage[num]:{used:0,images:0,docs:0,limit:20,remaining:20,resetAt:null})
+    ...(d.userUsage[num]||{used:0,images:0,docs:0,limit:20,remaining:20,resetAt:null})
   }));
   filterUsage();
 }
