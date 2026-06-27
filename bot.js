@@ -3643,6 +3643,172 @@ async function handleAdminPendingInput(body, sender, reply) {
     return false;
 }
 // ============================================================
+// توليد PDF احترافي بـ PDFKit مع دعم كامل للعربي والإنجليزي
+// ============================================================
+let _pdfFontReady = false;
+const PDF_FONT_PATH      = path.join(__dirname, 'fonts', 'Amiri-Regular.ttf');
+const PDF_FONT_BOLD_PATH = path.join(__dirname, 'fonts', 'Amiri-Bold.ttf');
+
+async function ensurePdfFonts() {
+    if (_pdfFontReady) return true;
+    try {
+        if (fs.existsSync(PDF_FONT_PATH) && fs.statSync(PDF_FONT_PATH).size > 10000) {
+            _pdfFontReady = true;
+            return true;
+        }
+        const { Font, woff2 } = require('fonteditor-core');
+        await woff2.init();
+        fs.mkdirSync(path.join(__dirname, 'fonts'), { recursive: true });
+        const w2Reg  = path.join(__dirname, 'node_modules/@fontsource/amiri/files/amiri-arabic-400-normal.woff2');
+        const w2Bold = path.join(__dirname, 'node_modules/@fontsource/amiri/files/amiri-arabic-700-normal.woff2');
+        if (fs.existsSync(w2Reg)) {
+            const f = Font.create(fs.readFileSync(w2Reg), { type:'woff2', hinting:true });
+            fs.writeFileSync(PDF_FONT_PATH, Buffer.from(f.write({ type:'ttf' })));
+        }
+        if (fs.existsSync(w2Bold)) {
+            const f = Font.create(fs.readFileSync(w2Bold), { type:'woff2', hinting:true });
+            fs.writeFileSync(PDF_FONT_BOLD_PATH, Buffer.from(f.write({ type:'ttf' })));
+        }
+        _pdfFontReady = true;
+        console.log('✅ خطوط PDF جاهزة');
+        return true;
+    } catch (e) {
+        console.error('[PDF-Gen] فشل تجهيز الخطوط:', e.message);
+        return false;
+    }
+}
+
+async function generatePdfContent(userRequest) {
+    const result = await callMistral({
+        model: 'mistral-large-latest',
+        messages: [
+            { role: 'system', content:
+                'أنت مساعد متخصص في إنشاء مستندات PDF احترافية.\n' +
+                'أجب بـ JSON فقط لا غير، بهذا الهيكل بالضبط:\n' +
+                '{"title":"","subtitle":"","type":"report","language":"ar","color":"#1a5276","sections":[{"heading":"","content":"","items":[],"table":{"headers":[],"rows":[]}}],"footer":""}\n' +
+                '- sections يمكن أن تحتوي content أو items أو table أو الثلاثة معاً\n' +
+                '- language: ar أو en أو mixed\n' +
+                '- اجعل المحتوى مفصلاً واحترافياً'
+            },
+            { role: 'user', content: userRequest }
+        ],
+        max_tokens: 3000,
+        temperature: 0.3
+    });
+    const clean = result.replace(/```json|```/g, '').trim();
+    const s = clean.indexOf('{'), e = clean.lastIndexOf('}');
+    if (s === -1 || e === -1) throw new Error('JSON غير صحيح');
+    return JSON.parse(clean.slice(s, e+1));
+}
+
+async function buildPdfBuffer(data) {
+    const PDFDocument = require('pdfkit');
+    const isAr      = data.language !== 'en';
+    const mainColor = data.color || '#1a5276';
+    const fontReady = await ensurePdfFonts();
+    const doc       = new PDFDocument({ size:'A4', margin:60, info:{ Title: data.title||'مستند', Author:'MedTerm Bot' } });
+    const chunks    = [];
+    doc.on('data', c => chunks.push(c));
+
+    const reg  = fontReady && fs.existsSync(PDF_FONT_PATH)      ? (doc.registerFont('Ar',     PDF_FONT_PATH), 'Ar')      : 'Helvetica';
+    const bold = fontReady && fs.existsSync(PDF_FONT_BOLD_PATH) ? (doc.registerFont('ArBold', PDF_FONT_BOLD_PATH), 'ArBold') : 'Helvetica-Bold';
+    const W    = doc.page.width - 120;
+    const al   = isAr ? 'right' : 'left';
+    const date = new Date().toLocaleDateString(isAr ? 'ar-SA' : 'en-US', { year:'numeric', month:'long', day:'numeric' });
+
+    // رأس الصفحة
+    doc.rect(0, 0, doc.page.width, 100).fill(mainColor);
+    doc.font(bold).fontSize(26).fillColor('#fff').text(data.title||'مستند', 60, 28, { align:al, width:W });
+    if (data.subtitle) doc.font(reg).fontSize(13).fillColor('#d6eaf8').text(data.subtitle, 60, 62, { align:al, width:W });
+    doc.font(reg).fontSize(10).fillColor('#aed6f1').text(date, 60, 80, { align:al, width:W });
+    doc.moveDown(3);
+
+    for (const sec of (data.sections||[])) {
+        if (doc.y > doc.page.height - 150) doc.addPage();
+
+        if (sec.heading) {
+            doc.font(bold).fontSize(16).fillColor(mainColor).text(sec.heading, { align:al });
+            const y = doc.y;
+            doc.save().moveTo(60,y).lineTo(doc.page.width-60,y).strokeColor(mainColor).strokeOpacity(0.4).stroke().restore();
+            doc.moveDown(0.5);
+        }
+        if (sec.content) {
+            doc.font(reg).fontSize(12).fillColor('#2c3e50').text(sec.content, { align:al, lineGap:5 });
+            doc.moveDown(0.5);
+        }
+        if (sec.items?.length) {
+            for (const item of sec.items) {
+                doc.font(reg).fontSize(12).fillColor('#34495e').text('• ' + item, { align:al, indent:20, lineGap:3 });
+            }
+            doc.moveDown(0.5);
+        }
+        if (sec.table?.headers?.length) {
+            const { headers, rows=[] } = sec.table;
+            const cw = W / headers.length;
+            const hy = doc.y;
+            doc.rect(60, hy, W, 24).fill(mainColor);
+            headers.forEach((h,i) => {
+                const x = isAr ? (doc.page.width-60-cw*(i+1)) : (60+cw*i);
+                doc.font(bold).fontSize(11).fillColor('#fff').text(h, x, hy+5, { width:cw, align:'center' });
+            });
+            doc.y = hy + 28;
+            rows.forEach((row, ri) => {
+                if (doc.y > doc.page.height-80) doc.addPage();
+                const ry = doc.y;
+                if (ri%2===0) doc.rect(60, ry, W, 22).fill('#eaf4fb');
+                row.forEach((cell,ci) => {
+                    const x = isAr ? (doc.page.width-60-cw*(ci+1)) : (60+cw*ci);
+                    doc.font(reg).fontSize(10).fillColor('#2c3e50').text(String(cell), x, ry+5, { width:cw, align:'center' });
+                });
+                doc.y = ry + 25;
+            });
+            doc.moveDown(0.5);
+        }
+        doc.moveDown(0.8);
+    }
+
+    // تذييل
+    const fy = doc.page.height - 50;
+    doc.save().moveTo(60,fy-10).lineTo(doc.page.width-60,fy-10).strokeColor('#bdc3c7').stroke().restore();
+    doc.font(reg).fontSize(9).fillColor('#7f8c8d').text(data.footer||`تم الإنشاء بواسطة MedTerm Bot — ${date}`, 60, fy, { align:'center', width:W });
+
+    return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
+}
+
+async function sendPdfViaWhatsApp(to, pdfBuffer, fileName) {
+    const pid   = process.env.PHONE_NUMBER_ID;
+    const token = process.env.WHATSAPP_TOKEN;
+    if (!pid || !token) throw new Error('بيانات WhatsApp API مفقودة');
+
+    const boundary = `Boundary${Date.now()}`;
+    const body = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="messaging_product"\r\n\r\nwhatsapp\r\n`),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/pdf\r\n\r\n`),
+        pdfBuffer,
+        Buffer.from(`\r\n--${boundary}--\r\n`)
+    ]);
+    const upRes = await fetch(`https://graph.facebook.com/v19.0/${pid}/media`, {
+        method:'POST',
+        headers:{ 'Authorization':`Bearer ${token}`, 'Content-Type':`multipart/form-data; boundary=${boundary}` },
+        body
+    });
+    if (!upRes.ok) throw new Error(`رفع PDF فشل: ${await upRes.text()}`);
+    const { id: mediaId } = await upRes.json();
+
+    const sendRes = await fetch(`https://graph.facebook.com/v19.0/${pid}/messages`, {
+        method:'POST',
+        headers:{ 'Authorization':`Bearer ${token}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ messaging_product:'whatsapp', to, type:'document', document:{ id:mediaId, filename:fileName, caption:`📄 ${fileName}` } })
+    });
+    if (!sendRes.ok) throw new Error(`إرسال PDF فشل: ${await sendRes.text()}`);
+    return true;
+}
+
+function isPdfCreationRequest(text) {
+    return /اعمل(لي|ني|ي)?\s*(pdf|ملف|تقرير|سيرة|cv|ملخص|مستند)|انشئ|أنشئ|create\s+(pdf|report|cv)|generate\s+(pdf|report)|اصنع\s*(pdf|ملف)|ولّد\s*(pdf|ملف)|احتاج\s*(pdf|تقرير|cv)/i.test(text);
+}
+
+// ============================================================
 // تشغيل البوت — WhatsApp Cloud API (Webhook)
 // كل رسالة واردة من Express webhook تُمرَّر هنا بصيغة Baileys-like
 // عبر adaptCloudMessage() الموجودة في cloudAdapter.js — حتى يبقى كل المنطق أدناه بدون تغيير
@@ -4876,6 +5042,27 @@ async function processIncomingMessage(adaptedMsg) {
 
             stats.totalMessages++;
             saveData();
+
+            // ── كشف طلب إنشاء PDF ──
+            if (isPdfCreationRequest(body)) {
+                await react('⏳');
+                await reply('⏳ جاري إنشاء ملف PDF احترافي... قد يأخذ 20-40 ثانية.');
+                try {
+                    const pdfData   = await generatePdfContent(body);
+                    const pdfBuffer = await buildPdfBuffer(pdfData);
+                    const fileName  = (pdfData.title || 'مستند').replace(/[^\w\u0600-\u06FF\s]/g, '').trim().slice(0, 40) + '.pdf';
+                    await sendPdfViaWhatsApp(sender, pdfBuffer, fileName);
+                    addToChatHistory(sender, 'user', body, 'text');
+                    addToChatHistory(sender, 'assistant', `[تم إنشاء PDF: ${fileName}]`, 'document');
+                    await react('✅');
+                } catch (pdfErr) {
+                    console.error('[PDF-Gen]', pdfErr.message);
+                    await react('❌');
+                    await reply(`عذراً، لم أتمكن من إنشاء PDF: ${pdfErr.message}`);
+                    try { await wa.sendText(ADMIN_NUMBER, `🔴 خطأ PDF-Gen:\n${pdfErr.message}\nطلب: ${body.slice(0,100)}`); } catch(_) {}
+                }
+                return;
+            }
 
             // ── 5. ضغط السياق عند الامتلاء (بدل الحذف المباشر) ──
             const maxHist = isVIP ? 60 : MAX_HISTORY;
