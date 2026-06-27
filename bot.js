@@ -3712,149 +3712,118 @@ async function generatePdfContent(userRequest) {
 async function buildPdfBuffer(data) {
     const PDFDocument = require('pdfkit');
     const reshaper    = require('arabic-reshaper');
+    const fontReady   = await ensurePdfFonts();
 
-    // تحضير النص للـ PDFKit — يصلح الحروف العربية المتشابكة والمتقطعة
-    // المشكلة: PDFKit لا يدعم Arabic shaping تلقائياً
-    // الحل: شبّك الحروف بـ arabic-reshaper + اعكس الترتيب للـ RTL
     const shapeAr = (input) => {
-        // حماية من non-string (object, array, null, undefined)
         const text = (input === null || input === undefined) ? '' : String(input);
         if (!text.trim()) return text;
-
         return text.split('\n').map(line => {
-            if (!line.trim()) return line;
-            const hasAr = /[\u0600-\u06FF]/.test(line);
-            if (!hasAr) return line; // نص إنجليزي — بدون تعديل
-
-            // نص عربي أو مختلط — نشبّك الحروف ونعكس الترتيب
-            try {
-                const shaped   = reshaper.convertArabic(line);
-                const reversed = shaped.split('').reverse().join('');
-                return reversed;
-            } catch (_) {
-                return line; // fallback للنص الأصلي لو فشل
-            }
+            if (!line.trim() || !/[\u0600-\u06FF]/.test(line)) return line;
+            try { return reshaper.convertArabic(line).split('').reverse().join(''); }
+            catch (_) { return line; }
         }).join('\n');
     };
-    const isAr     = data.language !== 'en';
+
     const mainColor = data.color || '#1a5276';
-    const fontReady = await ensurePdfFonts();
-    const doc       = new PDFDocument({ size:'A4', margin:60, info:{ Title: shapeAr(data.title||'مستند'), Author:'MedTerm Bot' } });
-    const chunks    = [];
+    const doc = new PDFDocument({ size:'A4', margin:60, info:{ Title: String(data.title||'Document'), Author:'MedTerm Bot' } });
+    const chunks = [];
     doc.on('data', c => chunks.push(c));
 
-    const reg  = fontReady && fs.existsSync(PDF_FONT_PATH)      ? (doc.registerFont('Ar',     PDF_FONT_PATH), 'Ar')      : 'Helvetica';
-    const bold = fontReady && fs.existsSync(PDF_FONT_BOLD_PATH) ? (doc.registerFont('ArBold', PDF_FONT_BOLD_PATH), 'ArBold') : 'Helvetica-Bold';
-    const W    = doc.page.width - 120;
-    const al   = isAr ? 'right' : 'left';
-    const date = new Date().toLocaleDateString(isAr ? 'ar-SA' : 'en-US', { year:'numeric', month:'long', day:'numeric' });
+    if (fontReady && fs.existsSync(PDF_FONT_PATH)) {
+        doc.registerFont('Ar',     PDF_FONT_PATH);
+        doc.registerFont('ArBold', fs.existsSync(PDF_FONT_BOLD_PATH) ? PDF_FONT_BOLD_PATH : PDF_FONT_PATH);
+    }
 
-    // رأس الصفحة
+    // كتابة نص بالخط المناسب تلقائياً (عربي أو إنجليزي)
+    const writeText = (input, opts = {}, useBold = false) => {
+        const str    = (input === null || input === undefined) ? '' : String(input);
+        const hasAr  = /[\u0600-\u06FF]/.test(str);
+        const font   = hasAr ? (useBold ? 'ArBold' : 'Ar') : (useBold ? 'Helvetica-Bold' : 'Helvetica');
+        const align  = opts.align || (hasAr ? 'right' : 'left');
+        const content = hasAr ? shapeAr(str) : str;
+        doc.font(font).text(content, { ...opts, align });
+    };
+
+    const W    = doc.page.width - 120;
+    const date = new Date().toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
+
+    // ── رأس الصفحة ──
     doc.rect(0, 0, doc.page.width, 100).fill(mainColor);
-    doc.font(bold).fontSize(26).fillColor('#fff').text(shapeAr(data.title||'مستند'), 60, 28, { align:al, width:W });
-    if (data.subtitle) doc.font(reg).fontSize(13).fillColor('#d6eaf8').text(shapeAr(data.subtitle), 60, 62, { align:al, width:W });
-    doc.font(reg).fontSize(10).fillColor('#aed6f1').text(shapeAr(date), 60, 80, { align:al, width:W });
+    doc.fontSize(26).fillColor('#fff');
+    writeText(data.title || 'Document', { x:60, y:28, width:W }, true);
+    if (data.subtitle) { doc.fontSize(13).fillColor('#d6eaf8'); writeText(data.subtitle, { x:60, y:62, width:W }); }
+    doc.font('Helvetica').fontSize(10).fillColor('#aed6f1').text(date, 60, 80, { align:'right', width:W });
     doc.moveDown(3);
 
     for (const sec of (data.sections||[])) {
         if (doc.y > doc.page.height - 150) doc.addPage();
+
         if (sec.heading) {
-            doc.font(bold).fontSize(16).fillColor(mainColor).text(shapeAr(sec.heading), { align:al });
+            doc.fontSize(16).fillColor(mainColor);
+            writeText(sec.heading, { width: W }, true);
             const y = doc.y;
             doc.save().moveTo(60,y).lineTo(doc.page.width-60,y).strokeColor(mainColor).strokeOpacity(0.4).stroke().restore();
             doc.moveDown(0.5);
         }
+
         if (sec.content) {
-            doc.font(reg).fontSize(12).fillColor('#2c3e50').text(shapeAr(sec.content), { align:al, lineGap:5 });
+            const contentStr = Array.isArray(sec.content) ? sec.content.join('\n') : String(sec.content||'');
+            doc.fontSize(12).fillColor('#2c3e50');
+            writeText(contentStr, { lineGap:5, width: W });
             doc.moveDown(0.5);
         }
-        if (sec.items?.length) {
+
+        if (sec.items && sec.items.length) {
             for (const item of sec.items) {
-                doc.font(reg).fontSize(12).fillColor('#34495e').text('• ' + shapeAr(item), { align:al, indent:20, lineGap:3 });
+                const itemStr = String(item||'');
+                const hasArI  = /[\u0600-\u06FF]/.test(itemStr);
+                doc.fontSize(12).fillColor('#34495e');
+                if (hasArI) { doc.font('Ar').text(shapeAr('• ' + itemStr), { indent:20, lineGap:3, align:'right', width: W }); }
+                else { doc.font('Helvetica').text('• ' + itemStr, { indent:20, lineGap:3, align:'left', width: W }); }
             }
             doc.moveDown(0.5);
         }
-        if (sec.table?.headers?.length) {
+
+        if (sec.table && sec.table.headers && sec.table.headers.length) {
             const { headers, rows=[] } = sec.table;
             const cw = W / headers.length;
             const hy = doc.y;
-            doc.rect(60, hy, W, 24).fill(mainColor);
-            headers.forEach((h,i) => {
-                const x = isAr ? (doc.page.width-60-cw*(i+1)) : (60+cw*i);
-                doc.font(bold).fontSize(11).fillColor('#fff').text(shapeAr(h), x, hy+5, { width:cw, align:'center' });
+            doc.rect(60, hy, W, 26).fill(mainColor);
+            headers.forEach((h, i) => {
+                const hStr  = String(h||'');
+                const hasArH = /[\u0600-\u06FF]/.test(hStr);
+                doc.fontSize(11).fillColor('#fff');
+                if (hasArH) doc.font('ArBold').text(shapeAr(hStr), 60 + cw*i, hy+6, { width:cw, align:'center' });
+                else doc.font('Helvetica-Bold').text(hStr, 60 + cw*i, hy+6, { width:cw, align:'center' });
             });
-            doc.y = hy + 28;
+            doc.y = hy + 30;
             rows.forEach((row, ri) => {
-                if (doc.y > doc.page.height-80) doc.addPage();
+                if (doc.y > doc.page.height - 80) doc.addPage();
                 const ry = doc.y;
                 if (ri%2===0) doc.rect(60, ry, W, 22).fill('#eaf4fb');
-                row.forEach((cell,ci) => {
-                    const x = isAr ? (doc.page.width-60-cw*(ci+1)) : (60+cw*ci);
-                    doc.font(reg).fontSize(10).fillColor('#2c3e50').text(shapeAr(String(cell)), x, ry+5, { width:cw, align:'center' });
+                row.forEach((cell, ci) => {
+                    const cStr   = String(cell||'');
+                    const hasArC = /[\u0600-\u06FF]/.test(cStr);
+                    doc.fontSize(10).fillColor('#2c3e50');
+                    if (hasArC) doc.font('Ar').text(shapeAr(cStr), 60 + cw*ci, ry+5, { width:cw, align:'center' });
+                    else doc.font('Helvetica').text(cStr, 60 + cw*ci, ry+5, { width:cw, align:'center' });
                 });
                 doc.y = ry + 25;
             });
             doc.moveDown(0.5);
         }
+
         doc.moveDown(0.8);
     }
 
+    // ── تذييل ──
     const fy = doc.page.height - 50;
     doc.save().moveTo(60,fy-10).lineTo(doc.page.width-60,fy-10).strokeColor('#bdc3c7').stroke().restore();
-    doc.font(reg).fontSize(9).fillColor('#7f8c8d').text(shapeAr(data.footer||`تم الإنشاء بواسطة MedTerm Bot — ${date}`), 60, fy, { align:'center', width:W });
-
-    return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
-
-    // رأس الصفحة
-    doc.rect(0, 0, doc.page.width, 100).fill(mainColor);
-    doc.font(bold).fontSize(26).fillColor('#fff').text(data.title||'مستند', 60, 28, { align:al, width:W });
-    if (data.subtitle) doc.font(reg).fontSize(13).fillColor('#d6eaf8').text(data.subtitle, 60, 62, { align:al, width:W });
-    doc.font(reg).fontSize(10).fillColor('#aed6f1').text(date, 60, 80, { align:al, width:W });
-    doc.moveDown(3);
-
-    for (const sec of (data.sections||[])) {
-        if (doc.y > doc.page.height - 150) doc.addPage();
-
-        if (sec.heading) {
-            doc.font(bold).fontSize(16).fillColor(mainColor).text(sec.heading, { align:al });
-            const y = doc.y;
-            doc.save().moveTo(60,y).lineTo(doc.page.width-60,y).strokeColor(mainColor).strokeOpacity(0.4).stroke().restore();
-            doc.moveDown(0.5);
-        }
-        if (sec.content) {
-            doc.font(reg).fontSize(12).fillColor('#2c3e50').text(sec.content, { align:al, lineGap:5 });
-            doc.moveDown(0.5);
-        }
-        if (sec.items?.length) {
-            for (const item of sec.items) {
-                doc.font(reg).fontSize(12).fillColor('#34495e').text('• ' + item, { align:al, indent:20, lineGap:3 });
-            }
-            doc.moveDown(0.5);
-        }
-        if (sec.table?.headers?.length) {
-            const { headers, rows=[] } = sec.table;
-            const cw = W / headers.length;
-            const hy = doc.y;
-            doc.rect(60, hy, W, 24).fill(mainColor);
-            headers.forEach((h,i) => {
-                const x = isAr ? (doc.page.width-60-cw*(i+1)) : (60+cw*i);
-                doc.font(bold).fontSize(11).fillColor('#fff').text(h, x, hy+5, { width:cw, align:'center' });
-            });
-            doc.y = hy + 28;
-            rows.forEach((row, ri) => {
-                if (doc.y > doc.page.height-80) doc.addPage();
-                const ry = doc.y;
-                if (ri%2===0) doc.rect(60, ry, W, 22).fill('#eaf4fb');
-                row.forEach((cell,ci) => {
-                    const x = isAr ? (doc.page.width-60-cw*(ci+1)) : (60+cw*ci);
-                    doc.font(reg).fontSize(10).fillColor('#2c3e50').text(String(cell), x, ry+5, { width:cw, align:'center' });
-                });
-                doc.y = ry + 25;
-            });
-            doc.moveDown(0.5);
-        }
-        doc.moveDown(0.8);
-    }
+    const footerStr = String(data.footer || ('Generated by MedTerm Bot — ' + date));
+    const hasArFoot = /[\u0600-\u06FF]/.test(footerStr);
+    doc.fontSize(9).fillColor('#7f8c8d');
+    if (hasArFoot) doc.font('Ar').text(shapeAr(footerStr), 60, fy, { align:'center', width:W });
+    else doc.font('Helvetica').text(footerStr, 60, fy, { align:'center', width:W });
 
     return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
 }
