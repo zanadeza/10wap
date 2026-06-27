@@ -2236,6 +2236,68 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                             else { result = await broadcastToAll(txt); }
                         }
                     }
+                    else if (action === 'getTargetedUsers') {
+                        // المستخدمون الذين انتهت فترتهم التجريبية ولم يشتركوا بـ VIP
+                        const targeted = Object.keys(welcomedUsers)
+                            .map(n => cleanNumber(n))
+                            .filter(n => {
+                                if (!n || n === ADMIN_NUMBER) return false;
+                                if (isActiveVIP(n)) return false;
+                                if ((blacklist||[]).includes(n)) return false;
+                                const rec = getDailyRecord(n);
+                                const limit = getUserDailyLimit(n);
+                                return rec.messages >= limit; // وصل للحد = انتهت فترته
+                            })
+                            .map(n => ({
+                                num:  n,
+                                name: userNames[n] || '—',
+                                msgs: getDailyRecord(n).messages,
+                                limit: getUserDailyLimit(n)
+                            }));
+                        result = { ok: true, users: targeted, total: targeted.length };
+                    }
+                    else if (action === 'broadcastTargeted') {
+                        // بث مستهدف للمستخدمين الذين انتهت فترتهم التجريبية
+                        if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
+                        else {
+                            const txt = (data.text || '').trim();
+                            if (!txt) { result = { ok: false, msg: 'الرسالة فارغة' }; }
+                            else {
+                                const targeted = Object.keys(welcomedUsers)
+                                    .map(n => cleanNumber(n))
+                                    .filter(n => {
+                                        if (!n || n === ADMIN_NUMBER) return false;
+                                        if (isActiveVIP(n)) return false;
+                                        if ((blacklist||[]).includes(n)) return false;
+                                        const rec = getDailyRecord(n);
+                                        const limit = getUserDailyLimit(n);
+                                        return rec.messages >= limit;
+                                    });
+                                if (targeted.length === 0) {
+                                    result = { ok: false, msg: 'لا يوجد مستخدمون مستهدفون حالياً' };
+                                } else {
+                                    // نضع قائمة مخصصة للبث المستهدف
+                                    _broadcastState = {
+                                        id: Date.now().toString(),
+                                        text: txt,
+                                        users: targeted,
+                                        batchIndex: 0,
+                                        batchProgress: 0,
+                                        sent: 0,
+                                        failed: 0,
+                                        total: targeted.length,
+                                        status: 'running',
+                                        type: 'targeted', // نوع البث — مستهدف
+                                        startedAt: Date.now(),
+                                        updatedAt: Date.now()
+                                    };
+                                    await saveBroadcastState();
+                                    runBroadcast().catch(e => console.error('[broadcast targeted]', e.message));
+                                    result = { ok: true, msg: '🎯 بدأ البث المستهدف لـ ' + targeted.length + ' مستخدم', total: targeted.length };
+                                }
+                            }
+                        }
+                    }
                     else if (action === 'broadcastStop') {
                         result = await stopBroadcast();
                     }
@@ -2604,6 +2666,7 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     <div class="nav-item" data-tab="customsend" onclick="showTab('customsend')"><span class="icon">✉️</span> رسالة مخصصة</div>
     <div class="nav-item" data-tab="blacklist" onclick="showTab('blacklist')"><span class="icon">⛔</span> المحظورون</div>
     <div class="nav-item" data-tab="broadcast" onclick="showTab('broadcast')"><span class="icon">📢</span> البث</div>
+    <div class="nav-item" data-tab="targeted" onclick="showTab('targeted')"><span class="icon">🎯</span> المستهدفون</div>
     <div class="nav-item" data-tab="reports" onclick="showTab('reports')"><span class="icon">🚨</span> البلاغات <span class="nav-badge" id="reports-badge" style="display:none">0</span></div>
   </nav>
   <div class="sidebar-footer">
@@ -2882,7 +2945,40 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
       </div>
     </div>
 
-    <!-- ══ المحادثات ══ -->
+    <!-- المستخدمون المستهدفون -->
+    <div class="panel" id="panel-targeted">
+      <div class="card">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+          <div class="card-title">🎯 المستخدمون المستهدفون</div>
+          <button class="btn btn-primary btn-sm" onclick="loadTargetedUsers()">🔄 تحديث</button>
+        </div>
+        <div style="padding:14px 18px">
+          <div class="info-box" style="margin-bottom:12px">
+            هؤلاء المستخدمون وصلوا للحد اليومي وانتهت فترتهم التجريبية ولم يشتركوا بـ VIP بعد.
+            يمكنك إرسال رسالة ترويجية لهم مباشرة.
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+            <span id="targeted-count" style="font-size:13px;color:var(--muted)">جاري التحميل...</span>
+          </div>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>الرقم</th><th>الاسم</th><th>الرسائل</th><th>الحد</th></tr></thead>
+            <tbody id="targeted-table"><tr><td colspan="4" class="empty">اضغط تحديث لتحميل القائمة</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-header"><div class="card-title">✉️ بث مستهدف لهم</div></div>
+        <div style="padding:18px;display:flex;flex-direction:column;gap:12px">
+          <textarea class="inp" id="targeted-msg-text" placeholder="اكتب رسالة الاشتراك هنا..." style="min-height:140px"></textarea>
+          <button class="btn btn-primary" onclick="sendTargetedBroadcast()" style="align-self:flex-start">🎯 إرسال للمستهدفين فقط</button>
+          <div class="info-box">💡 الرسالة ستُرسل فقط للمستخدمين الذين انتهت فترتهم التجريبية — مثالية لعروض الاشتراك.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- المحادثات -->
     <div class="panel" id="panel-conversations">
       <div class="conv-layout">
         <!-- قائمة المستخدمين -->
@@ -2954,6 +3050,7 @@ const PAGE_META={
   customsend:{title:'رسالة مخصصة',sub:'إرسال رسالة مباشرة لمستخدم محدد'},
   blacklist:{title:'المحظورون',sub:'قائمة المحظورين من استخدام البوت'},
   broadcast:{title:'البث الجماعي',sub:'إرسال رسالة لجميع المستخدمين'},
+  targeted:{title:'المستخدمون المستهدفون',sub:'من انتهت فترتهم التجريبية ولم يشتركوا'},
   reports:{title:'البلاغات',sub:'البلاغات المرسلة من المستخدمين'}
 };
 
@@ -3223,8 +3320,37 @@ async function doAction(action){
   toast(r.msg||'✅ تم');
   loadData();
 }
-async function sendBroadcast(){
-  await startBroadcast();
+async function loadTargetedUsers(){
+  document.getElementById('targeted-count').textContent='جاري التحميل...';
+  document.getElementById('targeted-table').innerHTML='<tr><td colspan="4" class="empty">جاري التحميل...</td></tr>';
+  const r=await api('getTargetedUsers');
+  if(!r.ok){toast('❌ '+(r.msg||'فشل'),'#dc2626');return;}
+  document.getElementById('targeted-count').textContent='إجمالي المستهدفين: '+r.total+' مستخدم';
+  const tbody=document.getElementById('targeted-table');
+  if(!r.users||!r.users.length){
+    tbody.innerHTML='<tr><td colspan="4" class="empty">لا يوجد مستخدمون مستهدفون حالياً</td></tr>';
+    return;
+  }
+  tbody.innerHTML=r.users.map(u=>
+    '<tr>'+
+    '<td dir="ltr">'+esc(u.num)+'</td>'+
+    '<td>'+esc(u.name)+'</td>'+
+    '<td style="color:#ef4444;font-weight:700">'+u.msgs+'</td>'+
+    '<td>'+u.limit+'</td>'+
+    '</tr>'
+  ).join('');
+}
+async function sendTargetedBroadcast(){
+  const text=document.getElementById('targeted-msg-text').value.trim();
+  if(!text){toast('أدخل نص الرسالة','#f59e0b');return;}
+  const countEl=document.getElementById('targeted-count').textContent;
+  if(!confirm('إرسال البث المستهدف؟\n'+countEl))return;
+  const r=await api('broadcastTargeted',{text});
+  if(r.ok){
+    toast('✅ '+r.msg);
+    showTab('broadcast');
+    startBroadcastPolling();
+  } else toast('❌ '+(r.msg||'فشل'),'#dc2626');
 }
 async function startBroadcast(){
   const text=document.getElementById('broadcast-text').value.trim();
