@@ -50,17 +50,24 @@ if (!META_APP_SECRET) {
 }
 
 // ============================================================
-// DASHBOARD AUTH
+// DASHBOARD AUTH — نظام صلاحيات متعدد المستويات
 // ============================================================
 const DASHBOARD_USER  = process.env.DASHBOARD_USER;
 const DASHBOARD_PASS  = process.env.DASHBOARD_PASS;
+const DEV_USER        = process.env.DEV_USER || DASHBOARD_USER;
+const DEV_PASS        = process.env.DEV_PASS || DASHBOARD_PASS;
 const crypto          = require('crypto');
 
 if (!DASHBOARD_USER || !DASHBOARD_PASS) {
     console.error('❌ خطأ فادح: لم يتم تعيين DASHBOARD_USER و DASHBOARD_PASS في .env (بيانات دخول لوحة التحكم)');
     process.exit(1);
 }
-// sessions: { token: { ip, createdAt } }
+
+// مستويات الصلاحية
+const ROLE_ADMIN = 'admin'; // يوزر عادي — كل شي ما عدا المحادثات
+const ROLE_DEV   = 'dev';   // مطور — كل شي بلا استثناء
+
+// sessions: { token: { ip, ua, createdAt, role } }
 const _sessions       = {};
 const SESSION_TTL_MS  = 12 * 60 * 60_000; // 12 ساعة
 
@@ -87,17 +94,32 @@ function isValidSession(req) {
         delete _sessions[token];
         return false;
     }
-    // ملاحظة: لا نفحص IP لأن Ngrok يغير الـ IP بين الطلبات بشكل طبيعي.
-    // كبديل عملي ضد سرقة الكوكي: نربط الجلسة بـ User-Agent وقت تسجيل الدخول.
-    // متصفح مختلف تماماً (= جهاز/برنامج مختلف يستخدم الكوكي المسروق) يُرفض،
-    // لكن هذا ليس حماية كاملة (الـ User-Agent قابل للتزوير من مهاجم متمرس).
     const ua = req.headers['user-agent'] || '';
     if (s.ua && s.ua !== ua) {
         console.warn('⚠️ جلسة admin مرفوضة: User-Agent مختلف عن وقت تسجيل الدخول (احتمال سرقة كوكي)');
         return false;
     }
-    s.createdAt = Date.now(); // تجديد تلقائي عند كل طلب
+    s.createdAt = Date.now();
     return true;
+}
+
+// إرجاع دور المستخدم الحالي من الجلسة
+function getSessionRole(req) {
+    const token = parseCookie(req.headers['cookie'] || '')['adm_tok'];
+    if (!token || !_sessions[token]) return null;
+    return _sessions[token].role || ROLE_ADMIN;
+}
+
+// التحقق من صلاحية معينة
+function hasPermission(req, permission) {
+    const role = getSessionRole(req);
+    if (role === ROLE_DEV) return true; // المطور عنده كل الصلاحيات
+    if (role === ROLE_ADMIN) {
+        // اليوزر العادي ممنوع من المحادثات فقط
+        const blocked = ['conversations', 'clearChat'];
+        return !blocked.includes(permission);
+    }
+    return false;
 }
 function parseCookie(str) {
     const result = {};
@@ -1612,41 +1634,135 @@ async function handleUserCommand(body, sender, reply, react, isAdmin, isVIP) {
 
 
 // كل مستخدم رسالة عشوائية مختلفة + rate limiting ذكي
-async function broadcastToAll(getTextFn) {
-    if (!isConnected) { console.log("[broadcast] البوت غير متصل"); return { sent: 0, failed: 0, total: 0 }; }
+// ============================================================
+// نظام البث المقسم — دفعات 100 مستخدم مع حفظ التقدم واستكمال عند الانقطاع
+// ============================================================
+const BATCH_SIZE = 100; // عدد المستخدمين في كل دفعة
+
+// حالة البث الحالي (في الذاكرة + MongoDB)
+let _broadcastState = null;
+// { id, text, users[], batchIndex, batchProgress, sent, failed, total, status, startedAt, updatedAt }
+
+async function saveBroadcastState() {
+    if (!_broadcastState) return;
+    _broadcastState.updatedAt = Date.now();
+    if (_mongoReady) {
+        try {
+            await _mongoDB.collection('broadcast').updateOne(
+                { _id: 'current' },
+                { $set: { ..._broadcastState } },
+                { upsert: true }
+            );
+        } catch (e) { console.error('[broadcast] فشل حفظ الحالة:', e.message); }
+    }
+}
+
+async function loadBroadcastState() {
+    if (!_mongoReady) return null;
+    try {
+        const doc = await _mongoDB.collection('broadcast').findOne({ _id: 'current' });
+        if (doc && doc.status === 'running') {
+            const { _id, ...state } = doc;
+            _broadcastState = state;
+            return state;
+        }
+    } catch (e) { console.error('[broadcast] فشل تحميل الحالة:', e.message); }
+    return null;
+}
+
+async function broadcastToAll(text) {
+    if (!isConnected) return { ok: false, msg: 'البوت غير متصل' };
+    if (_broadcastState?.status === 'running') return { ok: false, msg: 'يوجد بث جارٍ بالفعل' };
+
     const allUsers = Object.keys(welcomedUsers)
         .map(n => cleanNumber(n))
-        .filter(n => n && n !== ADMIN_NUMBER && /^\d+$/.test(n));
+        .filter(n => n && n !== ADMIN_NUMBER && /^\d+$/.test(n) && !blacklist.includes(n));
 
-    console.log(`📢 قائمة البث: ${allUsers.length} مستخدم`);
-    let sent = 0, failed = 0;
+    _broadcastState = {
+        id: Date.now().toString(),
+        text,
+        users: allUsers,
+        batchIndex: 0,
+        batchProgress: 0,
+        sent: 0,
+        failed: 0,
+        total: allUsers.length,
+        status: 'running',
+        startedAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    await saveBroadcastState();
 
-    for (let i = 0; i < allUsers.length; i++) {
-        const num = allUsers[i];
+    // تشغيل البث بالخلفية
+    runBroadcast().catch(e => console.error('[broadcast]', e.message));
+    return { ok: true, msg: `🚀 بدأ البث لـ ${allUsers.length} مستخدم`, id: _broadcastState.id };
+}
 
-        if (i > 0 && i % 30 === 0) {
-            console.log(`⏸️ استراحة 10 ثواني بعد ${i} رسائل...`);
-            await new Promise(r => setTimeout(r, 10_000));
-        }
+async function resumeBroadcast() {
+    if (_broadcastState?.status !== 'paused') return { ok: false, msg: 'لا يوجد بث متوقف للاستكمال' };
+    _broadcastState.status = 'running';
+    await saveBroadcastState();
+    runBroadcast().catch(e => console.error('[broadcast resume]', e.message));
+    return { ok: true, msg: '▶️ تم استكمال البث' };
+}
 
-        try {
-            const text = typeof getTextFn === 'function' ? getTextFn() : getTextFn;
-            console.log(`📤 إرسال لـ ${num}`);
-            // ملاحظة: Cloud API يسمح بالرد المجاني فقط ضمن نافذة 24 ساعة من آخر رسالة من المستخدم.
-            // إذا تجاوز المستخدم 24 ساعة بدون تفاعل، يجب استخدام Message Template معتمد من Meta.
-            await wa.sendText(num, text);
-            sent++;
-            console.log(`✅ وصل لـ ${num}`);
-        } catch(e) {
-            console.error(`❌ فشل لـ ${num}:`, e.message);
-            failed++;
-        }
+async function stopBroadcast() {
+    if (!_broadcastState || _broadcastState.status !== 'running') return { ok: false, msg: 'لا يوجد بث جارٍ' };
+    _broadcastState.status = 'paused';
+    await saveBroadcastState();
+    return { ok: true, msg: '⏸️ تم إيقاف البث — يمكنك استكماله لاحقاً' };
+}
 
-        await new Promise(r => setTimeout(r, 800));
+async function runBroadcast() {
+    if (!_broadcastState) return;
+    const state = _broadcastState;
+    const batches = [];
+
+    // تقسيم المستخدمين لدفعات
+    for (let i = 0; i < state.users.length; i += BATCH_SIZE) {
+        batches.push(state.users.slice(i, i + BATCH_SIZE));
     }
 
-    console.log(`📢 اكتمل البث: ${sent} نجح، ${failed} فشل`);
-    return { sent, failed, total: allUsers.length };
+    for (let bi = state.batchIndex; bi < batches.length; bi++) {
+        if (state.status !== 'running') break; // توقف لو تم الإيقاف
+
+        state.batchIndex = bi;
+        const batch = batches[bi];
+
+        for (let pi = state.batchProgress; pi < batch.length; pi++) {
+            if (state.status !== 'running') break;
+
+            state.batchProgress = pi;
+            const num = batch[pi];
+
+            try {
+                await wa.sendText(num, state.text);
+                state.sent++;
+            } catch (e) {
+                state.failed++;
+                console.error(`[broadcast] ❌ ${num}:`, e.message);
+            }
+
+            // حفظ التقدم كل 10 رسائل
+            if ((state.sent + state.failed) % 10 === 0) await saveBroadcastState();
+            await new Promise(r => setTimeout(r, 800));
+        }
+
+        // استراحة بين الدفعات
+        if (bi < batches.length - 1 && state.status === 'running') {
+            console.log(`[broadcast] ✅ دفعة ${bi + 1}/${batches.length} — استراحة 5 ثواني...`);
+            state.batchProgress = 0;
+            await saveBroadcastState();
+            await new Promise(r => setTimeout(r, 5000));
+        }
+    }
+
+    if (state.status === 'running') {
+        state.status = 'done';
+        state.batchProgress = 0;
+        console.log(`[broadcast] ✅ اكتمل: ${state.sent} نجح، ${state.failed} فشل`);
+    }
+    await saveBroadcastState();
 }
 
 
@@ -1724,6 +1840,13 @@ button:hover{opacity:.9;transform:translateY(-1px)}
         // ============================================================
         // ===== WEBHOOK (Meta) — معالجة فورية، بدون rate-limit أو جلسة =====
         // ============================================================
+        if (url === '/session-info' && req.method === 'GET') {
+            if (!isValidSession(req)) { res.writeHead(401); res.end('{}'); return; }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ role: getSessionRole(req) }));
+            return;
+        }
+
         if (url === '/health' && req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok', bot: isConnected ? 'connected' : 'disconnected', ts: Date.now() }));
@@ -1836,7 +1959,10 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     );
                     if (safeCompare(params.username, DASHBOARD_USER) && safeCompare(params.password, DASHBOARD_PASS)) {
                         const token = generateToken();
-                        _sessions[token] = { ip, createdAt: Date.now(), ua: req.headers['user-agent'] || '' };
+                        // تحديد الدور: لو نفس بيانات المطور → dev، غير ذلك → admin
+                        const role = (safeCompare(params.username, DEV_USER) && safeCompare(params.password, DEV_PASS))
+                            ? ROLE_DEV : ROLE_ADMIN;
+                        _sessions[token] = { ip, createdAt: Date.now(), ua: req.headers['user-agent'] || '', role };
                         res.writeHead(302, {
                             'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Lax`,
                             'Location': '/'
@@ -2102,22 +2228,48 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     else if (action === 'broadcast') {
                         if (!isConnected) { result = { ok: false, msg: 'البوت غير متصل' }; }
                         else {
-                            const txt = data.text || '';
+                            const txt = (data.text || '').trim();
                             if (!txt) { result = { ok: false, msg: 'الرسالة فارغة' }; }
-                            else {
-                                broadcastToAll(`📢 *رسالة من الإدارة*\n\n${txt}`).then(r => {
-                                    console.log(`📢 بث: ${r.sent} نجح، ${r.failed} فشل`);
-                                }).catch(console.error);
-                                result.msg = 'بدأ الإرسال في الخلفية';
-                            }
+                            else { result = await broadcastToAll(txt); }
+                        }
+                    }
+                    else if (action === 'broadcastStop') {
+                        result = await stopBroadcast();
+                    }
+                    else if (action === 'broadcastResume') {
+                        result = await resumeBroadcast();
+                    }
+                    else if (action === 'broadcastStatus') {
+                        if (!_broadcastState) {
+                            result = { ok: true, status: 'idle' };
+                        } else {
+                            const totalBatches = Math.ceil(_broadcastState.total / BATCH_SIZE);
+                            const processed = _broadcastState.sent + _broadcastState.failed;
+                            result = {
+                                ok: true,
+                                status: _broadcastState.status,
+                                sent: _broadcastState.sent,
+                                failed: _broadcastState.failed,
+                                total: _broadcastState.total,
+                                batchIndex: _broadcastState.batchIndex,
+                                totalBatches,
+                                currentBatchSent: _broadcastState.batchProgress,
+                                currentBatchTotal: Math.min(BATCH_SIZE, _broadcastState.total - _broadcastState.batchIndex * BATCH_SIZE),
+                                percent: _broadcastState.total > 0 ? Math.round(processed / _broadcastState.total * 100) : 0,
+                                startedAt: _broadcastState.startedAt
+                            };
                         }
                     }
                     else if (action === 'clearChat') {
-                        const num = data.num || '';
-                        if (num) {
-                            clearUserChatHistory(num);
-                            userChats[num] = [];
-                            result.msg = `✅ تم مسح محادثات ${num}`;
+                        if (!hasPermission(req, 'clearChat')) {
+                            result = { ok: false, msg: '⛔ ليس لديك صلاحية لهذا الإجراء' };
+                        } else {
+                            const num = data.num || '';
+                            if (num) {
+                                clearUserChatHistory(num);
+                                userChats[num] = [];
+                                result.msg = `✅ تم مسح محادثات ${num}`;
+                            }
                         }
                     }
                     else if (action === 'stats') {
@@ -2143,6 +2295,11 @@ button:hover{opacity:.9;transform:translateY(-1px)}
 
         // ===== CONVERSATIONS API =====
         if (url === '/conversations') {
+            if (!hasPermission(req, 'conversations')) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, msg: '⛔ ليس لديك صلاحية لعرض المحادثات' }));
+                return;
+            }
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             // قائمة المستخدمين مع عدد رسائلهم وآخر نشاط
             const list = Object.entries(_chatHistory).map(([sender, msgs]) => {
@@ -2661,16 +2818,63 @@ textarea.inp{resize:vertical;min-height:90px;width:100%}
     </div>
 
     <!-- ══ البث ══ -->
+    <!-- البث الجماعي -->
     <div class="panel" id="panel-broadcast">
-      <div class="card">
-        <div class="card-header"><div class="card-title">📢 إرسال رسالة جماعية لجميع المستخدمين</div></div>
+      <div class="card" id="broadcast-compose-card">
+        <div class="card-header"><div class="card-title">📢 البث الجماعي المقسم</div></div>
         <div style="padding:18px;display:flex;flex-direction:column;gap:12px">
-          <textarea class="inp" id="broadcast-text" placeholder="اكتب الرسالة هنا..."></textarea>
-          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <button class="btn btn-primary" onclick="sendBroadcast()">📢 إرسال للجميع</button>
-            <span id="broadcast-count" style="font-size:12px;color:var(--muted)"></span>
+          <textarea class="inp" id="broadcast-text" placeholder="اكتب نص الرسالة هنا..." style="min-height:120px"></textarea>
+          <div class="info-box">
+            📦 البث يتم بدفعات <strong>100 مستخدم</strong> مع استراحة 5 ثوانٍ بين كل دفعة.<br>
+            ⏸️ يمكنك إيقاف البث واستكماله من نفس المكان لاحقاً.
           </div>
-          <div class="info-box">⚠️ الرسالة ستُرسل لجميع المستخدمين مع تأخير 800ms بين كل رسالة لتجنب الحظر.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="startBroadcast()">📢 بدء البث</button>
+            <span id="broadcast-user-count" style="font-size:12px;color:var(--muted);align-self:center"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="broadcast-progress-card" style="margin-top:16px;display:none">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+          <div class="card-title">📊 تقدم البث</div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-warn btn-sm" id="btn-stop-resume" onclick="toggleBroadcast()">⏸️ إيقاف</button>
+            <button class="btn btn-danger btn-sm" onclick="clearBroadcastState()" id="btn-clear-broadcast" style="display:none">🗑️ مسح</button>
+          </div>
+        </div>
+        <div style="padding:18px">
+          <div style="margin-bottom:16px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <span style="font-size:13px;color:var(--muted)">التقدم الكلي</span>
+              <span id="bc-percent" style="font-size:13px;font-weight:700;color:var(--accent)">0%</span>
+            </div>
+            <div style="background:rgba(255,255,255,.1);border-radius:8px;height:12px;overflow:hidden">
+              <div id="bc-progress-bar" style="height:100%;background:linear-gradient(90deg,#25c39e,#1aa6e0);border-radius:8px;width:0%;transition:width .5s"></div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px">
+            <div style="background:rgba(255,255,255,.06);border-radius:10px;padding:12px;text-align:center">
+              <div id="bc-sent" style="font-size:22px;font-weight:700;color:#25c39e">0</div>
+              <div style="font-size:11px;color:var(--muted)">✅ نجح</div>
+            </div>
+            <div style="background:rgba(255,255,255,.06);border-radius:10px;padding:12px;text-align:center">
+              <div id="bc-failed" style="font-size:22px;font-weight:700;color:#ef4444">0</div>
+              <div style="font-size:11px;color:var(--muted)">❌ فشل</div>
+            </div>
+            <div style="background:rgba(255,255,255,.06);border-radius:10px;padding:12px;text-align:center">
+              <div id="bc-remaining" style="font-size:22px;font-weight:700;color:#f59e0b">0</div>
+              <div style="font-size:11px;color:var(--muted)">⏳ متبقي</div>
+            </div>
+            <div style="background:rgba(255,255,255,.06);border-radius:10px;padding:12px;text-align:center">
+              <div id="bc-total" style="font-size:22px;font-weight:700;color:var(--text)">0</div>
+              <div style="font-size:11px;color:var(--muted)">👥 الكلي</div>
+            </div>
+          </div>
+          <div style="margin-bottom:12px">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:8px">الدفعات (كل دفعة = 100 مستخدم)</div>
+            <div id="bc-batches" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+          </div>
+          <div id="bc-status-msg" style="font-size:13px;padding:10px;background:rgba(255,255,255,.05);border-radius:8px;text-align:center"></div>
         </div>
       </div>
     </div>
@@ -3017,12 +3221,70 @@ async function doAction(action){
   loadData();
 }
 async function sendBroadcast(){
+  await startBroadcast();
+}
+async function startBroadcast(){
   const text=document.getElementById('broadcast-text').value.trim();
-  if(!text){toast('اكتب الرسالة أولاً','#f59e0b');return;}
-  if(!confirm('إرسال لجميع المستخدمين؟'))return;
+  if(!text){toast('أدخل نص الرسالة','#f59e0b');return;}
+  const total=_data?Object.keys(_data.users||{}).length:0;
+  if(!confirm(`إرسال البث لـ ${total} مستخدم بدفعات 100؟`))return;
   const r=await api('broadcast',{text});
-  if(r.ok){toast('✅ '+(r.msg||'بدأ الإرسال'));document.getElementById('broadcast-text').value='';}
-  else toast(r.msg||'فشل الإرسال','#dc2626');
+  if(r.ok){toast('✅ '+r.msg);startBroadcastPolling();}
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+async function toggleBroadcast(){
+  const btn=document.getElementById('btn-stop-resume');
+  const isRunning=btn.textContent.includes('إيقاف');
+  const r=await api(isRunning?'broadcastStop':'broadcastResume');
+  if(r.ok)toast('✅ '+r.msg);
+  else toast('❌ '+(r.msg||'فشل'),'#dc2626');
+}
+function clearBroadcastState(){
+  if(!confirm('مسح حالة البث؟'))return;
+  document.getElementById('broadcast-progress-card').style.display='none';
+  if(_bcPollTimer){clearInterval(_bcPollTimer);_bcPollTimer=null;}
+}
+let _bcPollTimer=null;
+function startBroadcastPolling(){
+  document.getElementById('broadcast-progress-card').style.display='block';
+  if(_bcPollTimer)clearInterval(_bcPollTimer);
+  _bcPollTimer=setInterval(updateBroadcastStatus,1500);
+  updateBroadcastStatus();
+}
+async function updateBroadcastStatus(){
+  const r=await api('broadcastStatus');
+  if(!r.ok||r.status==='idle'){
+    if(r.status==='idle'){document.getElementById('broadcast-progress-card').style.display='none';}
+    if(_bcPollTimer){clearInterval(_bcPollTimer);_bcPollTimer=null;}
+    return;
+  }
+  document.getElementById('broadcast-progress-card').style.display='block';
+  document.getElementById('bc-sent').textContent=r.sent||0;
+  document.getElementById('bc-failed').textContent=r.failed||0;
+  document.getElementById('bc-remaining').textContent=Math.max(0,(r.total||0)-(r.sent||0)-(r.failed||0));
+  document.getElementById('bc-total').textContent=r.total||0;
+  document.getElementById('bc-percent').textContent=(r.percent||0)+'%';
+  document.getElementById('bc-progress-bar').style.width=(r.percent||0)+'%';
+  const btn=document.getElementById('btn-stop-resume');
+  if(r.status==='running'){btn.textContent='⏸️ إيقاف';btn.className='btn btn-warn btn-sm';}
+  else if(r.status==='paused'){btn.textContent='▶️ استكمال';btn.className='btn btn-success btn-sm';}
+  const msgs={running:'🔄 البث جارٍ...',paused:'⏸️ البث متوقف — اضغط استكمال للمتابعة من نفس المكان',done:'✅ اكتمل البث!'};
+  document.getElementById('bc-status-msg').textContent=msgs[r.status]||r.status;
+  document.getElementById('btn-clear-broadcast').style.display=(r.status==='done'||r.status==='paused')?'':'none';
+  const batchesEl=document.getElementById('bc-batches');
+  batchesEl.innerHTML='';
+  for(let i=0;i<(r.totalBatches||0);i++){
+    const div=document.createElement('div');
+    let bg='rgba(255,255,255,.1)';
+    if(i<r.batchIndex)bg='#25c39e';
+    else if(i===r.batchIndex&&r.status==='running')bg='#f59e0b';
+    else if(i===r.batchIndex&&r.status==='paused')bg='#6366f1';
+    div.style.cssText=`background:${bg};border-radius:6px;padding:4px 10px;font-size:11px;color:#fff;font-weight:700;transition:background .3s`;
+    div.textContent=`دفعة ${i+1}`;
+    if(i===r.batchIndex&&r.status==='running')div.textContent+=` (${r.currentBatchSent}/${r.currentBatchTotal})`;
+    batchesEl.appendChild(div);
+  }
+  if(r.status==='done'&&_bcPollTimer){clearInterval(_bcPollTimer);_bcPollTimer=null;}
 }
 async function blockUser(num){
   if(!confirm('حظر المستخدم '+num+'؟ سيصله إشعار تلقائي.'))return;
@@ -3287,6 +3549,21 @@ async function clearConvChat() {
 
 loadData();
 setInterval(loadData,30000);
+
+// فحص دور المستخدم وإخفاء العناصر غير المسموحة
+(async function checkRole(){
+  try {
+    const r = await fetch('/session-info', {credentials:'include'});
+    const info = await r.json();
+    if (info.role !== 'dev') {
+      // إخفاء تبويب المحادثات للـ admin العادي
+      const navConv = document.querySelector('[data-tab="conversations"]');
+      if (navConv) navConv.style.display = 'none';
+      const panelConv = document.getElementById('panel-conversations');
+      if (panelConv) panelConv.style.display = 'none';
+    }
+  } catch(e) {}
+})();
 </script>
 </body>
 </html>`);
@@ -5533,4 +5810,11 @@ console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
     }
     startWebServer();
     startBot();
+
+    // استكمال البث المتوقف لو كان جارياً قبل الإغلاق
+    const savedBroadcast = await loadBroadcastState();
+    if (savedBroadcast && savedBroadcast.status === 'running') {
+        console.log(`[broadcast] 🔄 استكمال بث متوقف: ${savedBroadcast.sent}/${savedBroadcast.total} مكتمل`);
+        runBroadcast().catch(e => console.error('[broadcast resume]', e.message));
+    }
 })();
