@@ -3227,7 +3227,7 @@ async function startBroadcast(){
   const text=document.getElementById('broadcast-text').value.trim();
   if(!text){toast('أدخل نص الرسالة','#f59e0b');return;}
   const total=_data?Object.keys(_data.users||{}).length:0;
-  if(!confirm(`إرسال البث لـ ${total} مستخدم بدفعات 100؟`))return;
+  if(!confirm('إرسال البث لـ '+total+' مستخدم بدفعات 100؟'))return;
   const r=await api('broadcast',{text});
   if(r.ok){toast('✅ '+r.msg);startBroadcastPolling();}
   else toast('❌ '+(r.msg||'فشل'),'#dc2626');
