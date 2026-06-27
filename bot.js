@@ -526,6 +526,9 @@ function getSystemPrompt() {
     _cachedSystemPrompt = `اسمك "MedTerm"، مساعد ذكاء اصطناعي شامل على واتساب.
 التاريخ: ${dateStr} - ${timeStr} (القدس). استخدمه دائماً عند السؤال عن التاريخ.
 
+مطورك: المهندس نادر — للتواصل معه: https://wa.me/972593850520
+إذا سألك أحد "من صنعك؟" أو "من طورك؟" أو "من المبرمج؟" أو ما شابه، أجبه: "طوّرني المهندس نادر 👨‍💻 للتواصل معه: https://wa.me/972593850520"
+
 شخصيتك: مهني ودقيق، ردود مباشرة بدون حشو. اللغة الافتراضية عربية، تجيب بلغة المستخدم فوراً. تجيب على أي سؤال في أي مجال بدون استثناء — لا تقل أبداً "خارج تخصصي".
 
 قواعد الكتابة — مهمة جداً:
@@ -3703,10 +3706,20 @@ async function generatePdfContent(userRequest) {
 
 async function buildPdfBuffer(data) {
     const PDFDocument = require('pdfkit');
-    const isAr      = data.language !== 'en';
+    const reshaper    = require('arabic-reshaper');
+
+    // دالة تشكيل النص العربي — تصلح الحروف المتشابكة والمنفصلة
+    const shapeAr = (text) => {
+        if (!text) return '';
+        return text.split('\n').map(line => {
+            const hasAr = /[\u0600-\u06FF]/.test(line);
+            return hasAr ? reshaper.convertArabic(line) : line;
+        }).join('\n');
+    };
+    const isAr     = data.language !== 'en';
     const mainColor = data.color || '#1a5276';
     const fontReady = await ensurePdfFonts();
-    const doc       = new PDFDocument({ size:'A4', margin:60, info:{ Title: data.title||'مستند', Author:'MedTerm Bot' } });
+    const doc       = new PDFDocument({ size:'A4', margin:60, info:{ Title: shapeAr(data.title||'مستند'), Author:'MedTerm Bot' } });
     const chunks    = [];
     doc.on('data', c => chunks.push(c));
 
@@ -3715,6 +3728,62 @@ async function buildPdfBuffer(data) {
     const W    = doc.page.width - 120;
     const al   = isAr ? 'right' : 'left';
     const date = new Date().toLocaleDateString(isAr ? 'ar-SA' : 'en-US', { year:'numeric', month:'long', day:'numeric' });
+
+    // رأس الصفحة
+    doc.rect(0, 0, doc.page.width, 100).fill(mainColor);
+    doc.font(bold).fontSize(26).fillColor('#fff').text(shapeAr(data.title||'مستند'), 60, 28, { align:al, width:W });
+    if (data.subtitle) doc.font(reg).fontSize(13).fillColor('#d6eaf8').text(shapeAr(data.subtitle), 60, 62, { align:al, width:W });
+    doc.font(reg).fontSize(10).fillColor('#aed6f1').text(shapeAr(date), 60, 80, { align:al, width:W });
+    doc.moveDown(3);
+
+    for (const sec of (data.sections||[])) {
+        if (doc.y > doc.page.height - 150) doc.addPage();
+        if (sec.heading) {
+            doc.font(bold).fontSize(16).fillColor(mainColor).text(shapeAr(sec.heading), { align:al });
+            const y = doc.y;
+            doc.save().moveTo(60,y).lineTo(doc.page.width-60,y).strokeColor(mainColor).strokeOpacity(0.4).stroke().restore();
+            doc.moveDown(0.5);
+        }
+        if (sec.content) {
+            doc.font(reg).fontSize(12).fillColor('#2c3e50').text(shapeAr(sec.content), { align:al, lineGap:5 });
+            doc.moveDown(0.5);
+        }
+        if (sec.items?.length) {
+            for (const item of sec.items) {
+                doc.font(reg).fontSize(12).fillColor('#34495e').text('• ' + shapeAr(item), { align:al, indent:20, lineGap:3 });
+            }
+            doc.moveDown(0.5);
+        }
+        if (sec.table?.headers?.length) {
+            const { headers, rows=[] } = sec.table;
+            const cw = W / headers.length;
+            const hy = doc.y;
+            doc.rect(60, hy, W, 24).fill(mainColor);
+            headers.forEach((h,i) => {
+                const x = isAr ? (doc.page.width-60-cw*(i+1)) : (60+cw*i);
+                doc.font(bold).fontSize(11).fillColor('#fff').text(shapeAr(h), x, hy+5, { width:cw, align:'center' });
+            });
+            doc.y = hy + 28;
+            rows.forEach((row, ri) => {
+                if (doc.y > doc.page.height-80) doc.addPage();
+                const ry = doc.y;
+                if (ri%2===0) doc.rect(60, ry, W, 22).fill('#eaf4fb');
+                row.forEach((cell,ci) => {
+                    const x = isAr ? (doc.page.width-60-cw*(ci+1)) : (60+cw*ci);
+                    doc.font(reg).fontSize(10).fillColor('#2c3e50').text(shapeAr(String(cell)), x, ry+5, { width:cw, align:'center' });
+                });
+                doc.y = ry + 25;
+            });
+            doc.moveDown(0.5);
+        }
+        doc.moveDown(0.8);
+    }
+
+    const fy = doc.page.height - 50;
+    doc.save().moveTo(60,fy-10).lineTo(doc.page.width-60,fy-10).strokeColor('#bdc3c7').stroke().restore();
+    doc.font(reg).fontSize(9).fillColor('#7f8c8d').text(shapeAr(data.footer||`تم الإنشاء بواسطة MedTerm Bot — ${date}`), 60, fy, { align:'center', width:W });
+
+    return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
 
     // رأس الصفحة
     doc.rect(0, 0, doc.page.width, 100).fill(mainColor);
@@ -3766,11 +3835,6 @@ async function buildPdfBuffer(data) {
         }
         doc.moveDown(0.8);
     }
-
-    // تذييل
-    const fy = doc.page.height - 50;
-    doc.save().moveTo(60,fy-10).lineTo(doc.page.width-60,fy-10).strokeColor('#bdc3c7').stroke().restore();
-    doc.font(reg).fontSize(9).fillColor('#7f8c8d').text(data.footer||`تم الإنشاء بواسطة MedTerm Bot — ${date}`, 60, fy, { align:'center', width:W });
 
     return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
 }
