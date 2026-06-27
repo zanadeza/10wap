@@ -4116,7 +4116,11 @@ async function processIncomingMessage(adaptedMsg) {
                     }
 
                     // ── الملف جديد — استخراج كامل ──
-                    await reply('⏳ جاري قراءة الملف واستخراج محتواه، انتظر لحظة...');
+                    const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
+                    const waitMsg = buffer.length > 2 * 1024 * 1024
+                        ? `⏳ الملف كبير (${sizeMB}MB) — جاري قراءة كل الصفحات، قد يأخذ دقيقة أو أكثر...`
+                        : '⏳ جاري قراءة الملف واستخراج محتواه، انتظر لحظة...';
+                    await reply(waitMsg);
                     console.log(`[PDF] بدء استخراج: "${fileName}" | حجم: ${buffer.length} bytes`);
 
                     const tmpDirName = `pdf_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
@@ -4137,8 +4141,10 @@ async function processIncomingMessage(adaptedMsg) {
                                 await new Promise((resolve, reject) => {
                                     execFile(MUTOOL_PATH, [
                                         'draw', '-o', path.join(tmpDir, 'page-%d.jpg'),
-                                        '-r', '150', pdfPath
-                                    ], { timeout: 60_000 }, (err, _so, se) => {
+                                        '-r', '72',  // resolution منخفض للسرعة
+                                        '-F', 'jpg',
+                                        pdfPath      // بدون حد — كل الصفحات
+                                    ], { timeout: 120_000 }, (err, _so, se) => { // دقيقتين كحد أقصى
                                         if (err) return reject(new Error(`mutool: ${se || err.message}`));
                                         resolve();
                                     });
@@ -4163,13 +4169,15 @@ async function processIncomingMessage(adaptedMsg) {
                             console.log(`[PDF] mutool غير متاح — سيتم الاعتماد على النص فقط لـ "${fileName}"`);
                         }
 
-                        // استخراج النص
+                        // استخراج النص الكامل بدون حد
                         let docText = '';
                         try {
-                            console.log('[PDF] بدء استخراج النص بـ pdf-parse...');
-                            const parsed = await pdfParse(buffer);
+                            console.log('[PDF] بدء استخراج النص الكامل بـ pdf-parse...');
+                            const parsed = await pdfParse(buffer, {
+                                max: 0 // 0 = كل الصفحات بدون حد
+                            });
                             docText = (parsed.text || '').trim();
-                            console.log(`[PDF] تم استخراج النص: ${docText.length} حرف`);
+                            console.log(`[PDF] تم استخراج النص: ${docText.length} حرف | ${parsed.numpages} صفحة`);
                         } catch (parseErr) {
                             console.error('[PDF] فشل pdf-parse:', parseErr.message);
                         }
