@@ -540,7 +540,12 @@ function getSystemPrompt() {
 
 خبرتك: طب وأدوية وأعراض وتشخيص أولي، علوم وبرمجة، قانون وأعمال، دين وتاريخ، ترجمة وأدب، وأي موضوع آخر.
 للطب: أعطِ معلومة دقيقة كاملة + نبّه بمراجعة الطبيب للحالات الجدية.
-اسم المستخدم في السياق، استخدمه أحياناً بشكل طبيعي.`
+اسم المستخدم في السياق، استخدمه أحياناً بشكل طبيعي.
+
+معلومات الخدمة (لو سألك عنها):
+- النسخة المجانية: ${DAILY_MSG_LIMIT} رسالة نصية + ${DAILY_IMG_LIMIT} صورة + ${DAILY_TTS_LIMIT} رسالة صوتية — لمرة واحدة فقط لا تتجدد.
+- النسخة المميزة (VIP): غير محدودة بالكامل. للاشتراك: ${SUPPORT_LINK}
+- أنت مجاني بالكامل بدون رسوم خفية — الرصيد لمرة واحدة فقط.`
     return _cachedSystemPrompt;
 }
 
@@ -3708,12 +3713,27 @@ async function buildPdfBuffer(data) {
     const PDFDocument = require('pdfkit');
     const reshaper    = require('arabic-reshaper');
 
-    // دالة تشكيل النص العربي — تصلح الحروف المتشابكة والمنفصلة
-    const shapeAr = (text) => {
-        if (!text) return '';
+    // تحضير النص للـ PDFKit — يصلح الحروف العربية المتشابكة والمتقطعة
+    // المشكلة: PDFKit لا يدعم Arabic shaping تلقائياً
+    // الحل: شبّك الحروف بـ arabic-reshaper + اعكس الترتيب للـ RTL
+    const shapeAr = (input) => {
+        // حماية من non-string (object, array, null, undefined)
+        const text = (input === null || input === undefined) ? '' : String(input);
+        if (!text.trim()) return text;
+
         return text.split('\n').map(line => {
+            if (!line.trim()) return line;
             const hasAr = /[\u0600-\u06FF]/.test(line);
-            return hasAr ? reshaper.convertArabic(line) : line;
+            if (!hasAr) return line; // نص إنجليزي — بدون تعديل
+
+            // نص عربي أو مختلط — نشبّك الحروف ونعكس الترتيب
+            try {
+                const shaped   = reshaper.convertArabic(line);
+                const reversed = shaped.split('').reverse().join('');
+                return reversed;
+            } catch (_) {
+                return line; // fallback للنص الأصلي لو فشل
+            }
         }).join('\n');
     };
     const isAr     = data.language !== 'en';
@@ -3866,6 +3886,60 @@ async function sendPdfViaWhatsApp(to, pdfBuffer, fileName) {
     });
     if (!sendRes.ok) throw new Error(`إرسال PDF فشل: ${await sendRes.text()}`);
     return true;
+}
+
+// كشف أسئلة الاشتراك والدفع والرصيد والأسعار
+function isSubscriptionQuery(text) {
+    return /اشتراك|اشترك|سعر|تكلفة|كم.*(سعر|تكلف|ثمن)|مجاني|مجان|مجانا|مدفوع|دفع|فلوس|VIP|vip|بكم|رصيد.*كم|كم.*رصيد|خطة|خطط|باقة|باقات|subscription|price|paid|free|cost|upgrade|ترقية|هل.*مجان|هل.*مدفوع/i.test(text);
+}
+
+// بناء رسالة الاشتراك المفصلة مع رصيد المستخدم الحالي
+function buildSubscriptionMessage(sender, isVIP, isAdmin) {
+    const limit   = getUserDailyLimit(sender);
+    const rec     = getDailyRecord(sender);
+    const msgUsed = rec.messages || 0;
+    const imgUsed = rec.images   || 0;
+    const ttsUsed = rec.tts      || 0;
+    const msgLeft = Math.max(0, limit - msgUsed);
+    const imgLeft = Math.max(0, DAILY_IMG_LIMIT - imgUsed);
+    const ttsLeft = Math.max(0, DAILY_TTS_LIMIT - ttsUsed);
+
+    if (isAdmin || isVIP) {
+        const expiry = vipExpiry[sender];
+        const expStr = expiry
+            ? `ينتهي: ${new Date(expiry).toLocaleDateString('ar-SA')}`
+            : 'دائم بلا انتهاء';
+        return (
+            `⭐ أنت مشترك بالنسخة المميزة (VIP)\n` +
+            `${expStr}\n\n` +
+            `✅ رسائل نصية: ♾️ غير محدود\n` +
+            `✅ صور: ♾️ غير محدود\n` +
+            `✅ رسائل صوتية: ♾️ غير محدود\n` +
+            `✅ PDF: ♾️ بلا حد للحجم (حتى 20MB)\n` +
+            `✅ أولوية في الرد\n\n` +
+            `للاستفسار: 👤 ${SUPPORT_LINK}`
+        );
+    }
+
+    return (
+        `💬 MedTerm — تفاصيل الخدمة والاشتراك\n\n` +
+        `🆓 النسخة المجانية (أنت الآن):\n` +
+        `💬 الرسائل النصية: ${msgUsed}/${limit} — متبقي ${msgLeft}\n` +
+        `🖼️ الصور: ${imgUsed}/${DAILY_IMG_LIMIT} — متبقي ${imgLeft}\n` +
+        `🔊 الصوت/TTS: ${ttsUsed}/${DAILY_TTS_LIMIT} — متبقي ${ttsLeft}\n` +
+        `📄 PDF: حتى 5MB فقط\n\n` +
+        `⚠️ هذا الرصيد لمرة واحدة ولا يتجدد تلقائياً.\n\n` +
+        `──────────────────\n` +
+        `⭐ النسخة المميزة VIP:\n` +
+        `✅ رسائل نصية: ♾️ غير محدود\n` +
+        `✅ صور: ♾️ غير محدود\n` +
+        `✅ رسائل صوتية: ♾️ غير محدود\n` +
+        `✅ PDF: حتى 20MB بلا حدود\n` +
+        `✅ إنشاء ملفات PDF احترافية\n` +
+        `✅ أولوية في الرد والمعالجة\n\n` +
+        `📲 للاشتراك أو الاستفسار تواصل مع المهندس نادر:\n` +
+        `👤 ${SUPPORT_LINK}`
+    );
 }
 
 function isPdfCreationRequest(text) {
@@ -5106,6 +5180,15 @@ async function processIncomingMessage(adaptedMsg) {
 
             stats.totalMessages++;
             saveData();
+
+            // ── كشف أسئلة الاشتراك والدفع والرصيد ──
+            if (isSubscriptionQuery(body)) {
+                await reply(buildSubscriptionMessage(sender, isVIP, isAdmin));
+                addToChatHistory(sender, 'user', body, 'text');
+                addToChatHistory(sender, 'assistant', '[معلومات الاشتراك]', 'text');
+                await react('✅');
+                return;
+            }
 
             // ── كشف طلب إنشاء PDF ──
             if (isPdfCreationRequest(body)) {
