@@ -4133,27 +4133,32 @@ async function processIncomingMessage(adaptedMsg) {
                         let pages = [];
                         if (MUTOOL_PATH) {
                             console.log(`[PDF] تحويل بـ mutool: ${MUTOOL_PATH}`);
-                            await new Promise((resolve, reject) => {
-                                execFile(MUTOOL_PATH, [
-                                    'convert', '-o', path.join(tmpDir, 'page-%d.jpg'),
-                                    '-O', 'resolution=150', pdfPath
-                                ], { timeout: 60_000 }, (err, _so, se) => {
-                                    if (err) return reject(new Error(`mutool: ${se || err.message}`));
-                                    resolve();
+                            try {
+                                await new Promise((resolve, reject) => {
+                                    execFile(MUTOOL_PATH, [
+                                        'draw', '-o', path.join(tmpDir, 'page-%d.jpg'),
+                                        '-r', '150', pdfPath
+                                    ], { timeout: 60_000 }, (err, _so, se) => {
+                                        if (err) return reject(new Error(`mutool: ${se || err.message}`));
+                                        resolve();
+                                    });
                                 });
-                            });
 
-                            const dirEntries = await fs.promises.readdir(tmpDir);
-                            const pageFiles  = dirEntries
-                                .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
-                                .sort();
+                                const dirEntries = await fs.promises.readdir(tmpDir);
+                                const pageFiles  = dirEntries
+                                    .filter(f => f.startsWith('page-') && f.endsWith('.jpg'))
+                                    .sort();
 
-                            if (pageFiles.length === 0) throw new Error('mutool لم ينتج أي صور');
-                            console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
-
-                            pages = await Promise.all(
-                                pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
-                            );
+                                if (pageFiles.length > 0) {
+                                    console.log(`[PDF] تم تحويل ${pageFiles.length} صفحة من "${fileName}"`);
+                                    pages = await Promise.all(
+                                        pageFiles.map(f => fs.promises.readFile(path.join(tmpDir, f)).then(b => b.toString('base64')))
+                                    );
+                                }
+                            } catch (mutoolErr) {
+                                console.warn(`[PDF] mutool فشل (${mutoolErr.message}) — سيتم الاعتماد على النص فقط`);
+                                // لا نوقف المعالجة — نكمل باستخراج النص فقط
+                            }
                         } else {
                             console.log(`[PDF] mutool غير متاح — سيتم الاعتماد على النص فقط لـ "${fileName}"`);
                         }
@@ -4170,7 +4175,7 @@ async function processIncomingMessage(adaptedMsg) {
                         }
 
                         // ── حفظ في الكاش المشترك ──
-                        if (docText) await pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
+                        if (docText) await pdfCacheSet(cacheKey, fileName, docText, pages.length);
 
                         stats.totalDocs = (stats.totalDocs || 0) + 1;
                         saveData();
@@ -4180,9 +4185,9 @@ async function processIncomingMessage(adaptedMsg) {
                             fileName,
                             docText,
                             pages,
-                            pageCount: pageFiles.length,
+                            pageCount: pages.length,
                             loadedAt: Date.now(),
-                            offTopicCount: 0 // عداد الرسائل المتتالية غير المتعلقة بالملف
+                            offTopicCount: 0
                         };
                         // مسح سياق المحادثة القديمة وبدء جديد للملف
                         userChats[sender] = [];
@@ -4190,7 +4195,7 @@ async function processIncomingMessage(adaptedMsg) {
                         await react('📄');
                         await reply(
                             `📄 *تم قراءة الملف بنجاح: "${fileName}"*\n` +
-                            `(${pageFiles.length} صفحة — يقرأ النصوص والصور معاً)\n\n` +
+                            `(${pages.length > 0 ? pages.length + ' صفحة' : 'نص مستخرج'} — ${pages.length > 0 ? 'يقرأ النصوص والصور معاً' : 'نصوص فقط'})\n\n` +
                             `✅ *وضع الملف مفعّل تلقائياً* — سأجيب على أسئلتك من هذا الملف.\n\n` +
                             `💡 *يمكنك:*\n` +
                             `• اسألني أي سؤال من الملف\n` +
