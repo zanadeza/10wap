@@ -4011,8 +4011,15 @@ async function processIncomingMessage(adaptedMsg) {
                     const fileName = docMsg?.fileName || 'ملف';
                     const caption  = body || '';
 
-                    // فقط PDF مدعوم
-                    if (mime !== 'application/pdf') {
+                    console.log(`[PDF] mime: "${mime}" | fileName: "${fileName}"`);
+
+                    // فقط PDF مدعوم — نقبل كل صيغ الـ mimetype الشائعة لـ PDF
+                    const isPdf = mime === 'application/pdf' ||
+                                  mime === 'application/x-pdf' ||
+                                  mime.includes('pdf') ||
+                                  fileName.toLowerCase().endsWith('.pdf');
+
+                    if (!isPdf) {
                         await react('ℹ️');
                         const ext = fileName.split('.').pop().toUpperCase();
                         await reply(
@@ -4035,6 +4042,14 @@ async function processIncomingMessage(adaptedMsg) {
 
                     if (!buffer || buffer.length === 0) {
                         await react('❌');
+                        try {
+                            await wa.sendText(ADMIN_NUMBER,
+                                `🔴 *فشل تحميل PDF*\n` +
+                                `الملف: ${fileName}\n` +
+                                `المرسِل: ${sender}\n` +
+                                `السبب: buffer فارغ أو null`
+                            );
+                        } catch (_) {}
                         await reply('لم أتمكن من تنزيل الملف، يرجى المحاولة مرة أخرى.');
                         return;
                     }
@@ -4102,19 +4117,22 @@ async function processIncomingMessage(adaptedMsg) {
 
                     // ── الملف جديد — استخراج كامل ──
                     await reply('⏳ جاري قراءة الملف واستخراج محتواه، انتظر لحظة...');
-                    console.log(`[PDF] استخراج جديد: "${fileName}"`);
+                    console.log(`[PDF] بدء استخراج: "${fileName}" | حجم: ${buffer.length} bytes`);
 
                     const tmpDirName = `pdf_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
                     const tmpDir     = path.join(os.tmpdir(), tmpDirName);
                     await fs.promises.mkdir(tmpDir, { recursive: true });
+                    console.log(`[PDF] مجلد مؤقت: ${tmpDir}`);
 
                     try {
                         const pdfPath = path.join(tmpDir, 'input.pdf');
                         await fs.promises.writeFile(pdfPath, buffer);
+                        console.log(`[PDF] تم حفظ الملف: ${pdfPath}`);
 
                         // تحويل الصفحات لصور بـ mutool (لو متاح)
                         let pages = [];
                         if (MUTOOL_PATH) {
+                            console.log(`[PDF] تحويل بـ mutool: ${MUTOOL_PATH}`);
                             await new Promise((resolve, reject) => {
                                 execFile(MUTOOL_PATH, [
                                     'convert', '-o', path.join(tmpDir, 'page-%d.jpg'),
@@ -4143,9 +4161,13 @@ async function processIncomingMessage(adaptedMsg) {
                         // استخراج النص
                         let docText = '';
                         try {
+                            console.log('[PDF] بدء استخراج النص بـ pdf-parse...');
                             const parsed = await pdfParse(buffer);
                             docText = (parsed.text || '').trim();
-                        } catch (_) {}
+                            console.log(`[PDF] تم استخراج النص: ${docText.length} حرف`);
+                        } catch (parseErr) {
+                            console.error('[PDF] فشل pdf-parse:', parseErr.message);
+                        }
 
                         // ── حفظ في الكاش المشترك ──
                         if (docText) await pdfCacheSet(cacheKey, fileName, docText, pageFiles.length);
@@ -4178,7 +4200,18 @@ async function processIncomingMessage(adaptedMsg) {
                         );
 
                     } catch (imgErr) {
-                        console.error('[PDF]', imgErr.message);
+                        console.error('[PDF] ❌ خطأ في المعالجة:', imgErr.message);
+                        console.error('[PDF] stack:', imgErr.stack?.split('\n')[1] || '');
+                        // إرسال تفاصيل الخطأ للأدمن مباشرة
+                        try {
+                            await wa.sendText(ADMIN_NUMBER,
+                                `🔴 *خطأ PDF*\n` +
+                                `الملف: ${fileName}\n` +
+                                `المرسِل: ${sender}\n` +
+                                `الخطأ: ${imgErr.message}\n` +
+                                `المكان: ${imgErr.stack?.split('\n')[1]?.trim() || '—'}`
+                            );
+                        } catch (_) {}
                         await react('❌');
                         await reply(`عذراً، لم أتمكن من قراءة "${fileName}".\nتأكد أن الملف غير محمي بكلمة مرور.`);
                     } finally {
