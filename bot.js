@@ -1957,11 +1957,14 @@ button:hover{opacity:.9;transform:translateY(-1px)}
                     const params = Object.fromEntries(
                         body.split('&').map(p => p.split('=').map(v => decodeURIComponent(v.replace(/\+/g, ' '))))
                     );
-                    if (safeCompare(params.username, DASHBOARD_USER) && safeCompare(params.password, DASHBOARD_PASS)) {
+                    // فحص يوزر المطور أولاً
+                    const isDevLogin   = safeCompare(params.username, DEV_USER)       && safeCompare(params.password, DEV_PASS);
+                    // فحص يوزر الأدمن العادي
+                    const isAdminLogin = safeCompare(params.username, DASHBOARD_USER) && safeCompare(params.password, DASHBOARD_PASS);
+
+                    if (isDevLogin || isAdminLogin) {
                         const token = generateToken();
-                        // تحديد الدور: لو نفس بيانات المطور → dev، غير ذلك → admin
-                        const role = (safeCompare(params.username, DEV_USER) && safeCompare(params.password, DEV_PASS))
-                            ? ROLE_DEV : ROLE_ADMIN;
+                        const role  = isDevLogin ? ROLE_DEV : ROLE_ADMIN;
                         _sessions[token] = { ip, createdAt: Date.now(), ua: req.headers['user-agent'] || '', role };
                         res.writeHead(302, {
                             'Set-Cookie': `adm_tok=${token}; Path=/; HttpOnly; Max-Age=43200; SameSite=Lax`,
