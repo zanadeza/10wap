@@ -3279,9 +3279,9 @@ async function updateBroadcastStatus(){
     if(i<r.batchIndex)bg='#25c39e';
     else if(i===r.batchIndex&&r.status==='running')bg='#f59e0b';
     else if(i===r.batchIndex&&r.status==='paused')bg='#6366f1';
-    div.style.cssText=`background:${bg};border-radius:6px;padding:4px 10px;font-size:11px;color:#fff;font-weight:700;transition:background .3s`;
-    div.textContent=`دفعة ${i+1}`;
-    if(i===r.batchIndex&&r.status==='running')div.textContent+=` (${r.currentBatchSent}/${r.currentBatchTotal})`;
+    div.style.cssText='background:'+bg+';border-radius:6px;padding:4px 10px;font-size:11px;color:#fff;font-weight:700;transition:background .3s';
+    div.textContent='دفعة '+(i+1);
+    if(i===r.batchIndex&&r.status==='running')div.textContent+=' ('+r.currentBatchSent+'/'+r.currentBatchTotal+')';
     batchesEl.appendChild(div);
   }
   if(r.status==='done'&&_bcPollTimer){clearInterval(_bcPollTimer);_bcPollTimer=null;}
