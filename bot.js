@@ -197,6 +197,7 @@ function loadData() {
         userLimits:      {},
         userLimitsUsage: {},
         trialNotified:   {},
+        pdfCreatedCount: {}, // عدد ملفات PDF أنشأها كل مستخدم { [sender]: count }
         blacklist:       [],
         userLanguages:   {},
         stats:           { totalMessages: 0, totalImages: 0, totalMedical: 0, totalDocs: 0 }
@@ -220,7 +221,7 @@ let _saveTimer = null;
 function saveData() {
     if (_saveTimer) clearTimeout(_saveTimer);
     _saveTimer = setTimeout(async () => {
-        const payload = { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, blacklist, userLanguages, stats };
+        const payload = { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, pdfCreatedCount, blacklist, userLanguages, stats };
         // حفظ على MongoDB لو متصل
         if (_mongoReady) {
             try {
@@ -245,13 +246,14 @@ function saveData() {
     }, 500);
 }
 
-let { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, blacklist, userLanguages, stats } = loadData();
+let { userNames, welcomedUsers, vipNumbers, vipExpiry, reports, userLimits, userLimitsUsage, trialNotified, pdfCreatedCount, blacklist, userLanguages, stats } = loadData();
 
 // ضمان وجود الحقول
 if (!Array.isArray(reports))   reports = [];
 if (!userLimits)               userLimits = {};
 if (!userLimitsUsage)          userLimitsUsage = {};
 if (!trialNotified)            trialNotified = {};
+if (!pdfCreatedCount)          pdfCreatedCount = {};
 if (!Array.isArray(blacklist)) blacklist = [];
 if (!userLanguages)            userLanguages = {};
 if (!vipExpiry)                vipExpiry = {};
@@ -412,6 +414,7 @@ function nowJerusalem() {
 // ============================================================
 const DAILY_MSG_LIMIT   = 20; // رسائل نصية/24 ساعة لكل مستخدم عادي
 const DAILY_IMG_LIMIT   = 5;  // صور يومياً للمستخدم العادي
+const PDF_FREE_LIMIT    = 2;  // حد إنشاء PDF للمجاني (ملفين فقط إجمالي)
 const DAILY_TTS_LIMIT   = 10; // مرات استخدام الصوت/الترجمة يومياً للمستخدم العادي
 
 // ✅ حد مدة الرسائل الصوتية الواردة (Voxtral + استخراج النص)
@@ -3687,53 +3690,114 @@ async function ensurePdfFonts() {
 }
 
 async function generatePdfContent(userRequest) {
+    // ── الخطوة 1: بحث بالإنترنت لجمع معلومات حقيقية ──
+    let webContext = '';
+    try {
+        const searchResult = await callMistral({
+            model: 'mistral-small-latest',
+            messages: [{ role: 'user', content: `ابحث وأعطني معلومات شاملة عن: ${userRequest}\nاكتب ملخصاً مفصلاً بالإنجليزي والعربي مع أرقام وحقائق دقيقة.` }],
+            tools: [{ type: 'web_search_preview' }],
+            max_tokens: 1500,
+            temperature: 0.2
+        });
+        if (searchResult && searchResult.length > 50) {
+            webContext = `\n\nResearch findings:\n${searchResult.slice(0, 1200)}`;
+            console.log(`[PDF-Gen] بحث الإنترنت: ${webContext.length} حرف`);
+        }
+    } catch (e) {
+        console.warn('[PDF-Gen] web search غير متاح، نكمل بدونه:', e.message);
+    }
+
+    // ── الخطوة 2: توليد محتوى PDF منظم ──
+    const systemPrompt =
+        'You are an expert bilingual document creator (English + Arabic).\n' +
+        'Create a comprehensive, well-structured PDF document.\n' +
+        'Return ONLY valid compact JSON with this structure:\n' +
+        '{"title_en":"...","title_ar":"...","color":"#1a5276","sections":[' +
+        '{"heading_en":"...","heading_ar":"...","content_en":"...","content_ar":"...",' +
+        '"items":[{"en":"...","ar":"..."}],' +
+        '"table":{"headers":[{"en":"...","ar":"..."}],"rows":[[{"en":"...","ar":"..."}]]}}' +
+        '],"footer_en":"...","footer_ar":"..."}\n\n' +
+        'STRICT RULES:\n' +
+        '- Max 5 sections\n' +
+        '- content_en/content_ar: 2-3 clear sentences each, include numbers/symbols if relevant\n' +
+        '- items: 4-6 bullet points per section when needed\n' +
+        '- table: only when data is tabular, max 6 rows\n' +
+        '- Color by topic: medical/nursing=#145a32, anatomy=#1a5276, science=#1e3a5f, general=#4a235a\n' +
+        '- Language: professional, clear, no jargon without explanation\n' +
+        '- Include symbols/numbers/formulas when relevant (e.g. O₂, H₂O, 120/80 mmHg)\n' +
+        '- Return ONLY compact JSON — no markdown, no comments, no trailing commas';
+
+    const userPrompt = `Create a comprehensive bilingual PDF document about: ${userRequest}${webContext}`;
+
     const result = await callMistral({
         model: 'mistral-large-latest',
         messages: [
-            { role: 'system', content:
-                'You are a professional bilingual PDF document creator (English + Arabic).\n' +
-                'Return ONLY valid JSON, no extra text, with this EXACT structure:\n' +
-                '{\n' +
-                '  "title_en": "Document Title in English",\n' +
-                '  "title_ar": "عنوان المستند بالعربي",\n' +
-                '  "subtitle_en": "Subtitle in English",\n' +
-                '  "subtitle_ar": "العنوان الفرعي بالعربي",\n' +
-                '  "color": "#1a5276",\n' +
-                '  "sections": [\n' +
-                '    {\n' +
-                '      "heading_en": "Section Heading in English",\n' +
-                '      "heading_ar": "عنوان القسم بالعربي",\n' +
-                '      "content_en": "Detailed content in English. Be thorough and professional.",\n' +
-                '      "content_ar": "المحتوى التفصيلي بالعربية. كن شاملاً واحترافياً.",\n' +
-                '      "items": [\n' +
-                '        {"en": "Point in English", "ar": "النقطة بالعربي"}\n' +
-                '      ],\n' +
-                '      "table": {\n' +
-                '        "headers": [{"en": "Column", "ar": "العمود"}],\n' +
-                '        "rows": [[{"en": "Value", "ar": "القيمة"}]]\n' +
-                '      }\n' +
-                '    }\n' +
-                '  ],\n' +
-                '  "footer_en": "Footer text",\n' +
-                '  "footer_ar": "نص التذييل"\n' +
-                '}\n' +
-                'Rules:\n' +
-                '- Choose color based on topic: medical=#1a5276, legal=#1e3a5f, science=#145a32, general=#4a235a\n' +
-                '- Each section must have BOTH English and Arabic versions\n' +
-                '- items and table are optional — use only when appropriate\n' +
-                '- Content must be comprehensive, detailed, and professional\n' +
-                '- Minimum 4 sections, maximum 8 sections\n' +
-                '- Return ONLY the JSON object, nothing else'
-            },
-            { role: 'user', content: userRequest }
+            { role: 'system', content: systemPrompt },
+            { role: 'user',   content: userPrompt }
         ],
-        max_tokens: 4000,
-        temperature: 0.3
+        max_tokens: 2800,
+        temperature: 0.2
     });
-    const clean = result.replace(/```json|```/g, '').trim();
-    const s = clean.indexOf('{'), e = clean.lastIndexOf('}');
-    if (s === -1 || e === -1) throw new Error('JSON غير صحيح من الـ AI');
-    return JSON.parse(clean.slice(s, e+1));
+
+    // ── الخطوة 3: تحليل وإصلاح JSON ──
+    let clean = result.replace(/```json|```/g, '').trim();
+    const s = clean.indexOf('{');
+    if (s === -1) throw new Error('الـ AI لم يولد JSON صحيح');
+    clean = clean.slice(s);
+
+    // محاولة التحليل المباشر
+    try { return JSON.parse(clean); } catch (_) {}
+
+    // إصلاح JSON المقطوع
+    clean = repairJson(clean);
+    try { return JSON.parse(clean); }
+    catch (e2) { throw new Error('فشل تحليل JSON: ' + e2.message.slice(0, 80)); }
+}
+
+// إيجاد آخر موضع آمن للقطع (بعد عنصر كامل بالـ sections array)
+function findLastCompleteElement(json) {
+    // نبحث عن آخر }] أو }، أو } قبل التقطع
+    let depth = 0;
+    let lastSafePos = -1;
+    for (let i = 0; i < json.length; i++) {
+        const c = json[i];
+        if (c === '{' || c === '[') depth++;
+        else if (c === '}' || c === ']') {
+            depth--;
+            if (depth <= 2) lastSafePos = i + 1; // داخل sections array
+        }
+    }
+    return lastSafePos;
+}
+
+// إغلاق JSON المفتوح
+function repairJson(json) {
+    const stack = [];
+    let inStr = false;
+    let escape = false;
+
+    for (let i = 0; i < json.length; i++) {
+        const c = json[i];
+        if (escape) { escape = false; continue; }
+        if (c === '\\' && inStr) { escape = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '{') stack.push('}');
+        else if (c === '[') stack.push(']');
+        else if (c === '}' || c === ']') stack.pop();
+    }
+
+    // أزل trailing comma أو أي رموز ناقصة
+    let result = json.trimEnd();
+    result = result.replace(/,\s*$/, '');
+
+    // أغلق كل شي مفتوح
+    while (stack.length > 0) {
+        result += stack.pop();
+    }
+
+    return result;
 }
 
 async function buildPdfBuffer(data) {
@@ -3741,7 +3805,7 @@ async function buildPdfBuffer(data) {
     const reshaper    = require('arabic-reshaper');
     const fontReady   = await ensurePdfFonts();
 
-    // ── تحضير النص العربي (تشبيك + عكس للـ RTL) ──
+    // ── تحضير النص العربي ──
     const shapeAr = (input) => {
         const text = (input == null) ? '' : String(input);
         if (!text.trim()) return text;
@@ -3752,179 +3816,232 @@ async function buildPdfBuffer(data) {
         }).join('\n');
     };
 
-    const mainColor  = data.color || '#1a5276';
-    const accentColor = '#f39c12'; // لون ذهبي للتمييز
-    const doc = new PDFDocument({ size: 'A4', margin: 55, info: { Title: String(data.title_en || data.title || 'Document'), Author: 'MedTerm Bot' } });
+    const hasAr   = (t) => /[\u0600-\u06FF]/.test(String(t||''));
+    const str     = (v) => (v == null) ? '' : String(v);
+    const enFont  = (bold) => bold ? 'Helvetica-Bold' : 'Helvetica';
+    const arFont  = (bold) => (fontReady && fs.existsSync(PDF_FONT_PATH)) ? (bold ? 'ArBold' : 'Ar') : enFont(bold);
+
+    const mainColor   = data.color || '#1a5276';
+    const goldColor   = '#d4ac0d';
+    const lightBg     = '#f7f9fc';
+    const textDark    = '#1c2833';
+    const textMed     = '#2e4057';
+    const textLight   = '#5d6d7e';
+
+    const doc = new PDFDocument({
+        size: 'A4', margin: 0,
+        info: { Title: str(data.title_en || 'Document'), Author: 'MedTerm Bot', Creator: 'MedTerm Bot' }
+    });
     const chunks = [];
     doc.on('data', c => chunks.push(c));
 
-    // ── تسجيل الخطوط ──
     if (fontReady && fs.existsSync(PDF_FONT_PATH)) {
         doc.registerFont('Ar',     PDF_FONT_PATH);
         doc.registerFont('ArBold', fs.existsSync(PDF_FONT_BOLD_PATH) ? PDF_FONT_BOLD_PATH : PDF_FONT_PATH);
     }
 
-    const W    = doc.page.width - 110;
-    const date = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const PW = doc.page.width;
+    const PH = doc.page.height;
+    const ML = 50, MR = 50;
+    const W  = PW - ML - MR;
+    const date = new Date().toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
 
-    // ── رأس الصفحة ──
-    // خلفية متدرجة
-    doc.rect(0, 0, doc.page.width, 110).fill(mainColor);
-    // شريط ذهبي
-    doc.rect(0, 108, doc.page.width, 4).fill(accentColor);
+    // ── دالة كتابة نص تلقائي ──
+    const write = (text, opts = {}, bold = false) => {
+        const s     = str(text);
+        const isAr  = hasAr(s);
+        const font  = isAr ? arFont(bold) : enFont(bold);
+        const align = opts.align || (isAr ? 'right' : 'left');
+        const content = isAr ? shapeAr(s) : s;
+        doc.font(font).text(content, { ...opts, align });
+    };
+
+    // ── رأس الصفحة الأولى ──
+    // خلفية
+    doc.rect(0, 0, PW, 130).fill(mainColor);
+    // شريط ذهبي أسفل الرأس
+    doc.rect(0, 128, PW, 5).fill(goldColor);
+    // نقطة زخرفية
+    doc.circle(PW - 40, 30, 60).fill(mainColor).fillOpacity(0.3);
 
     // عنوان إنجليزي
-    const titleEn = String(data.title_en || data.title || 'Document');
-    doc.font('Helvetica-Bold').fontSize(24).fillColor('#ffffff')
-       .text(titleEn, 55, 20, { width: W, align: 'left' });
+    doc.fillOpacity(1).font(enFont(true)).fontSize(22).fillColor('#ffffff')
+       .text(str(data.title_en || 'Document'), ML, 22, { width: W - 30, align: 'left' });
 
     // عنوان عربي
-    const titleAr = String(data.title_ar || '');
+    const titleAr = str(data.title_ar || '');
     if (titleAr) {
-        doc.font('ArBold').fontSize(16).fillColor('#aed6f1')
-           .text(shapeAr(titleAr), 55, 52, { width: W, align: 'right' });
+        doc.font(arFont(true)).fontSize(15).fillColor('#aed6f1')
+           .text(shapeAr(titleAr), ML, 62, { width: W, align: 'right' });
     }
 
-    // تاريخ
-    doc.font('Helvetica').fontSize(10).fillColor('#d5d8dc')
-       .text(date, 55, 88, { width: W, align: 'center' });
+    // تاريخ + طابع "Bilingual"
+    doc.font(enFont(false)).fontSize(9).fillColor('#d5d8dc')
+       .text('Generated: ' + date + '  |  Bilingual: EN / AR', ML, 100, { width: W, align: 'center' });
 
-    doc.moveDown(4);
+    doc.y = 148;
 
     // ── الأقسام ──
-    for (const sec of (data.sections || [])) {
-        if (doc.y > doc.page.height - 160) doc.addPage();
+    for (let si = 0; si < (data.sections || []).length; si++) {
+        const sec = data.sections[si];
+        if (!sec) continue;
+        if (doc.y > PH - 180) { doc.addPage(); doc.y = 40; }
+
+        const secY = doc.y;
 
         // ── عنوان القسم ──
-        const hEn = String(sec.heading_en || sec.heading || '');
-        const hAr = String(sec.heading_ar || '');
-        if (hEn || hAr) {
-            // خلفية عنوان القسم
-            const boxY = doc.y;
-            doc.rect(55, boxY, W, 36).fill(mainColor).opacity(0.08);
-            doc.rect(55, boxY, 4, 36).fill(accentColor).opacity(1);
+        const hEn = str(sec.heading_en || sec.heading || '');
+        const hAr = str(sec.heading_ar || '');
 
-            // إنجليزي يسار
+        if (hEn || hAr) {
+            // خلفية شريط العنوان
+            doc.rect(0, secY, PW, 42).fill(lightBg);
+            // شريط لوني يسار
+            doc.rect(0, secY, 6, 42).fill(mainColor);
+            // رقم القسم
+            doc.circle(24, secY + 21, 14).fill(mainColor);
+            doc.font(enFont(true)).fontSize(12).fillColor('#ffffff')
+               .text(String(si + 1), 18, secY + 14, { width: 12, align: 'center' });
+
+            // عنوان EN
             if (hEn) {
-                doc.font('Helvetica-Bold').fontSize(14).fillColor(mainColor).opacity(1)
-                   .text(hEn, 65, boxY + 5, { width: (W / 2) - 10, align: 'left' });
+                doc.font(enFont(true)).fontSize(13).fillColor(mainColor)
+                   .text(hEn, 44, secY + 7, { width: W / 2 - 10, align: 'left' });
             }
-            // عربي يمين
+            // عنوان AR
             if (hAr) {
-                doc.font('ArBold').fontSize(13).fillColor(mainColor).opacity(1)
-                   .text(shapeAr(hAr), 55 + (W / 2), boxY + 7, { width: (W / 2) - 5, align: 'right' });
+                doc.font(arFont(true)).fontSize(12).fillColor(mainColor)
+                   .text(shapeAr(hAr), ML + W / 2, secY + 10, { width: W / 2, align: 'right' });
             }
-            doc.y = boxY + 42;
-            doc.moveDown(0.3);
+            doc.y = secY + 48;
         }
 
-        // ── المحتوى النصي ثنائي اللغة ──
-        const cEn = String(sec.content_en || sec.content || '');
-        const cAr = String(sec.content_ar || '');
+        // ── المحتوى النصي ──
+        const cEn = str(sec.content_en || sec.content || '');
+        const cAr = str(sec.content_ar || '');
+
         if (cEn) {
-            doc.font('Helvetica').fontSize(11).fillColor('#2c3e50').opacity(1)
-               .text(cEn, 55, doc.y, { width: W, align: 'left', lineGap: 3 });
-            doc.moveDown(0.4);
+            doc.font(enFont(false)).fontSize(11).fillColor(textDark)
+               .text(cEn, ML, doc.y, { width: W, align: 'left', lineGap: 4, paragraphGap: 2 });
+            doc.moveDown(0.3);
         }
         if (cAr) {
-            // خط رفيع فاصل
-            doc.save().moveTo(55, doc.y).lineTo(55 + W, doc.y)
-               .strokeColor('#aed6f1').strokeOpacity(0.5).lineWidth(0.5).stroke().restore();
-            doc.moveDown(0.3);
-            doc.font('Ar').fontSize(11).fillColor('#1a5276').opacity(1)
-               .text(shapeAr(cAr), 55, doc.y, { width: W, align: 'right', lineGap: 3 });
-            doc.moveDown(0.5);
+            // فاصل أفقي خفيف
+            const lineY = doc.y;
+            doc.save().moveTo(ML + 20, lineY).lineTo(ML + W - 20, lineY)
+               .strokeColor(mainColor).strokeOpacity(0.2).lineWidth(0.7).stroke().restore();
+            doc.y = lineY + 5;
+            doc.font(arFont(false)).fontSize(11).fillColor(textMed)
+               .text(shapeAr(cAr), ML, doc.y, { width: W, align: 'right', lineGap: 4 });
+            doc.moveDown(0.4);
         }
 
-        // ── النقاط ثنائية اللغة ──
-        if (sec.items && sec.items.length) {
-            for (const item of sec.items) {
-                if (doc.y > doc.page.height - 80) doc.addPage();
-                const iEn = String(item.en || item || '');
-                const iAr = String(item.ar || '');
+        // ── النقاط ──
+        const items = sec.items || [];
+        if (items.length) {
+            doc.moveDown(0.2);
+            for (let ii = 0; ii < items.length; ii++) {
+                const item = items[ii];
+                if (!item) continue;
+                const iEn = str(item.en || item || '');
+                const iAr = str(item.ar || '');
+                if (!iEn && !iAr) continue;
 
-                // خلفية النقطة
-                const iy = doc.y;
-                doc.rect(55, iy, W, iAr ? 36 : 20).fill('#f8f9fa').opacity(0.6);
-                doc.rect(55, iy, 3, iAr ? 36 : 20).fill(accentColor).opacity(1);
+                if (doc.y > PH - 100) { doc.addPage(); doc.y = 40; }
+
+                const iy  = doc.y;
+                const iH  = iAr ? 38 : 22;
+                // خلفية متناوبة
+                if (ii % 2 === 0) doc.rect(ML, iy, W, iH).fill('#eaf1fb').fillOpacity(0.5);
+                doc.fillOpacity(1);
+                // نقطة لونية
+                doc.circle(ML + 9, iy + (iAr ? 10 : 11), 4).fill(goldColor);
 
                 if (iEn) {
-                    doc.font('Helvetica').fontSize(11).fillColor('#2c3e50').opacity(1)
-                       .text('• ' + iEn, 62, iy + 4, { width: W - 10, align: 'left' });
+                    doc.font(enFont(false)).fontSize(10.5).fillColor(textDark)
+                       .text(iEn, ML + 18, iy + 4, { width: W - 18, align: 'left' });
                 }
                 if (iAr) {
-                    doc.font('Ar').fontSize(11).fillColor('#1a5276').opacity(1)
-                       .text(shapeAr(iAr), 55, iy + (iEn ? 18 : 4), { width: W - 7, align: 'right' });
+                    doc.font(arFont(false)).fontSize(10).fillColor(textMed)
+                       .text(shapeAr(iAr), ML, iy + (iEn ? 18 : 4), { width: W - 18, align: 'right' });
                 }
-                doc.y = iy + (iAr ? 40 : 24);
+                doc.y = iy + iH + 3;
             }
-            doc.moveDown(0.5);
+            doc.moveDown(0.4);
         }
 
-        // ── جدول ثنائي اللغة ──
-        if (sec.table && sec.table.headers && sec.table.headers.length) {
-            const { headers, rows = [] } = sec.table;
+        // ── الجدول ──
+        const tbl = sec.table;
+        if (tbl && tbl.headers && tbl.headers.length) {
+            if (doc.y > PH - 120) { doc.addPage(); doc.y = 40; }
+            doc.moveDown(0.3);
+            const { headers, rows = [] } = tbl;
             const cols = headers.length;
             const cw   = W / cols;
+            const thY  = doc.y;
+            const thH  = 34;
 
             // رأس الجدول
-            const thY = doc.y;
-            doc.rect(55, thY, W, 32).fill(mainColor).opacity(1);
-            headers.forEach((h, i) => {
-                const hEn2 = String(h.en || h || '');
-                const hAr2 = String(h.ar || '');
-                const cx   = 55 + cw * i;
-                if (hEn2) doc.font('Helvetica-Bold').fontSize(10).fillColor('#fff').opacity(1)
+            doc.rect(ML, thY, W, thH).fill(mainColor).fillOpacity(1);
+            headers.forEach((h, ci) => {
+                const hEn2 = str(h.en || h || '');
+                const hAr2 = str(h.ar || '');
+                const cx   = ML + cw * ci;
+                if (hEn2) doc.font(enFont(true)).fontSize(9.5).fillColor('#fff')
                              .text(hEn2, cx + 3, thY + 4, { width: cw - 6, align: 'center' });
-                if (hAr2) doc.font('ArBold').fontSize(9).fillColor('#aed6f1').opacity(1)
+                if (hAr2) doc.font(arFont(false)).fontSize(8.5).fillColor('#aed6f1')
                              .text(shapeAr(hAr2), cx + 3, thY + 18, { width: cw - 6, align: 'center' });
             });
-            doc.y = thY + 36;
+            doc.y = thY + thH;
 
             // صفوف الجدول
             rows.forEach((row, ri) => {
-                if (doc.y > doc.page.height - 80) doc.addPage();
-                const ry = doc.y;
-                const rowH = 32;
-                doc.rect(55, ry, W, rowH).fill(ri % 2 === 0 ? '#eaf4fb' : '#ffffff').opacity(0.8);
+                if (doc.y > PH - 60) { doc.addPage(); doc.y = 40; }
+                const ry  = doc.y;
+                const rH  = 30;
+                const bg  = ri % 2 === 0 ? '#eaf4fb' : '#ffffff';
+                doc.rect(ML, ry, W, rH).fill(bg).fillOpacity(0.7);
                 // حدود الجدول
-                doc.save().rect(55, ry, W, rowH).strokeColor('#bdc3c7').strokeOpacity(0.4).lineWidth(0.5).stroke().restore();
+                doc.save().rect(ML, ry, W, rH).strokeColor('#bdc3c7').strokeOpacity(0.3).lineWidth(0.5).stroke().restore();
+                doc.fillOpacity(1);
 
-                row.forEach((cell, ci) => {
-                    const cEn2  = String(cell.en || cell || '');
-                    const cAr2  = String(cell.ar || '');
-                    const cx    = 55 + cw * ci;
-                    if (cEn2) doc.font('Helvetica').fontSize(10).fillColor('#2c3e50').opacity(1)
+                (Array.isArray(row) ? row : []).forEach((cell, ci) => {
+                    const cEn2 = str(cell.en || cell || '');
+                    const cAr2 = str(cell.ar || '');
+                    const cx   = ML + cw * ci;
+                    if (cEn2) doc.font(enFont(false)).fontSize(9.5).fillColor(textDark)
                                  .text(cEn2, cx + 3, ry + 4, { width: cw - 6, align: 'center' });
-                    if (cAr2) doc.font('Ar').fontSize(9).fillColor('#1a5276').opacity(1)
-                                 .text(shapeAr(cAr2), cx + 3, ry + 18, { width: cw - 6, align: 'center' });
+                    if (cAr2) doc.font(arFont(false)).fontSize(8.5).fillColor(textMed)
+                                 .text(shapeAr(cAr2), cx + 3, ry + 17, { width: cw - 6, align: 'center' });
                 });
-                doc.y = ry + rowH;
+                doc.y = ry + rH;
             });
-            doc.moveDown(0.8);
+            doc.moveDown(0.6);
         }
 
-        doc.moveDown(0.6);
-
-        // فاصل بين الأقسام
-        if (doc.y < doc.page.height - 60) {
-            doc.save().moveTo(55, doc.y).lineTo(55 + W, doc.y)
-               .strokeColor(mainColor).strokeOpacity(0.15).lineWidth(1).stroke().restore();
+        // ── فاصل بين الأقسام ──
+        if (si < data.sections.length - 1 && doc.y < PH - 60) {
+            doc.moveDown(0.4);
+            doc.save().moveTo(ML, doc.y).lineTo(ML + W, doc.y)
+               .strokeColor(mainColor).strokeOpacity(0.12).lineWidth(1.5).stroke().restore();
             doc.moveDown(0.5);
         }
     }
 
-    // ── تذييل ──
-    const fy = doc.page.height - 55;
-    doc.rect(0, fy - 8, doc.page.width, 55).fill(mainColor).opacity(0.06);
-    doc.rect(0, fy - 8, doc.page.width, 3).fill(accentColor).opacity(1);
-
-    const footEn = String(data.footer_en || data.footer || ('Generated by MedTerm Bot | ' + date));
-    const footAr = String(data.footer_ar || 'تم الإنشاء بواسطة MedTerm Bot');
-    doc.font('Helvetica').fontSize(9).fillColor('#7f8c8d').opacity(1)
-       .text(footEn, 55, fy, { width: W, align: 'left' });
-    doc.font('Ar').fontSize(9).fillColor('#7f8c8d').opacity(1)
-       .text(shapeAr(footAr), 55, fy, { width: W, align: 'right' });
+    // ── تذييل كل الصفحات ──
+    const footEn = str(data.footer_en || ('Generated by MedTerm Bot | ' + date));
+    const footAr = str(data.footer_ar || 'تم الإنشاء بواسطة MedTerm Bot');
+    const pages  = doc.bufferedPageRange();
+    for (let pi = pages.start; pi < pages.start + pages.count; pi++) {
+        doc.switchToPage(pi);
+        const fy = PH - 36;
+        doc.rect(0, fy - 4, PW, 40).fill(mainColor).fillOpacity(0.07);
+        doc.rect(0, fy - 4, PW, 2).fill(goldColor).fillOpacity(1).fillOpacity(1);
+        doc.font(enFont(false)).fontSize(8).fillColor(textLight).fillOpacity(1)
+           .text(footEn + '  |  Page ' + (pi + 1), ML, fy + 4, { width: W / 2, align: 'left' });
+        doc.font(arFont(false)).fontSize(8).fillColor(textLight)
+           .text(shapeAr(footAr), ML + W / 2, fy + 4, { width: W / 2, align: 'right' });
+    }
 
     return new Promise(resolve => { doc.on('end', () => resolve(Buffer.concat(chunks))); doc.end(); });
 }
@@ -5262,21 +5379,52 @@ async function processIncomingMessage(adaptedMsg) {
 
             // ── كشف طلب إنشاء PDF ──
             if (isPdfCreationRequest(body)) {
+                // فحص حد PDF للمجاني
+                const pdfCount = pdfCreatedCount[sender] || 0;
+                if (!isVIP && !isAdmin && pdfCount >= PDF_FREE_LIMIT) {
+                    await reply(
+                        `📄 لقد استخدمت رصيدك المجاني من ملفات PDF (${PDF_FREE_LIMIT} ملفات).\n\n` +
+                        `⭐ للحصول على إنشاء PDF غير محدود، اشترك بخطة VIP:\n` +
+                        `👤 ${SUPPORT_LINK}`
+                    );
+                    await react('⭐');
+                    return;
+                }
+
                 await react('⏳');
-                await reply('⏳ جاري إنشاء ملف PDF احترافي... قد يأخذ 20-40 ثانية.');
+                const waitMsg = isVIP
+                    ? '🔍 جاري البحث وجمع المعلومات وإنشاء ملف PDF شامل...'
+                    : `🔍 جاري البحث وإنشاء ملف PDF... (ملف ${pdfCount + 1}/${PDF_FREE_LIMIT} من رصيدك المجاني)`;
+                await reply(waitMsg);
+
                 try {
                     const pdfData   = await generatePdfContent(body);
                     const pdfBuffer = await buildPdfBuffer(pdfData);
                     const rawTitle  = pdfData.title_en || pdfData.title || 'Document';
                     const fileName  = rawTitle.replace(/[^\w\s]/g, '').trim().slice(0, 40).replace(/\s+/g, '_') + '_EN_AR.pdf';
                     await sendPdfViaWhatsApp(sender, pdfBuffer, fileName);
+
+                    // تسجيل في سجل PDF
+                    pdfCreatedCount[sender] = (pdfCreatedCount[sender] || 0) + 1;
+                    saveData();
+
                     addToChatHistory(sender, 'user', body, 'text');
                     addToChatHistory(sender, 'assistant', `[تم إنشاء PDF: ${fileName}]`, 'document');
                     await react('✅');
+
+                    // تنبيه المجاني بالرصيد المتبقي
+                    if (!isVIP && !isAdmin) {
+                        const remaining = PDF_FREE_LIMIT - pdfCreatedCount[sender];
+                        if (remaining === 0) {
+                            await reply(`✅ تم إرسال الملف!\n\n⚠️ لقد استخدمت كامل رصيدك المجاني (${PDF_FREE_LIMIT} ملفات).\nللمزيد: 👤 ${SUPPORT_LINK}`);
+                        } else {
+                            await reply(`✅ تم إرسال الملف! متبقي لك ${remaining} ملف مجاني.`);
+                        }
+                    }
                 } catch (pdfErr) {
                     console.error('[PDF-Gen]', pdfErr.message);
                     await react('❌');
-                    await reply(`عذراً، لم أتمكن من إنشاء PDF: ${pdfErr.message}`);
+                    await reply(`عذراً، لم أتمكن من إنشاء PDF:\n${pdfErr.message}`);
                     try { await wa.sendText(ADMIN_NUMBER, `🔴 خطأ PDF-Gen:\n${pdfErr.message}\nطلب: ${body.slice(0,100)}`); } catch(_) {}
                 }
                 return;
@@ -5719,6 +5867,7 @@ console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
             if (mongoData.userLimits)      userLimits      = mongoData.userLimits;
             if (mongoData.userLimitsUsage) userLimitsUsage = mongoData.userLimitsUsage;
             if (mongoData.trialNotified)   trialNotified   = mongoData.trialNotified;
+            if (mongoData.pdfCreatedCount) pdfCreatedCount = mongoData.pdfCreatedCount;
             if (Array.isArray(mongoData.blacklist))  blacklist  = mongoData.blacklist;
             if (mongoData.userLanguages)   userLanguages   = mongoData.userLanguages;
             if (mongoData.stats)           stats           = { ...stats, ...mongoData.stats };
@@ -5756,4 +5905,3 @@ console.log(`🚀 جاري تشغيل ${BOT_NAME}...`);
         runBroadcast().catch(e => console.error('[broadcast resume]', e.message));
     }
 })();
-    
