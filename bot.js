@@ -3659,17 +3659,28 @@ async function handleAdminPendingInput(body, sender, reply) {
 let _pdfFontReady = false;
 const PDF_FONT_PATH      = path.join(__dirname, 'fonts', 'Amiri-Regular.ttf');
 const PDF_FONT_BOLD_PATH = path.join(__dirname, 'fonts', 'Amiri-Bold.ttf');
+const PDF_SYM_PATH       = path.join(__dirname, 'fonts', 'DejaVuSans.ttf');
+const PDF_SYM_BOLD_PATH  = path.join(__dirname, 'fonts', 'DejaVuSans-Bold.ttf');
 
 async function ensurePdfFonts() {
     if (_pdfFontReady) return true;
     try {
+        // نسخ DejaVu من النظام (للرموز والإنجليزي)
+        const dejavu     = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+        const dejavuBold = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+        fs.mkdirSync(path.join(__dirname, 'fonts'), { recursive: true });
+        if (!fs.existsSync(PDF_SYM_PATH) && fs.existsSync(dejavu))
+            fs.copyFileSync(dejavu, PDF_SYM_PATH);
+        if (!fs.existsSync(PDF_SYM_BOLD_PATH) && fs.existsSync(dejavuBold))
+            fs.copyFileSync(dejavuBold, PDF_SYM_BOLD_PATH);
+
         if (fs.existsSync(PDF_FONT_PATH) && fs.statSync(PDF_FONT_PATH).size > 10000) {
             _pdfFontReady = true;
             return true;
         }
+        // تحويل Amiri woff2 → TTF
         const { Font, woff2 } = require('fonteditor-core');
         await woff2.init();
-        fs.mkdirSync(path.join(__dirname, 'fonts'), { recursive: true });
         const w2Reg  = path.join(__dirname, 'node_modules/@fontsource/amiri/files/amiri-arabic-400-normal.woff2');
         const w2Bold = path.join(__dirname, 'node_modules/@fontsource/amiri/files/amiri-arabic-700-normal.woff2');
         if (fs.existsSync(w2Reg)) {
@@ -3681,7 +3692,7 @@ async function ensurePdfFonts() {
             fs.writeFileSync(PDF_FONT_BOLD_PATH, Buffer.from(f.write({ type:'ttf' })));
         }
         _pdfFontReady = true;
-        console.log('✅ خطوط PDF جاهزة');
+        console.log('✅ خطوط PDF جاهزة (Amiri للعربي + DejaVu للرموز)');
         return true;
     } catch (e) {
         console.error('[PDF-Gen] فشل تجهيز الخطوط:', e.message);
@@ -3690,69 +3701,65 @@ async function ensurePdfFonts() {
 }
 
 async function generatePdfContent(userRequest) {
-    // ── الخطوة 1: بحث بالإنترنت لجمع معلومات حقيقية ──
+    // ── الخطوة 1: بحث بالإنترنت ──
     let webContext = '';
     try {
         const searchResult = await callMistral({
             model: 'mistral-small-latest',
-            messages: [{ role: 'user', content: `ابحث وأعطني معلومات شاملة عن: ${userRequest}\nاكتب ملخصاً مفصلاً بالإنجليزي والعربي مع أرقام وحقائق دقيقة.` }],
+            messages: [{ role: 'user', content: `Research comprehensively about: ${userRequest}\nProvide detailed facts, numbers, clinical details, and key points in English and Arabic.` }],
             tools: [{ type: 'web_search_preview' }],
-            max_tokens: 1500,
-            temperature: 0.2
+            max_tokens: 2000,
+            temperature: 0.1
         });
         if (searchResult && searchResult.length > 50) {
-            webContext = `\n\nResearch findings:\n${searchResult.slice(0, 1200)}`;
-            console.log(`[PDF-Gen] بحث الإنترنت: ${webContext.length} حرف`);
+            webContext = `\n\nResearch data:\n${searchResult.slice(0, 1800)}`;
+            console.log(`[PDF-Gen] web search: ${webContext.length} chars`);
         }
     } catch (e) {
-        console.warn('[PDF-Gen] web search غير متاح، نكمل بدونه:', e.message);
+        console.warn('[PDF-Gen] web search unavailable:', e.message);
     }
 
-    // ── الخطوة 2: توليد محتوى PDF منظم ──
+    // ── الخطوة 2: توليد محتوى شامل ──
     const systemPrompt =
         'You are an expert bilingual document creator (English + Arabic).\n' +
-        'Create a comprehensive, well-structured PDF document.\n' +
-        'Return ONLY valid compact JSON with this structure:\n' +
-        '{"title_en":"...","title_ar":"...","color":"#1a5276","sections":[' +
-        '{"heading_en":"...","heading_ar":"...","content_en":"...","content_ar":"...",' +
-        '"items":[{"en":"...","ar":"..."}],' +
-        '"table":{"headers":[{"en":"...","ar":"..."}],"rows":[[{"en":"...","ar":"..."}]]}}' +
-        '],"footer_en":"...","footer_ar":"..."}\n\n' +
-        'STRICT RULES:\n' +
-        '- Max 5 sections\n' +
-        '- content_en/content_ar: 2-3 clear sentences each, include numbers/symbols if relevant\n' +
-        '- items: 4-6 bullet points per section when needed\n' +
-        '- table: only when data is tabular, max 6 rows\n' +
-        '- Color by topic: medical/nursing=#145a32, anatomy=#1a5276, science=#1e3a5f, general=#4a235a\n' +
-        '- Language: professional, clear, no jargon without explanation\n' +
-        '- Include symbols/numbers/formulas when relevant (e.g. O₂, H₂O, 120/80 mmHg)\n' +
-        '- Return ONLY compact JSON — no markdown, no comments, no trailing commas';
-
-    const userPrompt = `Create a comprehensive bilingual PDF document about: ${userRequest}${webContext}`;
+        'Create a COMPREHENSIVE, DETAILED, IN-DEPTH bilingual PDF.\n' +
+        'Return ONLY valid JSON:\n' +
+        '{"title_en":"...","title_ar":"...","color":"#145a32","sections":[' +
+        '{"heading_en":"...","heading_ar":"...",' +
+        '"content_en":"DETAILED paragraph with facts, numbers, clinical info. Min 4-5 sentences.",' +
+        '"content_ar":"فقرة تفصيلية مع حقائق وأرقام ومعلومات سريرية. 4-5 جمل على الأقل.",' +
+        '"items":[{"en":"Specific detailed point with number/value if relevant","ar":"نقطة تفصيلية محددة مع رقم أو قيمة إن وجدت"}],' +
+        '"table":{"headers":[{"en":"Col","ar":"عمود"}],"rows":[[{"en":"Val","ar":"قيمة"}]]}' +
+        '}],"footer_en":"...","footer_ar":"..."}\n\n' +
+        'CRITICAL RULES:\n' +
+        '- EXACTLY 5 sections minimum, 6 max\n' +
+        '- content_en: min 4 sentences, include ALL relevant numbers, values, formulas, symbols (e.g. SpO₂ >95%, BP 120/80 mmHg, temp 36.5-37.5°C)\n' +
+        '- content_ar: full translation + same level of detail\n' +
+        '- items: min 5 bullet points per section, each point must be specific and informative (not vague)\n' +
+        '- table: include when data is tabular (classifications, normal ranges, comparison) — max 8 rows\n' +
+        '- Use medical/scientific precision: include normal ranges, abnormal thresholds, causes, symptoms, management steps\n' +
+        '- Color: nursing/vital=#145a32, anatomy=#1a5276, pharmacology=#7b241c, general=#4a235a\n' +
+        '- Return ONLY compact JSON — no markdown, no trailing commas, no truncation';
 
     const result = await callMistral({
         model: 'mistral-large-latest',
         messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user',   content: userPrompt }
+            { role: 'user',   content: `Create a comprehensive detailed PDF about: ${userRequest}${webContext}\n\nBe thorough — include all important details, clinical pearls, and practical information.` }
         ],
-        max_tokens: 2800,
-        temperature: 0.2
+        max_tokens: 4000,
+        temperature: 0.15
     });
 
-    // ── الخطوة 3: تحليل وإصلاح JSON ──
+    // ── الخطوة 3: تحليل JSON ──
     let clean = result.replace(/```json|```/g, '').trim();
     const s = clean.indexOf('{');
-    if (s === -1) throw new Error('الـ AI لم يولد JSON صحيح');
+    if (s === -1) throw new Error('الـ AI لم يولد JSON');
     clean = clean.slice(s);
-
-    // محاولة التحليل المباشر
     try { return JSON.parse(clean); } catch (_) {}
-
-    // إصلاح JSON المقطوع
     clean = repairJson(clean);
     try { return JSON.parse(clean); }
-    catch (e2) { throw new Error('فشل تحليل JSON: ' + e2.message.slice(0, 80)); }
+    catch (e2) { throw new Error('فشل JSON: ' + e2.message.slice(0, 80)); }
 }
 
 // إيجاد آخر موضع آمن للقطع (بعد عنصر كامل بالـ sections array)
@@ -3818,7 +3825,8 @@ async function buildPdfBuffer(data) {
 
     const hasAr   = (t) => /[\u0600-\u06FF]/.test(String(t||''));
     const str     = (v) => (v == null) ? '' : String(v);
-    const enFont  = (bold) => bold ? 'Helvetica-Bold' : 'Helvetica';
+    const hasSymFont = fs.existsSync(PDF_SYM_PATH);
+    const enFont  = (bold) => hasSymFont ? (bold ? 'SymBold' : 'Sym') : (bold ? 'Helvetica-Bold' : 'Helvetica');
     const arFont  = (bold) => (fontReady && fs.existsSync(PDF_FONT_PATH)) ? (bold ? 'ArBold' : 'Ar') : enFont(bold);
 
     const mainColor   = data.color || '#1a5276';
@@ -3838,6 +3846,11 @@ async function buildPdfBuffer(data) {
     if (fontReady && fs.existsSync(PDF_FONT_PATH)) {
         doc.registerFont('Ar',     PDF_FONT_PATH);
         doc.registerFont('ArBold', fs.existsSync(PDF_FONT_BOLD_PATH) ? PDF_FONT_BOLD_PATH : PDF_FONT_PATH);
+    }
+    // DejaVu للإنجليزي والرموز (₂, °, ≥, ←, →, ±, ×)
+    if (fs.existsSync(PDF_SYM_PATH)) {
+        doc.registerFont('Sym',     PDF_SYM_PATH);
+        doc.registerFont('SymBold', fs.existsSync(PDF_SYM_BOLD_PATH) ? PDF_SYM_BOLD_PATH : PDF_SYM_PATH);
     }
 
     const PW = doc.page.width;
