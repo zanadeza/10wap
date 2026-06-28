@@ -3756,36 +3756,51 @@ async function generatePdfContent(userRequest) {
     const s = clean.indexOf('{');
     if (s === -1) throw new Error('الـ AI لم يولد JSON');
     clean = clean.slice(s);
+
+    // تنظيف مسبق للمشاكل الشائعة
+    clean = clean
+        .replace(/"en"\s*:\s*}/g, '"en":""}')       // {"en":} → {"en":""}
+        .replace(/"ar"\s*:\s*}/g, '"ar":""}')       // {"ar":} → {"ar":""}
+        .replace(/"en"\s*:\s*,/g, '"en":"",')       // "en": , → "en": "",
+        .replace(/"ar"\s*:\s*,/g, '"ar":"",')       // "ar": , → "ar": "",
+        .replace(/"en"\s*:\s*]/g, '"en":""]')       // "en":] → "en":""]
+        .replace(/"ar"\s*:\s*]/g, '"ar":""]')       // "ar":] → "ar":""]
+        .replace(/,\s*([}\]])/g, '$1');             // trailing commas
+
     try { return JSON.parse(clean); } catch (_) {}
     clean = repairJson(clean);
     try { return JSON.parse(clean); }
     catch (e2) { throw new Error('فشل JSON: ' + e2.message.slice(0, 80)); }
 }
 
-// إيجاد آخر موضع آمن للقطع (بعد عنصر كامل بالـ sections array)
+// إيجاد آخر موضع آمن للقطع
 function findLastCompleteElement(json) {
-    // نبحث عن آخر }] أو }، أو } قبل التقطع
-    let depth = 0;
-    let lastSafePos = -1;
+    let depth = 0, lastSafePos = -1;
     for (let i = 0; i < json.length; i++) {
         const c = json[i];
         if (c === '{' || c === '[') depth++;
-        else if (c === '}' || c === ']') {
-            depth--;
-            if (depth <= 2) lastSafePos = i + 1; // داخل sections array
-        }
+        else if (c === '}' || c === ']') { depth--; if (depth <= 2) lastSafePos = i + 1; }
     }
     return lastSafePos;
 }
 
-// إغلاق JSON المفتوح
+// إصلاح JSON المكسور أو المقطوع
 function repairJson(json) {
-    const stack = [];
-    let inStr = false;
-    let escape = false;
+    // 1. إزالة حقول فارغة: {"en":} أو {"ar":,} أو "key":,
+    let fixed = json
+        .replace(/"[^"]*":\s*,/g, '')           // "key": ,
+        .replace(/"[^"]*":\s*}/g, '}')           // "key": }  ← حذف المفتاح الفارغ
+        .replace(/"[^"]*":\s*]/g, ']')           // "key": ]
+        .replace(/,\s*([}\]])/g, '$1')           // trailing commas
+        .replace(/([{[,])\s*,/g, '$1')           // double commas
+        .replace(/:\s*,/g, ': "",')              // : , → : "",
+        .trimEnd();
 
-    for (let i = 0; i < json.length; i++) {
-        const c = json[i];
+    // 2. إغلاق الأقواس المفتوحة
+    const stack = [];
+    let inStr = false, escape = false;
+    for (let i = 0; i < fixed.length; i++) {
+        const c = fixed[i];
         if (escape) { escape = false; continue; }
         if (c === '\\' && inStr) { escape = true; continue; }
         if (c === '"') { inStr = !inStr; continue; }
@@ -3795,16 +3810,11 @@ function repairJson(json) {
         else if (c === '}' || c === ']') stack.pop();
     }
 
-    // أزل trailing comma أو أي رموز ناقصة
-    let result = json.trimEnd();
-    result = result.replace(/,\s*$/, '');
+    // أزل trailing comma أخيرة قبل الإغلاق
+    fixed = fixed.replace(/,\s*$/, '');
+    while (stack.length > 0) fixed += stack.pop();
 
-    // أغلق كل شي مفتوح
-    while (stack.length > 0) {
-        result += stack.pop();
-    }
-
-    return result;
+    return fixed;
 }
 
 async function buildPdfBuffer(data) {
